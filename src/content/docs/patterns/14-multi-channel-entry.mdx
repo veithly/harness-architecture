@@ -367,23 +367,23 @@ def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatf
     'doctor 子命令（参考 Claude Code 的 doctor）：检查依赖、网络、配置、凭证。用户排错时第一步就跑 doctor，避免「卡在某个步骤但不知道哪一步出问题」的痛苦',
   ]}
   advanced={[
-    'multi-binary 拆分（参考 Codex）—— daemon（长跑服务）/ CLI（用户入口）/ mcp-server（MCP 协议端点）/ stdio-to-uds（桥）分别独立 binary，各自升级；不同部分升级速度不同，分 binary 能精细化',
-    'stdio-to-uds 桥（参考 Codex）—— IDE 启子进程走 stdio（IDE 期望的协议），子进程内部走 UDS 连 daemon（高性能 IPC）；IDE 跟 daemon 完全解耦（daemon 重启不影响 IDE，IDE 升级不影响 daemon）',
-    'app-server 用 axum（参考 Codex）—— 同一个 daemon 同时支持 HTTP1 + WS（不同 client 选协议）；axum 是 Rust 生态最流行的 web server，性能 + 生态都成熟',
-    'sub-CLI lazy-load（参考 OpenClaw）—— 每个 sub-CLI（auth / config / doctor / login 等）一个文件，只在用到时 import；CLI 启动时间是 UX 关键，全部 import 会让启动慢半秒',
-    'channels-plugins catalog（参考 OpenClaw）—— 通道作为独立 npm 包通过 catalog 注册；这样新增通道（如新的 IM 平台）只需发 npm 包不用改主包，企业可以发自己的私有 channel 包',
-    'ACP 协议（参考 OpenClaw）—— 让外部 IDE / orchestrator 用标准协议接入；不要发明私有协议（外部生态不会跟进），ACP 是 OpenClaw 推动的标准',
-    'BasePlatformAdapter（参考 Hermes）—— 6 个 abstract method 抽出来（send_message / receive / parse / validate / authenticate / cleanup），每个平台独立子类；新增平台只需实现这 6 个方法',
-    'check_<platform>_requirements()（参考 Hermes）—— 缺依赖时优雅降级 + 警告（如「telegram 库未装，telegram 通道禁用」），不 fatal；让用户能逐步开通道而非一次性装齐所有依赖',
-    'HTTP API / Webhook 也建模为 platform（参考 Hermes）—— 复用同一套 message handler；HTTP 跟 Telegram 在 agent 视角都是「收到一条消息回一条消息」，统一抽象简化代码',
-    'extra dependencies（参考 Hermes）—— 主包不带平台 SDK，hermes[slack] / hermes[discord] / hermes[telegram] 等 extra 才装对应 SDK；用户只用 Telegram 不应该被迫装 discord.py',
+    'multi-binary 拆分（参考 Codex）：daemon（长跑服务）/ CLI（用户入口）/ mcp-server（MCP 协议端点）/ stdio-to-uds（桥）分别独立 binary，各自升级；不同部分升级速度不同，分 binary 能精细化',
+    'stdio-to-uds 桥（参考 Codex）：IDE 启子进程走 stdio（IDE 期望的协议），子进程内部走 UDS 连 daemon（高性能 IPC）；IDE 跟 daemon 完全解耦（daemon 重启不影响 IDE，IDE 升级不影响 daemon）',
+    'app-server 用 axum（参考 Codex）：同一个 daemon 同时支持 HTTP1 + WS（不同 client 选协议）；axum 是 Rust 生态最流行的 web server，性能 + 生态都成熟',
+    'sub-CLI lazy-load（参考 OpenClaw）：每个 sub-CLI（auth / config / doctor / login 等）一个文件，只在用到时 import；CLI 启动时间是 UX 关键，全部 import 会让启动慢半秒',
+    'channels-plugins catalog（参考 OpenClaw）：通道作为独立 npm 包通过 catalog 注册；这样新增通道（如新的 IM 平台）只需发 npm 包不用改主包，企业可以发自己的私有 channel 包',
+    'ACP 协议（参考 OpenClaw）：让外部 IDE / orchestrator 用标准协议接入；不要发明私有协议（外部生态不会跟进），ACP 是 OpenClaw 推动的标准',
+    'BasePlatformAdapter（参考 Hermes）：6 个 abstract method 抽出来（send_message / receive / parse / validate / authenticate / cleanup），每个平台独立子类；新增平台只需实现这 6 个方法',
+    'check_<platform>_requirements()（参考 Hermes）：缺依赖时优雅降级 + 警告（如「telegram 库未装，telegram 通道禁用」），不 fatal；让用户能逐步开通道而非一次性装齐所有依赖',
+    'HTTP API / Webhook 也建模为 platform（参考 Hermes）：复用同一套 message handler；HTTP 跟 Telegram 在 agent 视角都是「收到一条消息回一条消息」，统一抽象简化代码',
+    'extra dependencies（参考 Hermes）：主包不带平台 SDK，hermes[slack] / hermes[discord] / hermes[telegram] 等 extra 才装对应 SDK；用户只用 Telegram 不应该被迫装 discord.py',
   ]}
   avoid={[
-    '别全塞一个 main 文件 —— 超过 5000 行就该拆；Claude Code 的 cli.js 单文件是反面教材（debugging 极痛苦，单点故障）',
-    '别把所有 platform 强制依赖 —— 用户只用 Telegram 不应该被迫装 discord.py / slack-sdk 等所有平台 SDK；用 extra 让用户选',
-    '别在 MCP server 里跑长任务 —— MCP 设计上是请求-响应，长任务用 progress notification（流式更新）或 split（分多次请求-响应）；长跑会撑爆 stdio buffer',
-    '别让 IDE 集成依赖私有协议 —— MCP / ACP 都是公开协议，外部 IDE 自然支持；私有协议每个 IDE 都要单独适配，永远跟不上',
-    '别让 daemon 跟 CLI 紧耦合 —— daemon 升级不应该重启所有 CLI client（用户的 long-running session 会断），用 stdio-to-uds 桥解耦',
+    '别全塞一个 main 文件：超过 5000 行就该拆；Claude Code 的 cli.js 单文件是反面教材（debugging 极痛苦，单点故障）',
+    '别把所有 platform 强制依赖：用户只用 Telegram 不应该被迫装 discord.py / slack-sdk 等所有平台 SDK；用 extra 让用户选',
+    '别在 MCP server 里跑长任务：MCP 设计上是请求-响应，长任务用 progress notification（流式更新）或 split（分多次请求-响应）；长跑会撑爆 stdio buffer',
+    '别让 IDE 集成依赖私有协议：MCP / ACP 都是公开协议，外部 IDE 自然支持；私有协议每个 IDE 都要单独适配，永远跟不上',
+    '别让 daemon 跟 CLI 紧耦合：daemon 升级不应该重启所有 CLI client（用户的 long-running session 会断），用 stdio-to-uds 桥解耦',
   ]}
 />
 

@@ -44,7 +44,7 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ### Codex · 在 Linux 上把三种独立的内核隔离能力按各自最擅长的事拼起来
 
-Codex 是四家里唯一选择「自己写完整沙箱代码」路线的系统。它的逻辑是：每个操作系统都提供了几种不同的隔离能力，每种能力专注解决一类问题（文件系统、网络、系统调用），把它们组合起来能比任何单一方案都精确。这种选择带来的代价是每个平台都要写一套独立的代码（Linux 一套、macOS 一套、Windows 一套），但换来的是真正可以信赖的隔离边界。
+Codex 是四家里唯一选择「自己写完整沙箱代码」路线的系统。每个操作系统都提供了几种不同的隔离能力，每种能力专注解决一类问题（文件系统、网络、系统调用），把它们组合起来能比任何单一方案都精确。代价是每个平台都要写一套独立的代码（Linux 一套、macOS 一套、Windows 一套），好处是拿到真正可以信赖的隔离边界。
 
 在 Linux 上，Codex 把三种独立的内核能力按各自最擅长的事拼了起来：
 
@@ -99,11 +99,11 @@ pub(crate) fn apply_permission_profile_to_current_thread(
 
 三件套各自扮演的角色：
 
-**bubblewrap（缩写 bwrap）** 是用户空间的轻量级容器化工具，专门做文件系统挂载隔离——它能把宿主机的某个目录以只读方式挂进沙箱、把另一个目录以可写方式挂进沙箱、把临时目录挂成 tmpfs（只在内存里、退出就消失）。这是 Codex Linux 沙箱的主力——绝大多数文件系统隔离工作都靠它。它的好处是不需要内核特殊支持，只是一个普通的二进制；坏处是它本身依赖 Linux 命名空间能力，没有命名空间能力的环境（比如某些容器内的容器）就用不了。
+**bubblewrap（缩写 bwrap）** 是用户空间的轻量级容器化工具，专门做文件系统挂载隔离。它能把宿主机的某个目录以只读方式挂进沙箱、把另一个目录以可写方式挂进沙箱、把临时目录挂成 tmpfs（只在内存里、退出就消失）。这是 Codex Linux 沙箱的主力，绝大多数文件系统隔离工作都靠它。它不需要内核特殊支持，只是一个普通的二进制；但反过来，它本身依赖 Linux 命名空间能力，没有命名空间能力的环境（比如某些容器内的容器）就用不了。
 
 **seccomp** 是 Linux 内核的一项基础设施，能让用户层注册一段 BPF 字节码作为「系统调用过滤器」：每次进程要发起系统调用时，内核先跑这段 BPF 判断「这个调用允不允许」。Codex 用它做一件聚焦的事：在线程级别拦截网络相关的系统调用（`connect()`、`sendto()`），让进程根本无法发起任何网络连接。注意是「线程级别」：这件事很关键，意味着 Codex 的主进程本身仍能上网（用来发 OpenAI 请求），但 spawn 出来跑用户工具的子进程继承隔离规则之后连不出去。
 
-**landlock** 是 Linux 5.13+ 引入的内核 LSM（Linux Security Module），同样做文件系统访问控制，跟 bubblewrap 比是更新的内核机制。Codex 把它当 legacy/backup 用，主路径还是 bubblewrap——原因主要是 bubblewrap 在老内核也能跑，兼容性更广。
+**landlock** 是 Linux 5.13+ 引入的内核 LSM（Linux Security Module），同样做文件系统访问控制，跟 bubblewrap 比是更新的内核机制。Codex 把它当 legacy/backup 用，主路径还是 bubblewrap，原因主要是 bubblewrap 在老内核也能跑，兼容性更广。
 
 代码注释里有一段关于 trade-off 的决定特别值得看：`PR_SET_NO_NEW_PRIVS` 这个 prctl 调用是启用 seccomp 的硬性前提（内核要求「如果你要装系统调用过滤器，必须先承诺这个进程及其子进程永远不能通过 setuid 获得新特权」），但这个承诺同时也会让 setuid 提权失效：而很多 bubblewrap 的部署方式正好依赖 setuid 来让普通用户能创建命名空间。Codex 的处理是：只在需要 seccomp 或者需要 landlock 文件系统隔离时才设这个 flag，其他情况下不设，让 bwrap 那边的 setuid 路径能用。这是一段经典的「安全性对比兼容性」的工程平衡，做得很克制。
 
@@ -111,7 +111,7 @@ pub(crate) fn apply_permission_profile_to_current_thread(
 
 ### Claude Code · 把沙箱做成可以被 IT 管理员精确配置的 JSON schema
 
-Claude Code 在沙箱这件事上的取舍跟 Codex 完全不同——它认为沙箱的真正难点不在底层技术（reuse Codex / 系统自带的能力就好），而在"让 IT 管理员能在企业部署里精确控制沙箱行为"。具体来说就是把整个沙箱建模成一份 JSON schema，让管理员在 settings.json 里声明性地配置：
+Claude Code 在沙箱这件事上的取舍跟 Codex 完全不同。它认为沙箱的真正难点不在底层技术（reuse Codex / 系统自带的能力就好），而在"让 IT 管理员能在企业部署里精确控制沙箱行为"。具体来说就是把整个沙箱建模成一份 JSON schema，让管理员在 settings.json 里声明性地配置：
 
 <SourceBlock path="REF/claude-code-2.1.88-expanded/src/entrypoints/sandboxTypes.ts" lines="90-145" system="claude" summary="SandboxSettings 顶层：enabled + failIfUnavailable + 平台限制 + nested/network 退化档">
 
@@ -165,31 +165,31 @@ export const SandboxSettingsSchema = lazySchema(() =>
 
 这段 schema 定义里有几段注释是整个章节的精华，值得拆开讲：
 
-**第一段精华是 `failIfUnavailable` 的 trade-off 处理**：它问的是一个很实际的问题：当用户配置说「启用沙箱」但沙箱启动失败（缺少依赖、平台不支持、平台不在 `enabledPlatforms` 白名单里），系统应该怎么办？两种选择：直接报错退出，强制管理员去解决；或者降级到无沙箱模式加警告，让用户能继续工作。这两种选择没有绝对正确：开发者本地跑跑不应该被这种事卡死（默认 false，降级模式），但企业部署作为强制门槛时需要这种 fail-closed 行为（管理员配 true，沙箱启不动就一定不让用）。Claude Code 把这个决定权交给配置，注释里写得很清楚「Intended for managed-settings deployments that require sandboxing as a hard gate」。
+**第一处值得拆开讲的是 `failIfUnavailable` 的 trade-off 处理**：它问的是一个很实际的问题：当用户配置说「启用沙箱」但沙箱启动失败（缺少依赖、平台不支持、平台不在 `enabledPlatforms` 白名单里），系统应该怎么办？两种选择：直接报错退出，强制管理员去解决；或者降级到无沙箱模式加警告，让用户能继续工作。这两种选择没有绝对正确：开发者本地跑跑不应该被这种事卡死（默认 false，降级模式），但企业部署作为强制门槛时需要这种 fail-closed 行为（管理员配 true，沙箱启不动就一定不让用）。Claude Code 把这个决定权交给配置，注释里写得很清楚「Intended for managed-settings deployments that require sandboxing as a hard gate」。
 
-**第二段精华是 `enabledPlatforms`**：这个配置项的存在背景是真实企业部署的故事。Claude Code 的注释里直接写了「Added to unblock NVIDIA enterprise rollout: they want to enable autoAllowBashIfSandboxed but only on macOS initially, since Linux/WSL sandbox support is newer and less battle-tested」。这是少见的工程透明度：一个 undocumented 的配置项，连「为什么存在」都直接在代码注释里写了出来。背后讲的是一个很真实的企业部署问题：NVIDIA 想在 macOS 上启用一个「沙箱内自动放行 Bash」的功能（因为沙箱够强，可以信任），但 Linux 上的沙箱代码比较新还在 battle-test，他们暂时不敢在 Linux 上启用。`enabledPlatforms` 让管理员能精确说「这个功能只在 macOS 上启用，Linux、WSL 不要」。这种「undocumented setting」是用 zod 的 `.passthrough()` 机制兼容到 schema 里的，schema 不验证它但也不剔除它。
+**第二处是 `enabledPlatforms`**：这个配置项的存在背景是真实企业部署的故事。Claude Code 的注释里直接写了「Added to unblock NVIDIA enterprise rollout: they want to enable autoAllowBashIfSandboxed but only on macOS initially, since Linux/WSL sandbox support is newer and less battle-tested」。这是少见的工程透明度：一个 undocumented 的配置项，连「为什么存在」都直接在代码注释里写了出来。背后讲的是一个很真实的企业部署问题：NVIDIA 想在 macOS 上启用一个「沙箱内自动放行 Bash」的功能（因为沙箱够强，可以信任），但 Linux 上的沙箱代码比较新还在 battle-test，他们暂时不敢在 Linux 上启用。`enabledPlatforms` 让管理员能精确说「这个功能只在 macOS 上启用，Linux、WSL 不要」。这种「undocumented setting」是用 zod 的 `.passthrough()` 机制兼容到 schema 里的，schema 不验证它但也不剔除它。
 
-**第三段精华是 `enableWeakerNetworkIsolation` 这个明确标注「Reduces security」的开关**：它存在的背景是另一个具体的工具链问题：Go 写的命令行工具（gh、gcloud、terraform 等）通过 httpProxyPort 走 MITM 代理加自签 CA 时，需要访问 macOS 的 `com.apple.trustd.agent` 服务来验证 TLS 证书；但默认的沙箱配置不允许这个访问。打开 `enableWeakerNetworkIsolation` 会放开这个访问，但代价是 trustd 服务理论上能被用作数据泄漏渠道。Claude Code 的处理负责任：把这个开关做出来给用户用，但在注释里直接用粗体写明「Reduces security — opens a potential data exfiltration vector」，让管理员知道这是带代价的便利开关。
+**第三处是 `enableWeakerNetworkIsolation`，一个明确标注「Reduces security」的开关**：它存在的背景是另一个具体的工具链问题：Go 写的命令行工具（gh、gcloud、terraform 等）通过 httpProxyPort 走 MITM 代理加自签 CA 时，需要访问 macOS 的 `com.apple.trustd.agent` 服务来验证 TLS 证书；但默认的沙箱配置不允许这个访问。打开 `enableWeakerNetworkIsolation` 会放开这个访问，但代价是 trustd 服务理论上能被用作数据泄漏渠道。Claude Code 的处理负责任：把这个开关做出来给用户用，但在注释里直接用粗体写明「Reduces security, opens a potential data exfiltration vector」，让管理员知道这是带代价的便利开关。
 
-network 和 filesystem 各自有独立的 schema 子集——这反映了"网络隔离和文件系统隔离是两件独立的事"的工程直觉。network 维度的配置项有：允许访问的域名列表、是否只信管理面下发的域名、是否允许 Unix socket、是否允许本地 binding、HTTP/SOCKS 代理端口；filesystem 维度的配置项有：允许写的路径、显式拒绝写的路径、显式拒绝读的路径、允许读的路径、是否只信管理面下发的读路径。
+network 和 filesystem 各自有独立的 schema 子集，因为网络隔离和文件系统隔离本来就是两件独立的事。network 维度的配置项有：允许访问的域名列表、是否只信管理面下发的域名、是否允许 Unix socket、是否允许本地 binding、HTTP/SOCKS 代理端口；filesystem 维度的配置项有：允许写的路径、显式拒绝写的路径、显式拒绝读的路径、允许读的路径、是否只信管理面下发的读路径。
 
-特别值得讲的是两个带 `Managed` 前缀的配置——`allowManagedDomainsOnly` 和 `allowManagedReadPathsOnly`。它们的语义是："开了这个之后忽略所有用户层配置，只信 policySettings"。这是企业 IT 管理员的"我说了算"心态——管理员开了之后，无论用户在 `userSettings`、`projectSettings`、`localSettings`、`cliArg` 里怎么放行，都不生效；只有管理员在 `policySettings` 里下发的规则才算数。这种"管理面凌驾用户面"的设计是企业部署不可或缺的能力。
+特别值得讲的是两个带 `Managed` 前缀的配置，`allowManagedDomainsOnly` 和 `allowManagedReadPathsOnly`。它们的语义是："开了这个之后忽略所有用户层配置，只信 policySettings"。这是企业 IT 管理员的"我说了算"心态：管理员开了之后，无论用户在 `userSettings`、`projectSettings`、`localSettings`、`cliArg` 里怎么放行，都不生效；只有管理员在 `policySettings` 里下发的规则才算数。这种"管理面凌驾用户面"的设计是企业部署的基本盘。
 
 ### OpenClaw · 把沙箱看成"选哪个后端的问题"而不是"自己实现哪些隔离能力的问题"
 
-OpenClaw 在沙箱这件事上的取舍可以用一句话概括——它认为沙箱不是一个技术问题，而是一个"backend 选择"问题。第 12 章讲过的 ExecHost 枚举（sandbox / gateway / node）就是它对沙箱这件事的全部抽象：
+OpenClaw 在沙箱这件事上的取舍可以用一句话概括：它认为沙箱不是一个技术问题，而是一个"backend 选择"问题。第 12 章讲过的 ExecHost 枚举（sandbox / gateway / node）就是它对沙箱这件事的全部抽象：
 
 ```ts
 export type ExecHost = "sandbox" | "gateway" | "node";
 ```
 
-这三档的含义是：选 `sandbox` 表示这个命令要在隔离的执行环境里跑（具体怎么隔离由部署方决定——可以是 Docker、Firecracker microVM、AWS Lambda、Kubernetes Job 等任何东西），选 `gateway` 表示在 gateway 进程内跑（不开新进程，主要用于轻量级文件操作），选 `node` 表示直接在宿主 Node.js 进程里跑（用于已经被严格 allowlist 的可信命令，比如 `git status` 这种）。
+这三档的含义是：选 `sandbox` 表示这个命令要在隔离的执行环境里跑（具体怎么隔离由部署方决定，可以是 Docker、Firecracker microVM、AWS Lambda、Kubernetes Job 等任何东西），选 `gateway` 表示在 gateway 进程内跑（不开新进程，主要用于轻量级文件操作），选 `node` 表示直接在宿主 Node.js 进程里跑（用于已经被严格 allowlist 的可信命令，比如 `git status` 这种）。
 
-这种设计的工程哲学是把"沙箱实现"跟"agent 逻辑"彻底解耦——OpenClaw 自己的代码只关心"这个命令应该走哪个 backend"，至于 sandbox backend 内部到底用了什么技术做隔离，是部署方的事。好处是 agent 代码不需要维护 Linux/macOS/Windows 三套独立的沙箱代码，部署方爱用 Docker 用 Docker、爱用 Firecracker 用 Firecracker；坏处是 OpenClaw 自己不提供"开箱即用"的沙箱实现——部署方必须自己接一套容器或者隔离技术，不接就等于没沙箱。
+这种设计的工程哲学是把"沙箱实现"跟"agent 逻辑"彻底解耦。OpenClaw 自己的代码只关心"这个命令应该走哪个 backend"，至于 sandbox backend 内部到底用了什么技术做隔离，是部署方的事。好处是 agent 代码不需要维护 Linux/macOS/Windows 三套独立的沙箱代码，部署方爱用 Docker 用 Docker、爱用 Firecracker 用 Firecracker；坏处是 OpenClaw 自己不提供"开箱即用"的沙箱实现，部署方必须自己接一套容器或者隔离技术，不接就等于没沙箱。
 
 ### Hermes · 把整件事委托给 6 种容器化方案，让用户用一个环境变量选
 
-Hermes 在沙箱这件事上走得比 OpenClaw 还要远——它不仅不自己实现沙箱，连"沙箱抽象"都不要了，直接把整件事委托给现成的容器化方案。具体做法是定义一个叫 `TERMINAL_ENV` 的环境变量，6 个候选值分别对应 6 种典型的执行环境。
+Hermes 在沙箱这件事上走得比 OpenClaw 还要远。它不仅不自己实现沙箱，连"沙箱抽象"都不要了，直接把整件事委托给现成的容器化方案。具体做法是定义一个叫 `TERMINAL_ENV` 的环境变量，6 个候选值分别对应 6 种典型的执行环境。
 
 <SourceBlock path="REF/hermes-agent/tools/terminal_tool.py" lines="765-820" system="hermes" summary="TERMINAL_ENV 6 后端 + per-backend 配置：image / cpu / memory / disk / persistent 都有">
 
@@ -235,7 +235,7 @@ def _get_env_config() -> Dict[str, Any]:
 
 - **local**：在用户的开发机上直接跑，没有任何隔离。这是默认值，启动最快、调试最方便，适合开发场景。
 - **docker**：在本地 Docker daemon 里跑一个容器，提供操作系统级别的隔离和环境可重复性。最常见的生产配置。
-- **singularity**：HPC（高性能计算）领域的标准容器格式，主要在科研集群里用——这种环境通常不允许跑 Docker（Docker 需要 root daemon），但允许跑 Singularity（rootless）。
+- **singularity**：HPC（高性能计算）领域的标准容器格式，主要在科研集群里用，这种环境通常不允许跑 Docker（Docker 需要 root daemon），但允许跑 Singularity（rootless）。
 - **modal**：把整个命令委托给 [Modal.com](https://modal.com) 的 serverless GPU/CPU 容器服务，按需启停，适合需要 GPU 但不想自己运维的场景。
 - **daytona**：把命令委托给 [Daytona](https://daytona.io) 的 dev-environment-as-a-service，给每个 agent session 一个独立的开发环境。
 - **ssh**：把命令通过 SSH 发到远端机器上跑，agent 本身只是个客户端。适合「agent 跑在用户笔记本上、命令在云上 VM 跑」的场景。
@@ -289,28 +289,28 @@ def _get_env_config() -> Dict[str, Any]:
 <BuildRecipe
   title="复刻方案"
   minimal={[
-    'Linux 上用 bubblewrap binary 做 FS 隔离（参考 Codex）—— read-only / writable / tmpfs 三种挂载方式，外部进程 enforce 边界；bubblewrap 是 Linux 沙箱的事实标准（不需自己写 namespace + chroot）',
-    '网络隔离用 seccomp BPF 拦 connect/sendto（参考 Codex）—— thread-level apply 让子进程继承；seccomp 比 iptables 轻量（不需 root），但需要熟悉 BPF 字节码',
-    'macOS 走 sandbox-exec + .sb 配置文件 —— macOS 不支持 bubblewrap / seccomp 但有 seatbelt（沙箱）+ sandbox-exec 命令；写 .sb 配置（基于 SchemeML）描述权限边界',
-    'fail_open vs fail_closed 给配置（参考 Claude Code 的 failIfUnavailable）—— dev 默认 fail_open（沙箱不可用时让命令直接跑，不打断 dev 体验），prod 默认 fail_closed（沙箱不可用时拒绝命令，安全第一）',
+    'Linux 上用 bubblewrap binary 做 FS 隔离（参考 Codex）：read-only / writable / tmpfs 三种挂载方式，外部进程 enforce 边界；bubblewrap 是 Linux 沙箱的事实标准（不需自己写 namespace + chroot）',
+    '网络隔离用 seccomp BPF 拦 connect/sendto（参考 Codex）：thread-level apply 让子进程继承；seccomp 比 iptables 轻量（不需 root），但需要熟悉 BPF 字节码',
+    'macOS 走 sandbox-exec + .sb 配置文件：macOS 不支持 bubblewrap / seccomp 但有 seatbelt（沙箱）+ sandbox-exec 命令；写 .sb 配置（基于 SchemeML）描述权限边界',
+    'fail_open vs fail_closed 给配置（参考 Claude Code 的 failIfUnavailable）：dev 默认 fail_open（沙箱不可用时让命令直接跑，不打断 dev 体验），prod 默认 fail_closed（沙箱不可用时拒绝命令，安全第一）',
   ]}
   advanced={[
-    '三平台分开 crate（参考 Codex）—— linux-sandbox（bubblewrap + seccomp）/ 默认走 mac seatbelt / windows-sandbox-rs；不要试图写一个跨平台的统一沙箱（每个平台机制完全不同），分开实现更清晰',
-    'PR_SET_NO_NEW_PRIVS 跟 setuid 的 trade-off 写注释里（参考 Codex）—— 这个 flag 防止 setuid 提权但也破坏了 sudo / mount 等需要 setuid 的工具；不是一律开，是按需启用并 document trade-off',
-    'enabledPlatforms 选项（参考 Claude Code）—— 让管理员在 macOS 启用 sandbox + 在 Linux 暂停（如果 Linux 上 bubblewrap 还有问题），逐平台 rollout 比一刀切安全',
-    'allowManagedDomainsOnly / allowManagedReadPathsOnly（参考 Claude Code）—— managed-only 模式忽略用户层配置（用户的「allow github.com」被忽略），只用企业管理员推下来的 domain 白名单；这是大企业 SSO 集成的关键',
-    'enableWeakerXxx 配置直接标注 "Reduces security"（参考 Claude Code）—— 让用户在 schema 里看到这是带安全成本的开关（不是普通 flag），决策时自然会三思',
-    'ExecHost 抽象（参考 OpenClaw）—— 让沙箱跟 agent 解耦：agent 调用 ExecHost.run({argv})，部署方决定 ExecHost 是 docker / firecracker / native sandbox / cloud sandbox；这是 SaaS / 多租户的关键',
-    '6 后端切换（参考 Hermes 的 TERMINAL_ENV=local/docker/singularity/modal/daytona/ssh）—— 满足不同部署需求（本地用 docker / 云端用 modal / 学术用 singularity / 生产用 daytona / 调远程机器用 ssh）',
-    'persistent container 默认开（参考 Hermes 的 TERMINAL_CONTAINER_PERSISTENT）—— 一个 session 复用容器（启动只付一次 cold-start 成本，后续每次执行都是 warm container）；frequent 短命令场景必备',
-    '默认不挂 host cwd（参考 Hermes）—— 显式开 TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE 才映射；默认隔离最安全（容器逃逸了也只是污染容器不是 host），用户主动开才挂 cwd',
+    '三平台分开 crate（参考 Codex）：linux-sandbox（bubblewrap + seccomp）/ 默认走 mac seatbelt / windows-sandbox-rs；不要试图写一个跨平台的统一沙箱（每个平台机制完全不同），分开实现更清晰',
+    'PR_SET_NO_NEW_PRIVS 跟 setuid 的 trade-off 写注释里（参考 Codex）：这个 flag 防止 setuid 提权但也破坏了 sudo / mount 等需要 setuid 的工具；不是一律开，是按需启用并 document trade-off',
+    'enabledPlatforms 选项（参考 Claude Code）：让管理员在 macOS 启用 sandbox + 在 Linux 暂停（如果 Linux 上 bubblewrap 还有问题），逐平台 rollout 比一刀切安全',
+    'allowManagedDomainsOnly / allowManagedReadPathsOnly（参考 Claude Code）：managed-only 模式忽略用户层配置（用户的「allow github.com」被忽略），只用企业管理员推下来的 domain 白名单；这是大企业 SSO 集成的关键',
+    'enableWeakerXxx 配置直接标注 "Reduces security"（参考 Claude Code）：让用户在 schema 里看到这是带安全成本的开关（不是普通 flag），决策时自然会三思',
+    'ExecHost 抽象（参考 OpenClaw）：让沙箱跟 agent 解耦，agent 调用 ExecHost.run({argv})，部署方决定 ExecHost 是 docker / firecracker / native sandbox / cloud sandbox；这是 SaaS / 多租户的关键',
+    '6 后端切换（参考 Hermes 的 TERMINAL_ENV=local/docker/singularity/modal/daytona/ssh）：满足不同部署需求（本地用 docker / 云端用 modal / 学术用 singularity / 生产用 daytona / 调远程机器用 ssh）',
+    'persistent container 默认开（参考 Hermes 的 TERMINAL_CONTAINER_PERSISTENT）：一个 session 复用容器（启动只付一次 cold-start 成本，后续每次执行都是 warm container）；frequent 短命令场景必备',
+    '默认不挂 host cwd（参考 Hermes）：显式开 TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE 才映射；默认隔离最安全（容器逃逸了也只是污染容器不是 host），用户主动开才挂 cwd',
   ]}
   avoid={[
-    '别假设沙箱永远可用 —— bubblewrap 不在 PATH（极简 Linux）/ docker daemon 没起 / seatbelt 不支持的 macOS 版本（很老）都要处理；fail_open vs fail_closed 决策必须显式',
-    '别在沙箱里挂用户 home —— 默认应该是 cwd + 临时 tmpfs，不是 ~（挂了 home 等于把 ~/.ssh / ~/.aws 等敏感文件全部暴露给沙箱内进程）',
-    '别让网络默认通 —— seccomp 拦 connect 是默认行为；要让 agent 联网应该走代理（通过 proxy_routed_network 显式开），让流量都被代理审计',
-    '别忽视 setuid trade-off —— PR_SET_NO_NEW_PRIVS 会破坏依赖 setuid 的工具（sudo / mount / ping 等）；如果用户的 build 流程依赖这些工具就要慎用',
-    '别把「安全」写死 —— enterprise 部署经常需要 enableWeaker* 开关（如某团队需要 sandbox 内访问 git ssh 但默认不允许），加进 schema 但标注代价（"Reduces security"）让用户知道',
+    '别假设沙箱永远可用：bubblewrap 不在 PATH（极简 Linux）/ docker daemon 没起 / seatbelt 不支持的 macOS 版本（很老）都要处理；fail_open vs fail_closed 决策必须显式',
+    '别在沙箱里挂用户 home：默认应该是 cwd + 临时 tmpfs，不是 ~（挂了 home 等于把 ~/.ssh / ~/.aws 等敏感文件全部暴露给沙箱内进程）',
+    '别让网络默认通：seccomp 拦 connect 是默认行为；要让 agent 联网应该走代理（通过 proxy_routed_network 显式开），让流量都被代理审计',
+    '别忽视 setuid trade-off：PR_SET_NO_NEW_PRIVS 会破坏依赖 setuid 的工具（sudo / mount / ping 等）；如果用户的 build 流程依赖这些工具就要慎用',
+    '别把「安全」写死：enterprise 部署经常需要 enableWeaker* 开关（如某团队需要 sandbox 内访问 git ssh 但默认不允许），加进 schema 但标注代价（"Reduces security"）让用户知道',
   ]}
 />
 

@@ -178,7 +178,7 @@ def _scan_context_content(content: str, filename: str) -> str:
 
 **想要最强类型安全和可观察性**：参考 Codex 的 fragment 加 marker 路线。24 个 ContextualUserFragment trait 把每种 context 内容做成强类型对象，rollout 反向识别类型、压缩时按类型选策略、单点改动改对应 fragment 即可。代价是代码量大（每加一种新 context 要写 trait impl 加模板文件加注册到 mod.rs）、缺少注入前安全扫描（默认本地仓库可信）。适合企业级、工程化要求高的场景。
 
-**想适配多身份（主 agent、subagent、外部调用方）**：参考 OpenClaw 的 buildXxxSection 加 PromptMode 三档路线。模块化函数加三档模式让同一套代码同时服务三种身份，扩展新身份只需要加一个 PromptMode 值。ctx 参数贯穿装配链让运行时状态注入有统一接口。代价是 cache 切分不显式（主 agent 和 subagent 走同一个 prompt 函数时 cache 会污染）。适合多通道、多角色 agent。
+**想适配多身份（主 agent、subagent、外部调用方）**：参考 OpenClaw 的 buildXxxSection 加 PromptMode 三档路线。模块化函数加三档模式让同一套代码同时服务三种身份，扩展新身份只需要加一个 PromptMode 值。ctx 参数贯穿装配链让运行时状态注入有统一接口。但它不显式切 cache（主 agent 和 subagent 走同一个 prompt 函数时 cache 会污染）。适合多通道、多角色 agent。
 
 **做安全严格的长跑助理或让用户自由定制人格**：参考 Hermes 的 10 层装配加注入前扫描路线。10 层显式装配让每层职责清晰（agent identity 来自 SOUL.md 用户可改、frozen MEMORY snap 锁缓存稳定性、context files 外部输入扫描后注入），prompt injection 扫描把不信任边界拉到文件读取层（其他三家都没做）。代价是完全牺牲了 system prompt 的稳定 cache（10 层每层都可能变，cache 命中率低）、扫描规则需要持续更新（9 类 pattern 不够覆盖所有变种）。适合长跑、用户私人 agent 场景。
 
@@ -274,6 +274,8 @@ System prompt 是 context system 输出的其中一段（通常是 role=system �
 没有最值得参考，要看四件事：是否多人协作改 prompt、是否需要压缩还原 prompt 来源、是否要给 subagent 不同 prompt mode、是否在意 cache 命中率。
 
 **Codex 风格**（fragment 加 marker）适合 prompt 内容多、多团队各自维护一段、且未来要做精细化压缩的场景。marker 让你压缩历史时知道「这段被压掉的原本是工具列表，丢不得」。代价是每加一种 fragment 都得改 `mod.rs`。
+
+**Claude Code 风格**（string[] 加 boundary）适合 prompt 不会爆炸增长、最关心 cache hit 的场景。boundary 字符串是个硬核的工程选择，效率高但扩展性差。
 
 **Claude Code 风格**（string[] 加 boundary）适合 prompt 不会爆炸增长、最关心 cache hit 的场景。boundary 字符串是个硬核的工程选择，效率高但扩展性差。
 

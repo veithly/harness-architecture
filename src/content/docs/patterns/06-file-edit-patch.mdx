@@ -181,13 +181,13 @@ V4A Format:
 
 虽然四家在文件编辑的工程深度上差距巨大（Codex 定制 DSL 对比 OpenClaw 没有专用编辑工具），但只要做文件编辑，四件事是共识。
 
-**第一件是写前必读**：所有四家都不允许模型「盲改」文件，必须先 Read 这个文件拿到当前内容，再基于当前内容做改动。Codex 的 V4A update_hunk 要带 `@@ context @@` 锚点加几行 context line（让 parser 在文件里定位改动位置）。Claude Code 强制 old_string 在文件中唯一匹配（如果模型没读过文件就 Edit，几乎肯定 old_string 不准被拒）。Hermes 的 V4A update 也要 context line。OpenClaw 没有强制但鼓励 plugin 在 before_tool_call 加 check「这个文件本轮 read 过没」。这种「写前必读」原则的工程意义是防止「模型基于幻觉记忆改文件」的灾难：模型可能误以为文件是某个内容然后基于错误内容生成 diff，写盘后真实文件被破坏。
+**第一点，写前必读**：所有四家都不允许模型「盲改」文件，必须先 Read 这个文件拿到当前内容，再基于当前内容做改动。Codex 的 V4A update_hunk 要带 `@@ context @@` 锚点加几行 context line（让 parser 在文件里定位改动位置）。Claude Code 强制 old_string 在文件中唯一匹配（如果模型没读过文件就 Edit，几乎肯定 old_string 不准被拒）。Hermes 的 V4A update 也要 context line。OpenClaw 没有强制但鼓励 plugin 在 before_tool_call 加 check「这个文件本轮 read 过没」。这种「写前必读」原则的工程意义是防止「模型基于幻觉记忆改文件」的灾难：模型可能误以为文件是某个内容然后基于错误内容生成 diff，写盘后真实文件被破坏。
 
-**第二件是写前再校验**：读跟写之间可能有 race condition，所以写前还要再验一次「文件当前状态」跟「我读到的状态」是否一致。Codex 在 apply-patch parser 阶段对 context line 做严格匹配（context 对不上整段拒绝）。Claude Code 比对文件 mtime（其他进程改过就拒绝）。Hermes 走同样的 V4A parser 兜一次。OpenClaw 走 policy 中间件做边界校验。四家都同意「读完到写完之间不能假设文件没变」。
+**其次，写前还要再校验**：读跟写之间可能有 race condition，所以写前还要再验一次「文件当前状态」跟「我读到的状态」是否一致。Codex 在 apply-patch parser 阶段对 context line 做严格匹配（context 对不上整段拒绝）。Claude Code 比对文件 mtime（其他进程改过就拒绝）。Hermes 走同样的 V4A parser 兜一次。OpenClaw 走 policy 中间件做边界校验。四家都同意「读完到写完之间不能假设文件没变」。
 
-**第三件是失败等于全部回滚，绝不留半成品**：这是 atomic 语义的核心。V4A 整段 patch 失败整段拒（apply-patch parser 在解析阶段失败就拒绝整段，已经成功解析的 hunk 也不写盘）。Claude Code 的单条 Edit 失败单条拒。OpenClaw 单次 fs.write 失败单次拒。没有一家允许「前 3 个 hunk 写了第 4 个失败但前 3 个保留」这种半成品状态：理由是半成品状态对 reviewer 跟用户都很危险，宁可全部失败让模型重试也不能留 inconsistent state。
+**还有一点，失败就要全部回滚，绝不留半成品**：这是 atomic 语义的核心。V4A 整段 patch 失败整段拒（apply-patch parser 在解析阶段失败就拒绝整段，已经成功解析的 hunk 也不写盘）。Claude Code 的单条 Edit 失败单条拒。OpenClaw 单次 fs.write 失败单次拒。没有一家允许「前 3 个 hunk 写了第 4 个失败但前 3 个保留」这种半成品状态：理由是半成品状态对 reviewer 跟用户都很危险，宁可全部失败让模型重试也不能留 inconsistent state。
 
-**第四件是 diff 是反馈格式**：四家最终都把改动以 diff 形式回给模型跟用户看。Codex 在 tool_result 里返回 unified diff 让模型自己 verify 改对没。Claude Code 的 fileHistory 系统提供 /diff 命令让用户看 agent 改了什么。Hermes 跟 OpenClaw 也都在 tool_result 里返回 diff。这种 diff 作为公共反馈语言的设计让 reviewer（人类或另一个 agent）可以用统一格式审所有改动，不需要为不同 agent 学不同输出格式。
+**最后，diff 是反馈格式**：四家最终都把改动以 diff 形式回给模型跟用户看。Codex 在 tool_result 里返回 unified diff 让模型自己 verify 改对没。Claude Code 的 fileHistory 系统提供 /diff 命令让用户看 agent 改了什么。Hermes 跟 OpenClaw 也都在 tool_result 里返回 diff。这种 diff 作为公共反馈语言的设计让 reviewer（人类或另一个 agent）可以用统一格式审所有改动，不需要为不同 agent 学不同输出格式。
 
 ## §5 · 关键分歧 · 按场景选型
 

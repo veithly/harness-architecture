@@ -16,7 +16,7 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §1 · TL;DR
 
-<Verdict tldr="session 是 agent 的「记忆载体」：它要回答四个相互纠缠的产品问题。一次对话怎么开始（用户输入第一句话之前要加载哪些初始上下文）、对话过程中产生的状态怎么持久化（消息历史、文件改动记录、cost tracker（token 与费用累计器）、todo 列表都得存下来）、用户回来 resume 时怎么把状态完整重建出来（不能只重放消息，因为模型读不出当时的 cwd 当前工作目录、approval mode 审批模式、git 状态这些隐藏前提）、什么时候应该让 session 自动重置（不重置会无限膨胀、过早重置会让用户失去上下文）。这四件事的处理方式直接决定了 agent 体验的上限：做对了用户能连续工作几天，做错了用户每次回来都得花十分钟重新解释。四家的取舍幅度大到惊人。Codex 走的是「类数据库工程化」路线：每个 session 一个 JSONL 文件 append-only 追加写（只在末尾追加、绝不修改已写入的行，崩了也能恢复到最后一条完整行）、第一行写 SessionMeta（首行 metadata，记录 cwd 当前工作目录、model 当前用的模型、git_sha 启动时的 commit 哈希、agent 当前 agent 类型这些恢复时必须的元数据）记录 cwd、model、git_sha、agent 这些恢复时必须的元数据、session 数量多了之后用一个 SQLite state DB（基于 SQLite 的轻量本地数据库）做线程索引（避免列目录扫上千个文件），并且把「逻辑对话」（ThreadId，可以跨多次进程启动的稳定对话 ID）和「具体运行实例」（SessionId，跟当前进程同生命周期的运行 ID）拆成两个独立 ID，让用户能用 resume 续接、fork 派生、archive 归档这些跨时间操作。Claude Code 走的是「IDE 一等公民」路线：把 session 当成不能简化的复杂系统，22 个文件名带 session 的工具各管一块状态（sessionStorage 落盘存储、sessionRestore 恢复加载、sessionMemory 进程内消息历史、sessionMemoryCompact 压缩后的历史、sessionHooks 生命周期钩子注册、sessionTracing 链路追踪 等等），并且明确把生命周期事件归纳成 4 种 source（startup 全新启动、resume 从历史恢复、clear 用户主动清空、compact 上下文压缩触发），每种 source 触发不同的 plugin hook（插件钩子）和 user hook（用户自定义钩子），让 plugin 能精确地说「我只在 startup 跑、不在 clear 跑」。最有意思的工程纪律是注释里直接写着「do not add ANY warmup logic」（启动路径上不许做任何热身工作），这是反复踩坑后才能写出来的铁律。OpenClaw 走的是「session 是身份不是状态」的极简路线：整个 sessions 模块就 12 个文件，核心代码不到 100 行，只做 UUID 正则校验加 agent scope key（按 agent 名拼出的命名空间前缀）拼接加 transcript 事件序列化。session 数据存哪里、什么时候 reset、resume 怎么做全部交给上层调用方决定。Hermes 走的是「为多平台聊天而设计」路线：一个用户在 Telegram、Slack、Discord 跟同一个 agent 对话时，每个平台一个独立 session。用 SessionSource 这个数据类（dataclass，Python 里只携带数据没行为的纯结构体）记录消息从哪来（platform 哪个 IM、chat_id 群组或 DM ID、chat_type 是私聊还是群聊、user_id 发送者 ID），用 SessionContext 记录当前连接了哪些平台、家在哪个 channel（home channel，agent 主动发消息时的默认归属频道），并且配了一个 SessionResetPolicy 提供 4 种 reset 模式（每天定时、闲置超时、任一触发、永不重置）。最特别的是它有一个 _PII_SAFE_PLATFORMS 安全平台清单（白名单里的平台 mention 用户名不依赖内部 ID，可以脱敏；不在白名单里的 Discord、Slack 因为 mention 必须用 raw user_id 反而不能 redact），只在那些 mention 不需要内部 ID 的平台上对发给 LLM 的内容做 PII 脱敏（个人可识别信息脱敏，把姓名、邮箱、电话等敏感字段在发给 LLM 前替换为占位符）。要做带历史持久化的开发者 agent 参考 Codex，要做多子系统状态分层的 IDE agent 参考 Claude Code，要做平台框架让别人自己存参考 OpenClaw，要做多平台聊天 agent 参考 Hermes。" />
+<Verdict tldr="session 是 agent 的「记忆载体」：它要回答四个相互纠缠的产品问题。一次对话怎么开始（用户输入第一句话之前要加载哪些初始上下文）、对话过程中产生的状态怎么持久化（消息历史、文件改动记录、cost tracker（token 与费用累计器）、todo 列表都得存下来）、用户回来 resume 时怎么把状态完整重建出来（不能只重放消息，因为模型读不出当时的 cwd 当前工作目录、approval mode 审批模式、git 状态这些隐藏前提）、什么时候应该让 session 自动重置（不重置会无限膨胀、过早重置会让用户失去上下文）。这四件事的处理方式直接决定了 agent 体验的上限：做对了用户能连续工作几天，做错了用户每次回来都得花十分钟重新解释。四家的取舍幅度大到惊人。Codex 走的是「类数据库工程化」路线：每个 session 一个 JSONL 文件 append-only 追加写（只在末尾追加、绝不修改已写入的行，崩了也能恢复到最后一条完整行）、第一行写 SessionMeta（首行 metadata，记录 cwd 当前工作目录、model 当前用的模型、git_sha 启动时的 commit 哈希、agent 当前 agent 类型这些恢复时必须的元数据）记录 cwd、model、git_sha、agent 这些恢复时必须的元数据、session 数量多了之后用一个 SQLite state DB（基于 SQLite 的轻量本地数据库）做线程索引（避免列目录扫上千个文件），并且把「逻辑对话」（ThreadId，可以跨多次进程启动的稳定对话 ID）和「具体运行实例」（SessionId，跟当前进程同生命周期的运行 ID）拆成两个独立 ID，让用户能用 resume 续接、fork 派生、archive 归档这些跨时间操作。Claude Code 走的是「IDE 一等公民」路线：把 session 当成不能简化的复杂系统，22 个文件名带 session 的工具各管一块状态（sessionStorage 落盘存储、sessionRestore 恢复加载、sessionMemory 进程内消息历史、sessionMemoryCompact 压缩后的历史、sessionHooks 生命周期钩子注册、sessionTracing 链路追踪 等等），并且明确把生命周期事件归纳成 4 种 source（startup 全新启动、resume 从历史恢复、clear 用户主动清空、compact 上下文压缩触发），每种 source 触发不同的 plugin hook（插件钩子）和 user hook（用户自定义钩子），让 plugin 能精确地说「我只在 startup 跑、不在 clear 跑」。最有意思的工程纪律是注释里直接写着「do not add ANY warmup logic」（启动路径上不许做任何热身工作），这是反复踩坑后才能写出来的铁律。OpenClaw 走的是「session 是身份不是状态」的极简路线：整个 sessions 模块就 12 个文件，核心代码不到 100 行，只做 UUID 正则校验加 agent scope key（按 agent 名拼出的命名空间前缀）拼接加 transcript 事件序列化。session 数据存哪里、什么时候 reset、resume 怎么做全部交给上层调用方决定。Hermes 走的是「为多平台聊天而设计」路线：一个用户在 Telegram、Slack、Discord 跟同一个 agent 对话时，每个平台一个独立 session。用 SessionSource 这个数据类（dataclass，Python 里只携带数据没行为的纯结构体）记录消息从哪来（platform 哪个 IM、chat_id 群组或 DM ID、chat_type 是私聊还是群聊、user_id 发送者 ID），用 SessionContext 记录当前连接了哪些平台、家在哪个 channel（home channel，agent 主动发消息时的默认归属频道），并且配了一个 SessionResetPolicy 提供 4 种 reset 模式（每天定时、闲置超时、任一触发、永不重置）。最特别的是它有一个 _PII_SAFE_PLATFORMS 安全平台清单（白名单里的平台 mention 用户名不依赖内部 ID，可以脱敏；不在白名单里的 Discord、Slack 因为 mention 必须用 raw user_id 反而不能 redact），只在那些 mention 不需要内部 ID 的平台上对发给 LLM 的内容做 PII 脱敏（个人可识别信息脱敏，把姓名、邮箱、电话等敏感字段在发给 LLM 前替换为占位符）。按产品形态对号入座：带历史持久化的长期开发者 agent 对应 Codex；要跟 cost tracker、todos、worktree 多子系统协作的 IDE agent 对应 Claude Code；让别人自带存储的平台框架对应 OpenClaw；多平台聊天 agent 则对应 Hermes。" />
 
 ## §2 · Session 4 档对照
 
@@ -209,7 +209,7 @@ export async function processSessionStartHooks(
 
 把这 4 种合并是诱惑很大的：startup 和 resume 都是「开始 session」，clear 和 compact 都是「中途事件」，看起来合并成 2 种更简洁。但实际上每种 source 下「该做什么、不该做什么」完全不同，合并之后 hook 就得在每个分支里手写 if-else 判断当前情况，反而比分成 4 种 source 更繁琐。Claude Code 实测发现 4 种是「最小够用」的颗粒：每种 source 都有清晰的 do、don't 列表，hook 写作更精确。
 
-代码注释里有一行关键的铁律值得单独拎出来讲：**「do not add ANY "warmup" logic. It is CRITICAL that you do not add extra work on startup.」** 直译是「不要加任何热身逻辑，启动时不要做额外工作，这一点至关重要」。这条铁律的来源是反复踩坑的经验：Claude Code 2.0 之前曾经有过这些 warmup：startup 时扫 ~/.claude 目录准备 quick-resume 列表（3 秒）、startup 时加载所有 plugin 避免后续 lazy load 延迟（5 秒）、startup 时跑 git status 预填 context（1 到 3 秒）、startup 时 fetch latest version 检查更新（2 秒）。每一个单独看都合理（每个 PR 增加 1 到 3 秒，没有 reviewer 会反对），一年下来 startup 从 2 秒变成 11 秒。CLI 工具启动超过 200ms 用户就会感到「卡」，11 秒已经完全脱离了「响应式工具」的产品定位。痛过之后才在代码注释里写下这条铁律，让任何新 PR 看到这条都得解释「我这个工作为什么不能 lazy」。
+代码注释里有一行关键的铁律值得单独拎出来讲：**「do not add ANY "warmup" logic. It is CRITICAL that you do not add extra work on startup.」** 直译是「不要加任何热身逻辑，启动时不要做额外工作，这一点是硬性要求」。这条铁律的来源是反复踩坑的经验：Claude Code 2.0 之前曾经有过这些 warmup：startup 时扫 ~/.claude 目录准备 quick-resume 列表（3 秒）、startup 时加载所有 plugin 避免后续 lazy load 延迟（5 秒）、startup 时跑 git status 预填 context（1 到 3 秒）、startup 时 fetch latest version 检查更新（2 秒）。每一个单独看都合理（每个 PR 增加 1 到 3 秒，没有 reviewer 会反对），一年下来 startup 从 2 秒变成 11 秒。CLI 工具启动超过 200ms 用户就会感到「卡」，11 秒已经完全脱离了「响应式工具」的产品定位。痛过之后才在代码注释里写下这条铁律，让任何新 PR 看到这条都得解释「我这个工作为什么不能 lazy」。
 
 resume 时不是简单重载 JSONL 就完事，要按顺序恢复 7 类状态：
 
@@ -351,7 +351,7 @@ class SessionResetPolicy:
 
 </SourceBlock>
 
-这 4 种模式对应 4 类真实用户群。`daily` 是「每天定时 reset」：典型用户是用 agent 当个人助理的人，作息规律，每天用一段时间晚上不用，凌晨 4 点（默认 at_hour）自动 reset 让第二天从干净状态开始。好处是每天一个清爽 session 不积累冗余上下文，坏处是熬夜用户可能 4 点突然失忆。`idle` 是「闲置超时 reset」：典型用户是项目协作场景，跟 agent 在 Slack 工作群讨论一个项目可能几天才回一次消息，但只要还在讨论就保持上下文。好处是以「有活动」为颗粒，连续讨论同一个项目时 context 持续保留，坏处是超过 idle 阈值后强制 reset 可能让用户体验不佳。`both` 是「任一触发就 reset」：这是 Hermes 默认模式，既有每天清盘的稳定性又有工作日连续的连贯性，多数场景都合适。`none` 是「永不 auto-reset」：典型用户是维护长期项目的人（小说创作、知识库整理），context 永远保留 agent 还「记得」用户在干什么。代价是 context 会无限增长所以必须依赖 compact 机制兜底。
+这 4 种模式对应 4 类真实用户群。`daily` 是「每天定时 reset」：典型用户是用 agent 当个人助理的人，作息规律，每天用一段时间晚上不用，凌晨 4 点（默认 at_hour）自动 reset 让第二天从干净状态开始。好处是每天一个清爽 session 不积累冗余上下文，坏处是熬夜用户可能 4 点突然失忆。`idle` 是「闲置超时 reset」：典型用户是项目协作场景，跟 agent 在 Slack 工作群讨论一个项目可能几天才回一次消息，但只要还在讨论就保持上下文。它以「有活动」为颗粒，连续讨论同一个项目时 context 持续保留；不过一旦超过 idle 阈值就被强制 reset，这点可能让用户不爽。`both` 是「任一触发就 reset」：这是 Hermes 默认模式，既有每天清盘的稳定性又有工作日连续的连贯性，多数场景都合适。`none` 是「永不 auto-reset」：典型用户是维护长期项目的人（小说创作、知识库整理），context 永远保留 agent 还「记得」用户在干什么。代价是 context 会无限增长所以必须依赖 compact 机制兜底。
 
 `notify_exclude_platforms` 字段是个很实用的细节：reset 时默认会给用户发通知（「agent 已重置上下文」），让用户知道为什么 agent 突然不记得之前的事。但对 api_server 和 webhook 这种程序调用方，发通知毫无意义反而是噪音，所以默认排除这两个平台。
 
@@ -406,7 +406,7 @@ def build_session_context_prompt(
 
 **第二件是 session 必须跟 user/scope 绑定，不能是全局的**。Codex 把 agent_path 和 agent_nickname 写进 SessionMeta（同一台机器上 Codex 给不同 agent role 用的 session 要能区分）、Claude Code 用 worktreeSession 让 git worktree 各自有独立 session（一个项目开多个 worktree 同时工作时 session 不能混）、OpenClaw 用 `{agentId}:{sessionId}` 拼接 key（同一个 sessionId 在不同 agent 视角下完全隔离）、Hermes 用 platform+chat_id 自然实现按平台和聊天上下文分隔。这个原则的反面是「全局 session pool」：如果所有用户、所有 agent、所有项目共享一个 session 集合，那 session 之间会互相污染，agent 在用户 A 那里学到的偏好会被错误地应用到用户 B 上。
 
-**第三件是 resume 不能只重放消息历史，必须把隐藏的状态也恢复**。这是 resume 这件事看似简单但很容易做错的地方。最容易踩的坑是：开发者实现 resume 时想着「把 messages 列表加载回来塞给模型就行了」，结果发现 agent resume 后表现得「像换了个人」：因为模型读对话历史时虽然能看到「用户让我改 foo.py」这类内容，但不知道当时的 cwd 在哪（结果找不到 foo.py 报错）、不知道当时的 approval mode 是什么（结果在每个 edit 上卡住等审批，而原本是 auto-accept）、不知道当时的 git state 是什么（基于错误的 commit 推理）。所以四家都强制在 session 元数据里保存这些「隐藏前提」：Codex 的 SessionMeta 第一行写 cwd、model、git_sha、agent_role、cli_version、sandbox_policy、approval_mode，Claude Code 的 sessionRestore 跨 7 个子系统恢复状态，OpenClaw 让上层调用方决定但提供 transcript_events 序列化框架，Hermes 把 SessionContext 重新构建。
+**第三点，resume 不能只重放消息历史，必须把隐藏的状态也恢复**。这是 resume 这件事看似简单但很容易做错的地方。最容易踩的坑是：开发者实现 resume 时想着「把 messages 列表加载回来塞给模型就行了」，结果发现 agent resume 后表现得「像换了个人」：因为模型读对话历史时虽然能看到「用户让我改 foo.py」这类内容，但不知道当时的 cwd 在哪（结果找不到 foo.py 报错）、不知道当时的 approval mode 是什么（结果在每个 edit 上卡住等审批，而原本是 auto-accept）、不知道当时的 git state 是什么（基于错误的 commit 推理）。所以四家都强制在 session 元数据里保存这些「隐藏前提」：Codex 的 SessionMeta 第一行写 cwd、model、git_sha、agent_role、cli_version、sandbox_policy、approval_mode，Claude Code 的 sessionRestore 跨 7 个子系统恢复状态，OpenClaw 让上层调用方决定但提供 transcript_events 序列化框架，Hermes 把 SessionContext 重新构建。
 
 ## §5 · 四家在 session 上的关键分歧
 
@@ -418,13 +418,13 @@ def build_session_context_prompt(
 
 虽然共同点确立了 session 设计的基本盘，但四家在「session 应该做多深」这件事上的分歧才是真正决定他们各自适合什么场景的核心。换一个角度看，「想做什么样的 agent」决定了你应该参考哪家的实现。
 
-**如果想做一个长期使用的开发者工具型 agent，用户希望能列出过去几个月所有的对话历史、能 resume 任意一次会话、能给 session 命名归档分类，那 Codex 的 JSONL 加 SQLite 双层架构是正确选择。** 这种场景的核心需求是「持久化完整、性能可控、跨时间引用」，Codex 的设计每一条都对得上：JSONL 给崩溃恢复能力、SQLite 索引给毫秒级查询、ThreadId 给跨进程的稳定身份、archived_sessions/ 子目录给老 session 归档。代价是工程复杂度高（要维护 JSONL 格式加 SQLite schema 加两者一致性），但对一个想做长期产品的开发者工具，这个代价是值得付的。
+**如果想做一个长期使用的开发者工具型 agent，用户希望能列出过去几个月所有的对话历史、能 resume 任意一次会话、能给 session 命名归档分类，那 Codex 的 JSONL 加 SQLite 双层架构是正确选择。** 这种场景的核心需求是「持久化完整、性能可控、跨时间引用」，Codex 的设计每一条都对得上：JSONL 给崩溃恢复能力、SQLite 索引给毫秒级查询、ThreadId 给跨进程的稳定身份、archived_sessions/ 子目录给老 session 归档。代价也实在：工程复杂度高，要维护 JSONL 格式、SQLite schema 以及两者之间的一致性。但对一个想做长期产品的开发者工具，这笔账值得付。
 
-**如果想做一个 IDE 集成的 agent，需要跟 cost tracker、file change tracking、todo list、worktree 这些 IDE 一等公民子系统深度协作，那 Claude Code 的 22 文件分层加 4 种 lifecycle source 是正确选择。** 这种场景的核心需求是「让 session 跟 IDE 的其他状态系统配合而不是替代它们」，Claude Code 的设计每个子系统独立演化、4 种 source hook 让 plugin 精确选择什么时候介入、warmup 禁令保证启动延迟可控。代价是 22 个文件长期维护成本高、sessionRestore 7 类状态的恢复顺序敏感（加新状态容易踩坑），但对 IDE 级 agent 这种代价是不可避免的。
+**如果想做一个 IDE 集成的 agent，需要跟 cost tracker、file change tracking、todo list、worktree 这些 IDE 一等公民子系统深度协作，那 Claude Code 的 22 文件分层加 4 种 lifecycle source 是正确选择。** 这种场景的核心需求是「让 session 跟 IDE 的其他状态系统配合而不是替代它们」，Claude Code 的设计每个子系统独立演化、4 种 source hook 让 plugin 精确选择什么时候介入、warmup 禁令保证启动延迟可控。换来的是长期维护负担：22 个文件要养，sessionRestore 7 类状态的恢复顺序敏感，加新状态容易踩坑。IDE 级 agent 绕不开这份复杂度。
 
-**如果想做一个 agent 框架而不是 agent 产品，不希望强加存储方案给用户，那 OpenClaw 的极简 session-id 是正确选择。** 这种场景的核心需求是「定义清晰的 contract，把 implementation 留给用户」，OpenClaw 只校验 UUID 格式加提供 session_key 命名空间加提供 transcript 序列化，剩下的全交给上层。代价是 out-of-box 体验差（用户上手要先选个 backend），但对框架定位的产品这是合理取舍。
+**如果想做一个 agent 框架而不是 agent 产品，不希望强加存储方案给用户，那 OpenClaw 的极简 session-id 是正确选择。** 这种场景的核心需求是「定义清晰的 contract，把 implementation 留给用户」，OpenClaw 只校验 UUID 格式加提供 session_key 命名空间加提供 transcript 序列化，剩下的全交给上层。换来的是 out-of-box 体验偏弱，用户上手前得先挑一个 backend。对框架而言这是合算的交换：用一份上手门槛换来了适配任何部署形态的灵活性。
 
-**如果想做一个多平台聊天 agent，要同时服务 Telegram、Slack、Discord 等多个平台，那 Hermes 的 SessionSource 加 4 种 reset 模式加 PII 安全平台清单是正确选择。** 这种场景的核心需求是「精确建模消息从哪来、按平台和场景定制 reset 策略、按平台能力区分能不能脱敏」，Hermes 的设计每一条都贴合：SessionSource 编码消息来源的 4 种 chat_type、SessionResetPolicy 提供 4 种 reset 模式可 per-platform 覆盖、_PII_SAFE_PLATFORMS 按 mention 语法精确划分。代价是 6 个以上平台兼容性自己管、reset 策略和 compact 之间的边界要写清楚，但对多平台 chat agent 这是必需的复杂度。
+**如果想做一个多平台聊天 agent，要同时服务 Telegram、Slack、Discord 等多个平台，那 Hermes 的 SessionSource 加 4 种 reset 模式加 PII 安全平台清单是正确选择。** 这种场景的核心需求是「精确建模消息从哪来、按平台和场景定制 reset 策略、按平台能力区分能不能脱敏」，Hermes 的设计每一条都贴合：SessionSource 编码消息来源的 4 种 chat_type、SessionResetPolicy 提供 4 种 reset 模式可 per-platform 覆盖、_PII_SAFE_PLATFORMS 按 mention 语法精确划分。担子落在 6 个以上平台的兼容性维护上，还要把 reset 策略和 compact 之间的边界划清楚。多平台 chat agent 这份复杂度省不掉。
 
 ## §6 · 我的点评
 
@@ -533,7 +533,7 @@ JSONL：只 append 一行（几 KB），write syscall 一次。Codex 一个 sess
 
 **3. 流式消费**
 
-Codex 的 TUI 想实时显示「agent 在干什么」。JSONL 可以 `tail -f` 流式读，每个新行就是一个事件。整文件 JSON 没法这样消费——读到文件中间 parse 失败。
+Codex 的 TUI 想实时显示「agent 在干什么」。JSONL 可以 `tail -f` 流式读，每个新行就是一个事件。整文件 JSON 没法这样消费，读到文件中间 parse 就会失败。
 
 **JSONL 的代价**
 
@@ -558,7 +558,7 @@ Codex 的 TUI 想实时显示「agent 在干什么」。JSONL 可以 `tail -f` �
 <details>
 <summary>**Q2 · 架构**：Claude Code 4 种 lifecycle source（startup / resume / clear / compact）为什么不合并成 2 种或 5 种？</summary>
 
-4 种数量恰到好处。每种对应根本不同的语义。
+4 种是合适的数量。每种对应根本不同的语义。
 
 **startup · 全新对话**
 
@@ -618,7 +618,7 @@ Hook 可以声明 `appliesTo: ['startup', 'resume']`（不在 clear / compact �
 
 **源码**：`claude-code/src/utils/sessionStart.ts:34-66`（`processSessionStartHooks` + 4 种 source 类型）。
 
-**追问**：「Codex 没有 clear / compact source 吗？」Codex 的 lifecycle 是 RolloutRecorderParams 的 Create / Resume 两种。compact 在 Codex 是 sub-agent（chapter 10），不是 lifecycle event。clear 不存在——Codex 不鼓励 /clear，鼓励开新 thread（cheap 操作）。两种产品定位不同。
+**追问**：「Codex 没有 clear / compact source 吗？」Codex 的 lifecycle 是 RolloutRecorderParams 的 Create / Resume 两种。compact 在 Codex 是 sub-agent（chapter 10），不是 lifecycle event。clear 不存在，Codex 不鼓励 /clear，而是鼓励开新 thread（cheap 操作）。两种产品定位不同。
 </details>
 
 <details>
@@ -1022,10 +1022,10 @@ Claude Code 2.0 之前，曾经有过这些"warmup"逻辑：
 
 每个 warmup 单独来看都合理：
 
-- "扫历史 session 加速 resume" — 帮用户更快进入工作
-- "加载 plugins" — 避免后续延迟
-- "git status" — context 准备
-- "fetch version" — 安全 / 修 bug
+- "扫历史 session 加速 resume"：帮用户更快进入工作
+- "加载 plugins"：避免后续延迟
+- "git status"：context 准备
+- "fetch version"：安全 / 修 bug
 
 每个 PR 增加 1-3 秒。一年下来 startup 从 2 秒变 11 秒。**没有任何一个 reviewer 说不**，因为每个看起来都"小且必要"。
 

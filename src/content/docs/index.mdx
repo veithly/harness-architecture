@@ -1,11 +1,11 @@
 ---
 title: Harness Architecture
-description: 拆 Codex、Claude Code、OpenClaw、Hermes 四个真实 Harness，作为自己做 Agent 的参考蓝本
+description: 拆 Codex、Claude Code、OpenClaw、Hermes 四个真实 harness，作为自己做 agent 的参考蓝本
 template: splash
 hero:
-  tagline: 把 Codex、Claude Code、OpenClaw、Hermes 放到同一张编辑台上：不是展示 logo，而是直接标出 loop、context、tools、verifier、memory、sandbox 这些取舍发生的位置。
+  tagline: 把 Codex、Claude Code、OpenClaw、Hermes 摆到一起比：不是贴一排 logo，而是直接标出 loop、context、tools、verifier、memory、sandbox 这些取舍各自发生在哪。
   image:
-    alt: Codex、Claude Code、OpenClaw、Hermes 四个 agent harness 的编辑台拼贴图
+    alt: Codex、Claude Code、OpenClaw、Hermes 四个 agent harness 的并排对比图
     file: ../../assets/homepage-editorial-proofwall.png
   actions:
     - text: 读 01 总览
@@ -37,9 +37,9 @@ import LandingKinetics from '@components/LandingKinetics.astro';
   <section className="aap-signal-section" aria-labelledby="aap-signal-title">
     <div className="aap-signal-copy">
       <p className="aap-kicker">issue 02 / first spread</p>
-      <h2 id="aap-signal-title">首页先给判断，不先卖概念。</h2>
+      <h2 id="aap-signal-title">先给判断，不先卖概念。</h2>
       <div className="aap-copy-line">
-        这版 landing page 按编辑台组织：巨型标题负责识别，配图像一张被批注过的 proof wall，下面的目录把 22 章拆成可复查的工程问题。
+        这版首页不堆术语。大标题说清这是在比什么，配图直接标出 loop、context、verifier、memory 这些决策发生在哪，下面的目录把 22 章拆成可以逐条复查的工程问题。
       </div>
     </div>
     <div className="aap-proof-card" aria-label="页面设计规则">
@@ -52,7 +52,7 @@ import LandingKinetics from '@components/LandingKinetics.astro';
   <section className="aap-proof-section" aria-labelledby="aap-proof-title">
     <div className="aap-section-head">
       <p className="aap-kicker">contents / no generic best practices</p>
-      <h2 id="aap-proof-title">像翻杂志目录一样进入架构问题。</h2>
+      <h2 id="aap-proof-title">像翻目录一样进入架构问题。</h2>
     </div>
     <ol className="aap-magazine-contents">
       <li>
@@ -68,7 +68,7 @@ import LandingKinetics from '@components/LandingKinetics.astro';
         <span className="aap-row-num">02</span>
         <div>
           <h3>再拆运行闭环</h3>
-          <p>Observe、plan、act、verify 不是流程图，是失败恢复边界。</p>
+          <p>Observe、plan、act、verify 不只是流程图，更像一道道失败恢复的边界。</p>
         </div>
         <i></i>
         <strong data-count="32">00</strong>
@@ -86,7 +86,7 @@ import LandingKinetics from '@components/LandingKinetics.astro';
         <span className="aap-row-num">04</span>
         <div>
           <h3>把结论装进 Skill</h3>
-          <p>读完不是收藏链接，而是得到下一次实现可以直接调用的工作记忆。</p>
+          <p>读完不是收藏一堆链接，而是拿到下次动手时能直接用上的工作记忆。</p>
         </div>
         <i></i>
         <strong data-count="68">00</strong>
@@ -97,7 +97,7 @@ import LandingKinetics from '@components/LandingKinetics.astro';
   <section className="aap-system-section" aria-labelledby="aap-system-title">
     <div className="aap-section-head">
       <p className="aap-kicker">reference systems / collisions</p>
-      <h2 id="aap-system-title">四个系统像四张贴进版面的证据。</h2>
+      <h2 id="aap-system-title">四个系统，四份能直接对照的证据。</h2>
     </div>
     <div className="aap-system-grid">
       <a className="aap-system-tile aap-system-codex aap-magnetic" href="/systems/codex/">
@@ -126,9 +126,9 @@ import LandingKinetics from '@components/LandingKinetics.astro';
   <section className="aap-skill-section" aria-labelledby="aap-skill-title">
     <div>
       <p className="aap-kicker">colophon / companion skill</p>
-      <h2 id="aap-skill-title">最后一页不是 CTA，是操作索引。</h2>
+      <h2 id="aap-skill-title">最后一页不是 CTA，是一份能查的操作索引。</h2>
       <div className="aap-copy-line">
-        <a href="/skill/">build-your-own-agent</a> 把 22 章压缩成 10 条铁律、8 维度选型表、Python scaffold、诊断脚本和安全检查。它不是资料索引，是下一次开工前可以直接加载的编辑手册。
+        <a href="/skill/">build-your-own-agent</a> 把 22 章压成 10 条铁律、8 维度选型表、Python scaffold、诊断脚本和安全检查。它不只是资料索引，更像下次开工前可以直接加载的工作手册。
       </div>
     </div>
     <a className="aap-final-cta aap-magnetic" href="/skill/">打开配套 Skill</a>

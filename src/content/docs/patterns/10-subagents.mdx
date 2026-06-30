@@ -120,7 +120,7 @@ pub(crate) async fn run_codex_thread_interactive(
 
 注意 `inherited_exec_policy` 这一行：这是 Codex 子 agent 设计里最关键的安全边界。子 agent 不能比父更宽松，父 session 禁掉的 binary 子 agent 也禁，没有「开子 agent 绕过 execpolicy」的逃生通道。这一条约束直接堵死了一类很恶心的攻击模式：如果父子能权限分离，恶意 prompt 就可以诱导 agent 开一个子 agent「帮我跑这个工具」绕过父的限制，等于多了一道权限提升的攻击面。Codex 直接关闭这条路。同样的逻辑也适用于 plugins、mcp_manager、skills_manager、environment_manager、agent_control、models_manager、auth_manager 这些共享服务：它们全部是 Arc 引用从父继承，子 agent 看到的工具集就是父看到的（减去主动 disable 的几个），没有任何渠道让子 agent 拿到比父更多的能力。
 
-approval 流程的处理也走同样的思路——子 agent 想跑危险命令时，不会自己弹 UI 让用户审批（如果允许，用户会看到一堆来自不同子 agent 的弹窗根本分不清在审批什么），而是把 approval event 推回父 session，由父 session 决定要不要弹给用户。所以从用户视角看，所有审批都来自父 agent，子 agent 是「父的一只手」，UI 一致性始终保持。这跟第 09 章讲到的 review sub-agent 用 `AskForApproval::Never` 是同一种思路在更广义场景下的应用——子 agent 永远不弹 UI，所有用户交互走父。
+approval 流程的处理也走同样的思路：子 agent 想跑危险命令时，不会自己弹 UI 让用户审批（如果允许，用户会看到一堆来自不同子 agent 的弹窗根本分不清在审批什么），而是把 approval event 推回父 session，由父 session 决定要不要弹给用户。所以从用户视角看，所有审批都来自父 agent，子 agent 是「父的一只手」，UI 一致性始终保持。这跟第 09 章讲到的 review sub-agent 用 `AskForApproval::Never` 是同一种思路在更广义场景下的应用：子 agent 永远不弹 UI，所有用户交互走父。
 
 ### Claude Code · 把子 agent 跟所有其他异步执行统一成一个 Task 抽象
 
@@ -546,7 +546,7 @@ MEMORY.md 是 Hermes 的长期记忆文件，用户级共享。如果子 agent �
 
 **`execute_code` · 子应该用工具，不应该再 spawn Python**
 
-`execute_code` 是 Hermes 的 Python sandbox。子 agent 拿到后，会倾向「写个 Python 脚本解决」。但子的任务通常是「分析这段日志」「总结这个文件」——应该 reasoning + 用 read_file / grep 工具，不是再 spawn 一层 Python 进程。一旦子 agent 也用 execute_code：
+`execute_code` 是 Hermes 的 Python sandbox。子 agent 拿到后，会倾向「写个 Python 脚本解决」。但子的任务通常是「分析这段日志」「总结这个文件」，应该 reasoning + 用 read_file / grep 工具，不是再 spawn 一层 Python 进程。一旦子 agent 也用 execute_code：
 
 - 多一层进程，资源占用 ×2
 - Python 错误不好 propagate 到父
@@ -587,7 +587,7 @@ final answer, reply ONLY with NO_REPLY.
 
 1. **位置紧贴行为**：模型刚 spawn 完，立即读到「不要 poll」。比 system prompt 在对话顶部更显著。
 2. **per-call 重复**：每次 spawn 都塞一次。模型即使忘了 system，也会被反复提醒。
-3. **指向具体反例**：「不要调 sessions_list / sessions_history / exec sleep」——给出具体禁忌，比抽象「不要 poll」可执行。
+3. **指向具体反例**：「不要调 sessions_list / sessions_history / exec sleep」，给出具体禁忌，比抽象「不要 poll」可执行。
 4. **NO_REPLY 协议**：教模型在「子完成在最终答之后」时怎么 graceful 处理（避免重复回答 + 重新触发）。
 
 **配套机制**
@@ -665,7 +665,7 @@ Task 抽象适合「**异步执行多样化但调度模式相似**」的产品�
 
 **源码**：`claude-code/src/Task.ts:6-30`（`TaskType` + `TaskStatus` 定义）+ `src/tools/TaskCreateTool/`。
 
-**追问**：「dream 这种 task 是怎么 fit 进 7 种 type 的？」dream 是 2.1 加的「后台预热」，用户没主动触发。要 fit 进 Task 抽象，dispatcher 加了 `auto_triggered` flag，UI 上 dream 默认不显示（除非用户开 debug 视图）。这是抽象漏出的具体例子——为了塞 dream 进来，抽象多了一个属性。
+**追问**：「dream 这种 task 是怎么 fit 进 7 种 type 的？」dream 是 2.1 加的「后台预热」，用户没主动触发。要 fit 进 Task 抽象，dispatcher 加了 `auto_triggered` flag，UI 上 dream 默认不显示（除非用户开 debug 视图）。这是抽象漏出的具体例子：为了塞 dream 进来，抽象多了一个属性。
 </details>
 
 <details>
@@ -944,7 +944,7 @@ chrome devtools performance tab
 
 目的：**安全约束跨进程保持**。
 
-场景：父 spawn 子，记录 child.spawnDepth = 1。父进程 crash 重启。如果重启后 spawnDepth 丢失（in-memory only），子重新加载会以为自己是 root，可以再 spawn 孙——MAX_DEPTH 防线失效。
+场景：父 spawn 子，记录 child.spawnDepth = 1。父进程 crash 重启。如果重启后 spawnDepth 丢失（in-memory only），子重新加载会以为自己是 root，可以再 spawn 孙，MAX_DEPTH 防线失效。
 
 持久化 spawnDepth 让安全约束在崩溃 / 重启 / 跨进程下都保持。
 

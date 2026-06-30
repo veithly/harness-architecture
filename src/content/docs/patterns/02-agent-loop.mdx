@@ -25,7 +25,7 @@ import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
 <AgentLoopSVG nodes={['Observe','Plan','Act','Verify']} caption="共有的最小循环：观察 → 规划 → 行动 → 验证" />
 
-把四个系统放在同一张泳道图里，每一格的工程取舍一目了然：
+把四个系统放在同一张泳道图里，每一格的工程取舍就很清楚了：
 
 <Diagram src="/diagrams/02-agent-loop-lanes.svg" alt="四系统 Agent Loop 泳道对比图" caption="同一个循环，四种工程取舍：停止条件、verifier、可重入与并发模型各不相同。" />
 
@@ -54,7 +54,7 @@ loop 内部按时间粒度从短到长分四层：
 - **Turn**：一次「模型说话 → 工具执行 → 模型再说话」的最小循环，对应 `TurnContext`（由 `new_default_turn()` 构造）。每个 Turn 有自己的工具列表、模型参数、超时设置。
 - **Goal**：长周期任务目标（比如「修复这个 bug」可能跨几十个 Turn）。通过 `apply_goal_resume_runtime_effects` 和 `continue_active_goal_if_idle` 实现「按目标恢复」而不是「按上次对话恢复」。上次断在某个 Turn 中间时，恢复不从那个 Turn 续起，而是从「这个 Goal 上一次稳定状态」续起，逻辑更清晰。
 
-这种四层抽象是 Codex 区别于其他三家最深的工程动作。
+这套四层抽象也是 Codex 区别于其他三家最深的一刀。
 
 **Verifier 设计**：Codex 根本不信任模型自评，所有判定走外部硬验证：
 
@@ -63,11 +63,11 @@ loop 内部按时间粒度从短到长分四层：
 - `run tests` 看测试退出码，0 才算通过，非 0 就反馈错误让模型继续修。
 - `execpolicy` 用 Starlark DSL 规则审查每条 shell 命令，不在白名单的命令直接拒绝。
 
-四个硬 verifier 串联，模型几乎没空间装作完成了。代价是只在 coding 场景生效。让 Codex 写 PRD 或做调研，这四个 verifier 全部失灵（没测试可跑、没 patch 要打）。
+四个硬 verifier 串联，模型几乎没空间装作完成了。但这套只在 coding 场景生效。让 Codex 写 PRD 或做调研，这四个 verifier 全部失灵（没测试可跑、没 patch 要打）。
 
 **持久化设计**：每步都通过 `flush_rollout()` 把事件写进 rollout JSONL，这个文件就是 loop 的物理时间线。机器重启了读 rollout 重建状态，用户看 agent 历史回放 rollout，做行为分析聚合多份 rollout。`resume_agent_from_rollout`（在 `agent/control.rs`）是从任意 rollout 续跑的入口。多 agent 通信也走同一套机制：`send_inter_agent_communication` 把 subagent 之间的消息写进 rollout。subagent 可以像独立进程一样被 spawn、interrupt、shutdown，主 agent 通过观察 rollout 就能知道 subagent 在做什么，不用额外 IPC。
 
-> Codex 是四家里 loop 工程化做得最深的一个，代价是所有抽象都围绕 coding 设计（Turn、Goal、patch、tests），跨场景复用难度大。
+> Codex 是四家里 loop 工程化做得最深的一个，但所有抽象都围绕 coding 设计（Turn、Goal、patch、tests），跨场景复用难度大。
 
 ### Claude Code · 7 种 transition.reason 把状态机做到最显式
 
@@ -134,7 +134,7 @@ async function* queryLoop(params, consumedCommandUuids) {
 
 **Memory prefetch 用 TS 5 `using` 关键字**（line 301）：`using pendingMemoryPrefetch = startRelevantMemoryPrefetch(...)`。loop 任何路径退出都自动 dispose，不用手动写 finally。Skill prefetch 在 `EXPERIMENTAL_SKILL_SEARCH` flag 后，每轮预取一次。模型流式期间已经在后台找候选 skill，skill 命中时延接近零。
 
-> 点评：Claude Code 把出错重试、上下文超长、预算耗尽全部建模成 transition 标签，loop 状态机比另外三家更显式。代价是 query.ts 1729 行所有路径耦合在一起没有插件钩子。想给 verifier 加自定义中间件、替换压缩策略、接外部观测器，只能 fork 整个 query.ts。
+> 点评：Claude Code 把出错重试、上下文超长、预算耗尽全部建模成 transition 标签，loop 状态机比另外三家更显式。问题在于 query.ts 1729 行所有路径耦合在一起没有插件钩子。想给 verifier 加自定义中间件、替换压缩策略、接外部观测器，只能 fork 整个 query.ts。
 
 ### OpenClaw · loop 做成可观察的后台 job，整个管线官方文档化
 
@@ -150,7 +150,7 @@ OpenClaw 是四家里唯一显式把整个 loop 写成官方文档的（`docs/co
 4. **`subscribeEmbeddedPiSession`**：把 pi-agent-core 的内部事件桥接成 3 个外部流：`assistant`（模型说话）、`tool`（工具调用）、`lifecycle`（会话状态变更）。外部消费者订阅这三个流就能完整观察 loop 状态。
 5. **`agent.wait`**：阻塞在 `lifecycle: end | error` 事件上，要么拿到最终结果，要么拿到错误。
 
-**Verifier 设计**：OpenClaw 走 verifier 完全中间件化路线。十几个 plugin hook（`before_tool_call`、`after_tool_call`、`tool_result_persist`、`tool_loop_detection` 等）让 verifier 不写死在 loop 里，而是注册成可插拔的中间件。想给某个企业 agent 加「PR 必须有 reviewer 才能 merge」的 verifier？写个 plugin hook 注册到 `after_tool_call` 就行，不用改 loop 源码。这是 OpenClaw 二开友好度最高的根本原因。
+**Verifier 设计**：OpenClaw 走 verifier 完全中间件化路线。十几个 plugin hook（`before_tool_call`、`after_tool_call`、`tool_result_persist`、`tool_loop_detection` 等）让 verifier 不写死在 loop 里，而是注册成可插拔的中间件。想给某个企业 agent 加「PR 必须有 reviewer 才能 merge」的 verifier？写个 plugin hook 注册到 `after_tool_call` 就行，不用改 loop 源码。OpenClaw 二开友好度最高，根子就在这。
 
 **Session lane 设计**：同 session 内的多个 run 强制串行化（不会并发跑），避免工具状态和历史消息的竞态。用户连续发 3 条消息，OpenClaw 按发送顺序串行处理，而不是同时跑 3 个 loop 抢同一个 conversation history。Codex 和 Hermes 都没显式做这一层（默认假设单用户单 session），并发场景下容易出问题。
 
@@ -169,9 +169,9 @@ while (api_call_count < self.max_iterations
 
 这一行 while 后面塞满了长期 agent 该有的所有支撑：
 
-**IterationBudget 设计**：默认父 agent 90 步，subagent 50 步（subagent 故意比父短，防止跑太多步浪费父的 budget）。耗尽后不直接退出，给模型一次 grace call 说最后一句话（让模型有机会总结当前进度而不是中断在半截）。grace call 后还不够就进入 `_handle_max_iterations()`，剥掉所有工具让模型做最终总结（剥掉工具是强制模型不再尝试新动作，专注总结）。这种软兜底是 Hermes 对 loop 收敛的设计：不强行 kill，引导优雅退出。
+**IterationBudget 设计**：默认父 agent 90 步，subagent 50 步（subagent 故意比父短，防止跑太多步浪费父的 budget）。耗尽后不直接退出，给模型一次 grace call 说最后一句话（让模型有机会总结当前进度而不是中断在半截）。grace call 后还不够就进入 `_handle_max_iterations()`，剥掉所有工具让模型做最终总结（剥掉工具是强制模型不再尝试新动作，专注总结）。Hermes 的 loop 收敛就靠这种软兜底：不强行 kill，引导优雅退出。
 
-**Memory 前置**：loop 开始前调一次 `_memory_manager.prefetch_all()`，把当前用户的长期记忆（偏好、过往任务、人物关系等）一次性预取到内存。整个 loop 期间所有 memory 查询都从内存读，省掉 N 次 RAG 延迟。这种批量预取代替按需查询的设计专为长跑 agent 优化。单次会话可能用到 50 次 memory，每次现查就是 50 次 LLM embedding 加向量数据库查询。预取一次缓存全 loop 把这部分延迟降到零。
+**Memory 前置**：loop 开始前调一次 `_memory_manager.prefetch_all()`，把当前用户的长期记忆（偏好、过往任务、人物关系等）一次性预取到内存。整个 loop 期间所有 memory 查询都从内存读，省掉 N 次 RAG 延迟。换成按需查询，单次会话可能用到 50 次 memory，每次现查就是 50 次 LLM embedding 加向量数据库查询。预取一次缓存全 loop，这部分延迟直接归零。
 
 **Verifier 设计**：Hermes 故意没有 Codex 那种 run tests 的硬 verifier。自评放在两个地方：
 
@@ -180,7 +180,7 @@ while (api_call_count < self.max_iterations
 
 loop 结束后写回 memory，下次类似任务 prefetch 时注入这些经验。verifier 摊到时间轴上：单次 loop 不严格，但每次都比上次好。
 
-**Interrupt 加 Checkpoint 设计**：每个 turn 开头 `checkpoint_mgr.new_turn()` 创建 checkpoint，整个 loop 检查 `_interrupt_requested` 标志。长期 agent 因此可以中断后回到上一 checkpoint，不用从头重跑。这是长跑场景必备：一个跑了 3 小时的 agent 半路被打断，没有 checkpoint 就只能从零开始。
+**Interrupt 加 Checkpoint 设计**：每个 turn 开头 `checkpoint_mgr.new_turn()` 创建 checkpoint，整个 loop 检查 `_interrupt_requested` 标志。长期 agent 因此可以中断后回到上一 checkpoint，不用从头重跑。长跑场景没这一层撑不住：一个跑了 3 小时的 agent 半路被打断，没有 checkpoint 就只能从零开始。
 
 > Hermes 的 loop 哲学：单次循环短一点没关系，跨会话的累积才是产出。同一个用户用一个月，Hermes 比第一天聪明得多，因为 memory 在积累，skill 在被触发，insights 在写回。
 
@@ -209,7 +209,7 @@ System prompt 是 agent 的第一性参数。模型一样、tool 一样，prompt
 
 Codex 把 prompt 写死在仓里，每个模型版本一份完整 markdown：`gpt-5.2-codex_prompt.md`、`gpt-5.1-codex-max_prompt.md`、`gpt_5_codex_prompt.md`、`prompt_with_apply_patch_instructions.md`。**没有运行时动态拼接**，模型选定的瞬间，prompt 也就选定了。
 
-好处：cache 命中率拉满，prompt 行为可 diff 可回滚。代价：想给某个 user 加一句话，得 fork repo。
+这样 cache 命中率拉满，prompt 行为可 diff 可回滚；缺点也明显，想给某个 user 加一句话就得 fork repo。
 
 <SourceBlock path="REF/codex/codex-rs/core/gpt-5.2-codex_prompt.md" lines="1-12" system="codex" summary="开篇身份 + general + editing constraints">
 
@@ -611,7 +611,7 @@ OpenClaw 把「持久化摘要」和「内存剪枝」分成两件事：
 
 `identifierPolicy: 'strict' | 'off' | 'custom'` 控制摘要时是否保留 opaque ID（issue 编号、commit hash）。这条策略让压缩本身也能被外部规则约束。
 
-**小结**：压缩对象上四家各异——Codex 整段历史，Claude Code 4 道串联，OpenClaw 双层分工，Hermes 中段保头尾。摘要产出方分别是主模型、forked agent、可配独立模型、aux 廉价模型。两个最值得参考的细节：Hermes 的 `SUMMARY_PREFIX` 防劫持文案，以及 Claude Code 的「断路器加多档阈值」组合。
+**小结**：压缩对象上四家各异。Codex 压整段历史，Claude Code 4 道串联，OpenClaw 双层分工，Hermes 中段保头尾。摘要产出方分别是主模型、forked agent、可配独立模型、aux 廉价模型。两个最值得参考的细节：Hermes 的 `SUMMARY_PREFIX` 防劫持文案，以及 Claude Code 的「断路器加多档阈值」组合。
 
 ---
 
@@ -765,7 +765,7 @@ Codex 把「task done」做成可机器判断的事，四个硬 verifier 串联�
 - `execpolicy` 在每次命令执行前过一道规则审查（允许、询问、拒绝）。
 - `goals.rs` 周期性检查 goal 是否满足判断条件。
 
-四个串到一起，loop 不会轻易停。代价是这套只对 coding 场景生效。让 loop 去「写 PRD」或「做调研」这种没有 exit code 的事，四个硬 verifier 全部失效。
+四个串到一起，loop 不会轻易停。但这套只对 coding 场景生效。让 loop 去「写 PRD」或「做调研」这种没有 exit code 的事，四个硬 verifier 全部失效。
 
 #### OpenClaw · verifier 中间件化
 
@@ -786,7 +786,7 @@ Hermes 单次 loop 跑 90 步（subagent 50 步），然后强制 grace call、�
 2. 自评写进 `memory`。
 3. 下次类似任务，`memory_manager.prefetch_all()` 把「上次哪里出错、上次哪里做对」提前注入。
 
-Hermes 的 verifier 不是单 loop 关口，而是跨会话的累积学习。短期不严格，长期收敛。
+Hermes 的 verifier 是跨会话的累积学习，不是单 loop 关口。短期不严格，长期收敛。
 
 **小结**：四家覆盖了 verifier 的不同区段。Codex 用四个硬 verifier 串联，loop 可被外部信任，但只对 coding 生效。OpenClaw 把硬 verifier 抽成 hook，可任意挂载外部检查。Claude Code 靠 `TOKEN_BUDGET` 软 nudge 节省 token。Hermes 把检查摊到跨会话的 memory 累积。自己实现 agent 时，三层都得有：硬 verifier 给外部信任、软 verifier 控 token、放任型 verifier 兜底。
 
@@ -814,13 +814,13 @@ Hermes 的 verifier 不是单 loop 关口，而是跨会话的累积学习。短
 
 四家代表了 Agent Loop 设计的四种典型取舍：
 
-**做 coding agent 且任务机器可验证（exit code、tests、patch grammar）**：参考 Codex 的 submit、event、turn、goal 四层事件机器路线。每一步都写盘可重放，4 个硬 verifier 串到底完全不依赖模型自评，rollout 物理可恢复让任何中断都能续上。代价是这套强约束只在 coding 场景生效，离开 coding 后 4 个 verifier 全部失灵。
+**做 coding agent 且任务机器可验证（exit code、tests、patch grammar）**：参考 Codex 的 submit、event、turn、goal 四层事件机器路线。每一步都写盘可重放，4 个硬 verifier 串到底完全不依赖模型自评，rollout 物理可恢复让任何中断都能续上。强约束的代价也在此：这套只在 coding 场景生效，离开 coding 后 4 个 verifier 全部失灵。
 
-**做 IDE 工具、桌面 agent、强可观测性场景**：参考 Claude Code 的 transition.reason 标签加 4 道压缩管线加 TOKEN_BUDGET 软 verifier 路线。loop 的所有「为什么还在跑」全部显式建模成标签，任何外部观察工具都能从 rollout 一眼看出 loop 当时在做什么。4 道压缩管线加 3 次断路器避免 OOM 状态烧光 quota，TOKEN_BUDGET 软 verifier 把「按 token 收敛速率判退」做成 60 行算法，对所有场景普适。代价是 query.ts 1729 行单文件耦合无插件钩子，定制只能 fork。
+**做 IDE 工具、桌面 agent、强可观测性场景**：参考 Claude Code 的 transition.reason 标签加 4 道压缩管线加 TOKEN_BUDGET 软 verifier 路线。loop 的所有「为什么还在跑」全部显式建模成标签，任何外部观察工具都能从 rollout 一眼看出 loop 当时在做什么。4 道压缩管线加 3 次断路器避免 OOM 状态烧光 quota，TOKEN_BUDGET 软 verifier 把「按 token 收敛速率判退」做成 60 行算法，对所有场景普适。它的短板也很具体：query.ts 1729 行单文件耦合，没有插件钩子，定制只能 fork。
 
-**做控制面、多通道 agent server、多用户并发场景**：参考 OpenClaw 的 RPC 后台 job 加 session lane 加 plugin hooks 路线。loop 是可观察的后台 job 而非函数调用，让 Telegram、Slack、Web 多通道天然适配。session lane 串行化同 session 多个 run 解决并发抢锁。十几个 plugin hook 让 verifier、审计、缓存全部中间件化，二开友好度最高。代价是 hook 多调试链路长（一次工具调用过 5-6 层中间件出问题难定位），没有内建 coding verifier。
+**做控制面、多通道 agent server、多用户并发场景**：参考 OpenClaw 的 RPC 后台 job 加 session lane 加 plugin hooks 路线。loop 是可观察的后台 job 而非函数调用，让 Telegram、Slack、Web 多通道天然适配。session lane 串行化同 session 多个 run 解决并发抢锁。十几个 plugin hook 让 verifier、审计、缓存全部中间件化，二开友好度最高。要小心的是 hook 一多调试链路就长（一次工具调用过 5-6 层中间件，出问题难定位），而且它没有内建 coding verifier。
 
-**做长跑助理、跨会话学习场景**：参考 Hermes 的 IterationBudget 加 memory prefetch 加 insights 自评路线。短期不严格（单 loop 跑短一点没关系）但长期收敛（memory 累积让下次更聪明）。grace call 兜底让 budget 耗尽时优雅退出而非硬 kill，insights 把 verifier 摊到时间轴上让 agent 跨会话变好。代价是没有结构化硬 verifier，强依赖 skill 自评。trajectory 大了之后 compaction 会改变 loop 表现（同一个 trajectory 不同时间观察可能压缩程度不同）。
+**做长跑助理、跨会话学习场景**：参考 Hermes 的 IterationBudget 加 memory prefetch 加 insights 自评路线。短期不严格（单 loop 跑短一点没关系）但长期收敛（memory 累积让下次更聪明）。grace call 兜底让 budget 耗尽时优雅退出而非硬 kill，insights 把 verifier 摊到时间轴上让 agent 跨会话变好。缺口在 verifier：没有结构化硬校验，强依赖 skill 自评。另外 trajectory 大了之后 compaction 会改变 loop 表现（同一个 trajectory 不同时间观察可能压缩程度不同）。
 
 ## §6 · 我的点评
 
@@ -926,9 +926,9 @@ Hermes 用 `IterationBudget(90, 50)`：90 步硬上限，50 步软上限触发 `
 <details>
 <summary>**Q3 · 设计抉择**：硬 verifier、软 verifier、放任型兜底三层各承担什么职责？为什么三层都要有？</summary>
 
-硬 verifier 是脚本、编译器、测试这种「机器可判断、不依赖 LLM」的检查，比如 `cargo build` 退出码、`pytest` 通过率、`apply_patch` 是否能干净 apply。好处是确定性强、可被外部审计。代价是只在能写 oracle 的场景成立，coding 之外难找到等价物。
+硬 verifier 是脚本、编译器、测试这种「机器可判断、不依赖 LLM」的检查，比如 `cargo build` 退出码、`pytest` 通过率、`apply_patch` 是否能干净 apply。它的确定性强、可被外部审计。但只在能写 oracle 的场景成立，coding 之外难找到等价物。
 
-软 verifier 是模型可读的提示信号，比如 Claude Code 的 `TOKEN_BUDGET` 在 90% 时 nudge「请你简短回答」。它不强制停，但让模型自己改变行为。好处是适用面广，坏处是行为不稳定，依赖模型对 nudge 的服从度。
+软 verifier 是模型可读的提示信号，比如 Claude Code 的 `TOKEN_BUDGET` 在 90% 时 nudge「请你简短回答」。它不强制停，但让模型自己改变行为。适用面广，行为却不稳定，依赖模型对 nudge 的服从度。
 
 放任型兜底是硬上限，比如 `max_iterations`、`max_tokens`、`max_tool_calls`。它不判断对错，只防 loop 跑爆系统。所有四家都有这一层，差别只在数字。
 
@@ -1025,11 +1025,11 @@ LLM-as-judge 没有确定 oracle，硬 verifier 路线（Codex）不适用。你
 <details>
 <summary>**Q10 · 开放题**：给你 1 天时间，把一个现有 chatbot 改造成 coding agent，最优先加哪 3 块？</summary>
 
-第一块加**工具系统加沙箱**（4-6 小时）：先实现 `read_file`、`apply_patch`、`run_shell` 三个工具，跑在 docker 或 ssh 子进程，确保 chatbot 能动文件。这块不加 chatbot 就还是 chatbot。
+先把**工具系统加沙箱**搭起来（4-6 小时）：实现 `read_file`、`apply_patch`、`run_shell` 三个工具，跑在 docker 或 ssh 子进程，确保 chatbot 能动文件。这步不做，chatbot 就还是 chatbot。
 
-第二块加**硬 verifier**（2 小时）：选一个二值信号，通常是 `cargo build` 或 `pytest`，挂在 loop 末尾。这块不加，loop 会无限制改文件然后说「完成了」。
+接着加**硬 verifier**（2 小时）：选一个二值信号，通常是 `cargo build` 或 `pytest`，挂在 loop 末尾。没有它，loop 会无限制改文件然后说「完成了」。
 
-第三块加**停止条件加事件流**（2 小时）：参考 Codex 的 `submit/next_event/turn` 抽象，把每一步执行写成 JSON event，给 stop 加 `goal_satisfied || max_iterations || verifier_failed_3_times`。这块不加，调试会很痛苦。
+最后补**停止条件加事件流**（2 小时）：参考 Codex 的 `submit/next_event/turn` 抽象，把每一步执行写成 JSON event，给 stop 加 `goal_satisfied || max_iterations || verifier_failed_3_times`。没有它，调试会很痛苦。
 
 剩下不在这 3 块里的（subagent、memory、multi-channel entry）都可以下周加。第 0 优先级的是 **system prompt 改造**，但这块通常不需要单独 1 天，写在工具系统之前花 30 分钟就能完成。
 

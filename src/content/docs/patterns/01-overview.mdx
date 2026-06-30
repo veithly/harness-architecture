@@ -276,7 +276,7 @@ Turn 的标准定义：从模型一次回复（含可能的工具调用）到下
 工程选择。原因有 4 个：
 
 1. **模型训练偏 markdown**：所有主流 LLM 在预训练阶段见过比 JSON 多得多的 markdown。让模型读 markdown 错误率更低。
-2. **人类可读**：debug 时直接看 prompt 一目了然。JSON 嵌套层级深，看 system prompt 要折叠展开。
+2. **人类可读**：debug 时直接看 prompt 就能读懂。JSON 嵌套层级深，看 system prompt 还得来回折叠展开。
 3. **可流式追加**：markdown 的 section（`##` `###`）天然支持「再加一段」。JSON 要重排整个对象。
 4. **diff 友好**：prompt 文件入仓后 git diff 易读。
 

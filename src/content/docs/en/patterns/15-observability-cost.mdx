@@ -16,7 +16,7 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §1 · TL;DR
 
-<Verdict tldr="Observing an agent is fundamentally about settling four ledgers at the same time: how many tokens it used, how many dollars that costs, how slow each response was, and how often it failed. Each of those four ledgers matters differently depending on how the agent is deployed, and that is exactly why the four systems make wildly different trade-offs. Codex treats observability as production infrastructure — the whole capability is split across three completely independent modules: one wires the agent into the industry-standard OpenTelemetry protocol (the CNCF-stewarded observability standard that unifies metrics, logs, and traces into one wire format) so it can plug into any enterprise backend (Datadog, Honeycomb, Splunk), one rolls up business-level events (which skill the user invoked, which tools ran, which files were changed, how many lines of generated code were actually accepted), and one packages the whole conversation into an offline-replayable trace bundle (a single zip containing session ID, all events, configuration, and the rollout JSONL — can be fed back into Codex to reconstruct the original state). Claude Code goes the IDE-native route — it hardcodes the price of every supported model right into the source code (price tier constants baked into the source — accepting that every price change needs a new release), persists every session to a JSONL file on disk, and lets the user run one terminal command that uses the strongest model to analyze their own conversation history and produce a readable report. OpenClaw takes the 'event bus' angle — it defines about a dozen semantically clean diagnostic event types (model usage, webhook lifecycle, message queue lifecycle, session stuck signal, tool looping signal) and dispatches them through a listener pattern (the publish-subscribe observer pattern), leaving the actual sink (a monitoring platform, a local file, a private Elasticsearch — a full-text search and analytics engine) entirely up to the deployer. Hermes treats cost precision as the top priority — it defines a vendor-neutral `CanonicalUsage` struct, ranks pricing sources into a six-level confidence ladder (`provider_cost_api` &gt; `provider_generation_api` &gt; `provider_models_api` &gt; `official_docs_snapshot` &gt; `user_override` &gt; `custom_contract` — actual provider cost beats published rates beats user overrides beats negotiated contracts), tags every cost record with «how confident am I in this number», persists everything to a local SQLite database, and ships a local reporting tool that prints aggregated statistics. Bottom line: borrow Codex's three-module split for enterprise agents, borrow Claude Code for developer self-serve reports, borrow OpenClaw for an event pipeline that fits many deployment shapes, and borrow Hermes for privacy-sensitive local services that need accurate billing." />
+<Verdict tldr="Observing an agent means settling four ledgers at once: how many tokens it used, how many dollars that costs, how slow each response was, and how often it failed. Those four ledgers carry different weight depending on how the agent is deployed, which is exactly why the four systems make such different trade-offs. Codex treats observability as production infrastructure and splits the capability across three independent modules. One wires the agent into the industry-standard OpenTelemetry protocol (the CNCF-stewarded standard that unifies metrics, logs, and traces into one wire format) so it can plug into any enterprise backend like Datadog, Honeycomb, or Splunk. One rolls up business-level events (which skill the user invoked, which tools ran, which files changed, how many generated lines were actually accepted). And one packages the whole conversation into an offline-replayable trace bundle, a single zip containing session ID, all events, configuration, and the rollout JSONL, which can be fed back into Codex to reconstruct the original state. Claude Code goes IDE-native: it hardcodes the price of every supported model right into the source (price tier constants baked in, accepting that every price change needs a new release), persists every session to a JSONL file on disk, and lets the user run one terminal command that uses the strongest model to analyze their own conversation history and produce a readable report. OpenClaw takes the event-bus angle. It defines about a dozen semantically clean diagnostic event types (model usage, webhook lifecycle, message queue lifecycle, session stuck signal, tool looping signal) and dispatches them through a listener pattern (the publish-subscribe observer pattern), leaving the actual sink (a monitoring platform, a local file, a private Elasticsearch full-text search engine) entirely up to the deployer. Hermes treats cost precision as the top priority. It defines a vendor-neutral `CanonicalUsage` struct, ranks pricing sources into a six-level confidence ladder (`provider_cost_api` &gt; `provider_generation_api` &gt; `provider_models_api` &gt; `official_docs_snapshot` &gt; `user_override` &gt; `custom_contract`: actual provider cost comes first, then published rates, then user overrides, with negotiated contracts ranked last), tags every cost record with «how confident am I in this number», persists everything to a local SQLite database, and ships a local reporting tool that prints aggregated statistics. Bottom line: borrow Codex's three-module split for enterprise agents, borrow Claude Code for developer self-serve reports, borrow OpenClaw for an event pipeline that fits many deployment shapes, and borrow Hermes for privacy-sensitive local services that need accurate billing." />
 
 ## §2 · Architecture Diagram
 
@@ -46,9 +46,9 @@ How the four systems cover observability, cost, and logs across five dimensions:
 
 Codex's stance on observability is very engineering-minded: it argues that observability is really three different problems with very different requirements, and trying to do all three in one module makes none of them good. So it splits the entire capability into three independent code modules, each focused on one thing, with no coupling between them.
 
-The first thing is **plugging into the industry-standard monitoring protocol**. Any serious production team already has monitoring infrastructure in place — it might be Datadog, Honeycomb, Splunk, Aliyun ARMS, or a self-hosted Prometheus + Grafana stack. All of these backends speak the OpenTelemetry (OTEL) standard. Rather than building its own monitoring system, Codex writes an adapter that emits the agent's internal metrics, traces, and logs over the OTEL protocol (supporting both HTTP and gRPC transports), and lets the user plug the data into whatever they already use. On top of that it ships a default exporter for an internal system called Statsig — that one exists because Codex's own team uses Statsig to collect product analytics.
+The first thing is **plugging into the industry-standard monitoring protocol**. Any serious production team already has monitoring infrastructure in place, whether Datadog, Honeycomb, Splunk, Aliyun ARMS, or a self-hosted Prometheus + Grafana stack. All of these backends speak the OpenTelemetry (OTEL) standard. Rather than building its own monitoring system, Codex writes an adapter that emits the agent's internal metrics, traces, and logs over the OTEL protocol (supporting both HTTP and gRPC transports), and lets the user plug the data into whatever they already use. On top of that it ships a default exporter for an internal system called Statsig. That one exists because Codex's own team uses Statsig to collect product analytics.
 
-<SourceBlock path="REF/codex/codex-rs/otel/src/config.rs" lines="50-108" system="codex" summary="The observability backend is abstracted into a pluggable exporter — fully off, internal default, HTTP, or gRPC. Each of metrics / traces / logs can be configured independently.">
+<SourceBlock path="REF/codex/codex-rs/otel/src/config.rs" lines="50-108" system="codex" summary="The observability backend is abstracted into a pluggable exporter: fully off, internal default, HTTP, or gRPC. Each of metrics / traces / logs can be configured independently.">
 
 ```rust
 #[derive(Clone, Debug)]
@@ -86,13 +86,13 @@ pub enum OtelExporter {
 
 Two details in this abstraction are worth calling out.
 
-First, **the three classes of data can be sent to different destinations**. Metrics (numerical indicators like requests-per-second), traces (full call chains for one request), and logs (structured log lines) are fundamentally different things in the monitoring world, and the backends that serve them well are often different — Datadog is great at traces, Grafana is often a better fit for metrics, ELK might own logs. Codex lets each of these pick its own destination instead of forcing everything into one backend.
+First, **the three classes of data can be sent to different destinations**. Metrics (numerical indicators like requests-per-second), traces (full call chains for one request), and logs (structured log lines) are genuinely different things in the monitoring world, and the backends that serve them well are often different. Datadog is great at traces, Grafana is often a better fit for metrics, ELK might own logs. Codex lets each of these pick its own destination instead of forcing everything into one backend.
 
-Second, **debug builds default to no reporting against production monitoring**. There is one critical line of code in here: if the build is in debug mode (i.e. a developer is locally compiling for testing), the exporter defaults to None. This is very deliberate engineering discipline — running tests during development tends to produce all kinds of weird metric spikes, and if that data leaks into the production monitoring dashboards, operators will be misled into thinking something is wrong in production.
+Second, **debug builds default to no reporting against production monitoring**. There is one critical line of code in here: if the build is in debug mode (i.e. a developer is locally compiling for testing), the exporter defaults to None. This is deliberate engineering discipline. Running tests during development tends to produce all kinds of weird metric spikes, and if that data leaks into the production monitoring dashboards, operators will be misled into thinking something is wrong in production.
 
-The second thing is **rolling up business-level events**. The OTEL layer above handles technical metrics, but agents have a separate class of events that matter — which skill the user invoked, which tools ran, which files were touched, how many turns the model went, how many MCP calls happened, and how many lines of generated code the user actually accepted. These are not generic CPU / memory metrics — they are the agent's own product metrics.
+The second thing is **rolling up business-level events**. The OTEL layer above handles technical metrics, but agents have a separate class of events that matter: which skill the user invoked, which tools ran, which files were touched, how many turns the model went, how many MCP calls happened, and how many lines of generated code the user actually accepted. These are not generic CPU / memory metrics. They are the agent's own product metrics.
 
-<SourceBlock path="REF/codex/codex-rs/analytics/src/events.rs" lines="56-100" system="codex" summary="Business events are expressed as a tagged union — every event has its own field definitions instead of being a generic struct with string-keyed properties.">
+<SourceBlock path="REF/codex/codex-rs/analytics/src/events.rs" lines="56-100" system="codex" summary="Business events are expressed as a tagged union: every event has its own field definitions instead of being a generic struct with string-keyed properties.">
 
 ```rust
 #[derive(Serialize)]
@@ -125,15 +125,15 @@ pub(crate) enum TrackEventRequest {
 
 </SourceBlock>
 
-This "every event is its own type" approach is very different from the common pattern of "one generic event struct plus a bag of string-keyed properties". The benefits are immediate: the compiler at the emit site checks whether you filled in every field (forgetting one fails to compile), the receiver doing aggregate analysis cannot be tripped up by typoed field names, and adding a new event type is just adding a new type that does not break any existing event. These twenty-plus event types cover nearly every business-level surface inside the agent worth caring about — skill invocations, guardian reviews, hook runs, context compactions, single-turn content, command executions, file changes, all kinds of tool calls (including MCP and dynamic tools), web searches, image generations, plugin lifecycle, even an event called "accepted line fingerprints" — which records which lines of model-generated code the user actually kept (using line-level hashes rather than content, to avoid leaking source), all in service of measuring "the fraction of generated code that actually survives", a key product KPI.
+This "every event is its own type" approach is very different from the common pattern of "one generic event struct plus a bag of string-keyed properties". The benefits are immediate: the compiler at the emit site checks whether you filled in every field (forgetting one fails to compile), the receiver doing aggregate analysis cannot be tripped up by typoed field names, and adding a new event type is just adding a new type that does not break any existing event. These twenty-plus event types cover nearly every business-level surface inside the agent worth caring about. One cluster tracks user-driven actions: skill invocations, guardian reviews, hook runs, context compactions, single-turn content, command executions, and file changes. Another covers the tool surface, including MCP and dynamic tools, web searches, image generations, and plugin lifecycle events. There is even an event called "accepted line fingerprints", which records which lines of model-generated code the user actually kept (using line-level hashes rather than content, to avoid leaking source). All of this is in service of measuring "the fraction of generated code that actually survives", a core product metric for a coding agent.
 
-The third thing is **packaging the whole conversation into an offline-replayable trace**. This one is heavier than the other two — it solves a debugging problem unique to agent systems: when an agent produces a strange result, reproducing it is extremely hard (LLM nondeterminism, external API state, filesystem state all conspire against you), and figuring out "how exactly did it get to that point" after the fact is nearly impossible. Codex's approach is to write every raw event a session produces, in order, to a JSONL file, plus a manifest describing what model / environment / version was used, and pack the whole thing into a trace bundle that can be shipped to any debugging tool offline. Alongside this is a "reducer" component, specifically designed to fold the raw event stream into a clean final state — just like a Redux reducer, taking an event stream and producing a state snapshot. The design philosophy is written very plainly: **the conversation hot path only writes raw events; the heavy reducers and viewers do not pollute the main codebase**.
+The third thing is **packaging the whole conversation into an offline-replayable trace**. This one is heavier than the other two. It solves a debugging problem unique to agent systems: when an agent produces a strange result, reproducing it is extremely hard (LLM nondeterminism, external API state, filesystem state all conspire against you), and figuring out "how exactly did it get to that point" after the fact is nearly impossible. Codex's approach is to write every raw event a session produces, in order, to a JSONL file, plus a manifest describing what model / environment / version was used, and pack the whole thing into a trace bundle that can be shipped to any debugging tool offline. Alongside this is a "reducer" component, specifically designed to fold the raw event stream into a clean final state, just like a Redux reducer that takes an event stream and produces a state snapshot. The design philosophy is written very plainly: **the conversation hot path only writes raw events; the heavy reducers and viewers do not pollute the main codebase**.
 
 ### Claude Code · Hardcoding prices into the code so users can see what they spent right in the terminal
 
-Claude Code's take on observability is IDE-flavored — it assumes its users are mostly developers, and that those developers care less about "plugging into my own Datadog" than about "telling me right in the terminal how much that session cost me, how many tokens it used, and which model was the most expensive". Around that judgement it does a few very focused things.
+Claude Code's take on observability is IDE-flavored: it assumes its users are mostly developers, and that those developers care less about "plugging into my own Datadog" than about "telling me right in the terminal how much that session cost me, how many tokens it used, and which model was the most expensive". Around that judgement it does a few very focused things.
 
-The first thing is **hardcoding model prices into the source code**. It does not call any remote pricing API or maintain an external pricing manifest — it writes the prices of every currently supported model as a set of constants directly in the source.
+The first thing is **hardcoding model prices into the source code**. It does not call any remote pricing API or maintain an external pricing manifest. It writes the prices of every currently supported model as a set of constants directly in the source.
 
 <SourceBlock path="REF/claude-code-2.1.88-expanded/src/utils/modelCost.ts" lines="26-90" system="claude" summary="5 hardcoded cost tiers (COST_TIER_3_15 / COST_TIER_15_75 / COST_TIER_5_25 / COST_TIER_30_150 / COST_HAIKU_35 / COST_HAIKU_45); each tier covers 5 dimensions (input / output / cache_write / cache_read / web_search)">
 
@@ -193,23 +193,23 @@ function tokensToUSDCost(modelCosts: ModelCosts, usage: Usage): number {
 }
 ```
 
-On the surface this looks unengineered — every price change requires a new release. But on closer look it is exactly the trade-off Claude Code wants: its users are developers running a binary on their own machines; if prices could be remotely pushed, it would mean Anthropic could silently change a price and watch every user's local cost statistics shift in lockstep, which destroys trust. Baking the prices into the code and binding them to a version number makes the whole thing transparent — users know precisely "this version recognises this price table"; raising prices means shipping a new version, in the open.
+On the surface this looks unengineered: every price change requires a new release. But on closer look it is exactly the trade-off Claude Code wants. Its users are developers running a binary on their own machines; if prices could be remotely pushed, it would mean Anthropic could silently change a price and watch every user's local cost statistics shift in lockstep, which destroys trust. Baking the prices into the code and binding them to a version number makes the whole thing transparent. Users know precisely "this version recognises this price table". Raising prices means shipping a new version, in the open.
 
-Prices are organised into six tiers (called "cost tiers"), each tier covering models that share the same price band — Sonnet-class models sit at one tier ($3 per million input / $15 per million output), Opus 4 / 4.1 sit at another ($15 / $75), Haiku sits at the cheaper tiers. Each tier records five prices: input, output, prompt cache write, prompt cache read, and per-call web search. Computing cost is just multiplying each kind of usage by its own price and summing — nothing fancy — but you have to keep the five separate or it will be wildly wrong: cache reads typically cost about one tenth of input price; mixing them into one number can be off by an order of magnitude.
+Prices are organised into six tiers (called "cost tiers"), each tier covering models that share the same price band. Sonnet-class models sit at one tier ($3 per million input / $15 per million output), Opus 4 / 4.1 sit at another ($15 / $75), Haiku sits at the cheaper tiers. Each tier records five prices: input, output, prompt cache write, prompt cache read, and per-call web search. Computing cost is just multiplying each kind of usage by its own price and summing, nothing fancy, but you have to keep the five separate or it will be wildly wrong: cache reads typically cost about one tenth of input price; mixing them into one number can be off by an order of magnitude.
 
-The second thing is **handling unknown models gracefully — neither throwing nor charging zero**. There is a very engineering-minded piece of code: when the user uses a model the local pricing table does not recognise, the system **falls back to the default model's price** to estimate cost, and at the same time emits an "unknown model price" event so the team finds out. That event flows into Anthropic's internal analytics, telling them "a wave of users are using some new model but the client price table hasn't been updated yet", which becomes the trigger for the next release. The product judgement behind this fail-soft-plus-alert is clear: throwing would crash the agent (bad UX) and returning zero would make the user think a new model is free (worse UX); falling back to the default price plus an internal alert keeps the user unbroken without losing the "we need to update the price table" signal.
+The second thing is **handling unknown models gracefully, neither throwing nor charging zero**. There is a very engineering-minded piece of code: when the user uses a model the local pricing table does not recognise, the system **falls back to the default model's price** to estimate cost, and at the same time emits an "unknown model price" event so the team finds out. That event flows into Anthropic's internal analytics, telling them "a wave of users are using some new model but the client price table hasn't been updated yet", which becomes the trigger for the next release. The product judgement behind this fail-soft-plus-alert is clear: throwing would crash the agent (bad UX) and returning zero would make the user think a new model is free (worse UX). Falling back to the default price plus an internal alert keeps the user unbroken without losing the "we need to update the price table" signal.
 
-The third thing is **letting the user see their session cost report straight in the terminal with `/insights`**. Implementation is unusual: it reads every session's JSONL file out of `~/.claude/projects/<dir>/sessions/` (each project gets its own subdirectory — clean namespacing), then runs Opus twice — once to extract a structured fact sheet of "what happened in this session", and once to take those facts and write a natural-language summary. Then it prints the report to the terminal.
+The third thing is **letting the user see their session cost report straight in the terminal with `/insights`**. Implementation is unusual: it reads every session's JSONL file out of `~/.claude/projects/<dir>/sessions/` (each project gets its own subdirectory, clean namespacing), then runs Opus twice. Once to extract a structured fact sheet of "what happened in this session", and once to take those facts and write a natural-language summary. Then it prints the report to the terminal.
 
-Why Opus instead of cheaper Haiku? Because "analyzing your own conversation history" is very quality-sensitive — Haiku occasionally hallucinates on long contexts (output tool calls that never happened); Opus is much steadier on long-text understanding and summarization. One `/insights` invocation costs about $0.5 to $1, but a developer's daily agent spend is typically $20 to $50, and the under-5% overhead is worth it — it buys the developer-experience win of "I don't need to open a browser dashboard, I can see today's spend right in the terminal".
+Why Opus instead of cheaper Haiku? Because "analyzing your own conversation history" is very quality-sensitive. Haiku occasionally hallucinates on long contexts (output tool calls that never happened); Opus is much steadier on long-text understanding and summarization. One `/insights` invocation costs about $0.5 to $1, but a developer's daily agent spend is typically $20 to $50, so the under-5% overhead pays for itself. It buys the developer-experience win of "I don't need to open a browser dashboard, I can see today's spend right in the terminal".
 
 ### OpenClaw · One "diagnostic event bus" that funnels every observability signal through the same pipe
 
-OpenClaw's trade-off is different again. The scenario it serves is not enterprise SRE or a single-machine IDE user, but a common ChatOps deployment shape — one agent simultaneously listening to Slack, Telegram, Discord, an in-house web UI, and an API gateway, serving many concurrent users with a fleet of workers behind it. In that scenario observability has one peculiar challenge: you cannot predict where the deployer wants the logs to land — could be Datadog, could be Sentry, could be a self-built Elasticsearch, could literally just be stderr.
+OpenClaw's trade-off is different again. The scenario it serves is not enterprise SRE or a single-machine IDE user, but a common ChatOps deployment shape: one agent simultaneously listening to Slack, Telegram, Discord, an in-house web UI, and an API gateway, serving many concurrent users with a fleet of workers behind it. In that scenario observability has one peculiar challenge: you cannot predict where the deployer wants the logs to land. It could be Datadog, Sentry, a self-built Elasticsearch, or literally just stderr.
 
 To meet that challenge OpenClaw picks a classic decoupling pattern: **every observation flows through one "diagnostic event" bus, and the other end of the bus is up to the deployer**. To make the bus actually useful, it does three things.
 
-The first thing is **distilling everything worth observing into roughly a dozen semantically clean event types**. Every event is a strongly-typed object with explicit fields, covering nearly every state worth tracking in an agent deployment — model usage (tokens, dollars, latency per call), webhook lifecycle (received, processed, error), message queue (enqueue, process), session state plus a "stuck" signal, queue-lane workflows, single agent run attempts, heartbeats, and one very distinctive event for "the tool is stuck in a loop".
+The first thing is **distilling everything worth observing into roughly a dozen semantically clean event types**. Every event is a strongly-typed object with explicit fields, covering nearly every state worth tracking in an agent deployment: model usage (tokens, dollars, latency per call), webhook lifecycle (received, processed, error), message queue (enqueue, process), session state plus a "stuck" signal, queue-lane workflows, single agent run attempts, heartbeats, and one very distinctive event for "the tool is stuck in a loop".
 
 <SourceBlock path="REF/openclaw/src/infra/diagnostic-events.ts" lines="1-100" system="openclaw" summary="DiagnosticEventPayload 13 variants: model.usage / webhook.received|processed|error / message.queued|processed / session.state|stuck / queue.lane.enqueue|dequeue / run.attempt / diagnostic.heartbeat / tool.loop">
 
@@ -245,9 +245,9 @@ export type DiagnosticUsageEvent = DiagnosticBaseEvent & {
 
 </SourceBlock>
 
-Every event carries two shared fields — a timestamp and a globally monotonic sequence number. These two fields look plain but solve a very specific problem: when several events fire nearly simultaneously, their millisecond-precision timestamps can collide, making downstream time-series analysis unable to tell which came first; the monotonic sequence number is a tiebreaker — "even if timestamps match, I still know which one came later".
+Every event carries two shared fields: a timestamp and a globally monotonic sequence number. These two fields look plain but solve a very specific problem: when several events fire nearly simultaneously, their millisecond-precision timestamps can collide, making downstream time-series analysis unable to tell which came first. The monotonic sequence number is a tiebreaker. Even if timestamps match, it still records which one came later.
 
-The second thing is **dispatching events through a listener pattern**. Any piece of code can register a listener function telling the bus "I care about these events, please pass them to me". The register call immediately returns an unsubscribe handle — calling it removes the listener with no extra bookkeeping. This pattern makes adding a new backend trivial: forward events to Datadog by writing one listener that translates them to OTEL; forward errors to Sentry by writing another listener; persist to local SQLite by writing yet another — all of this is entirely decoupled from the core agent code.
+The second thing is **dispatching events through a listener pattern**. Any piece of code can register a listener function telling the bus "I care about these events, please pass them to me". The register call immediately returns an unsubscribe handle. Calling it removes the listener with no extra bookkeeping. This pattern makes adding a new backend trivial: forward events to Datadog by writing one listener that translates them to OTEL; forward errors to Sentry by writing another listener; persist to local SQLite by writing yet another. All of this is entirely decoupled from the core agent code.
 
 The dispatch function itself does a few thoughtful engineering safeguards:
 
@@ -289,11 +289,11 @@ export function onDiagnosticEvent(listener: (evt: DiagnosticEventPayload) => voi
 
 There are three very clever bits in that code.
 
-**The first is the "recursion guard"**. Picture this: a listener responds to an event by emitting a new event (say, "I see model.usage, let me emit a cost_alert"), and that new event triggers further listeners that emit more events — without protection the whole system recurses forever until it blows the stack. OpenClaw uses a "dispatch depth" counter: each entry into emit increments it, each exit decrements; once depth exceeds 100, the event is simply dropped with an error logged. This is the engineering posture "I would rather lose observability data than let the agent's main flow crash".
+**The first is the "recursion guard"**. Picture this: a listener responds to an event by emitting a new event (say, "I see model.usage, let me emit a cost_alert"), and that new event triggers further listeners that emit more events. Without protection the whole system recurses forever until it blows the stack. OpenClaw uses a "dispatch depth" counter: each entry into emit increments it, each exit decrements; once depth exceeds 100, the event is simply dropped with an error logged. This is the engineering posture "I would rather lose observability data than let the agent's main flow crash".
 
-**The second is "listener isolation"**. Each listener call is wrapped in try-catch — if some listener has a bug and throws, the error gets swallowed and written to stderr, but it does not affect the other listeners. Sounds basic but matters a lot when multiple observability backends coexist — you do not want a bug in the Datadog listener to silently knock out the Sentry listener.
+**The second is "listener isolation"**. Each listener call is wrapped in try-catch. If some listener has a bug and throws, the error gets swallowed and written to stderr, but it does not affect the other listeners. Sounds basic but matters a lot when multiple observability backends coexist: you do not want a bug in the Datadog listener to silently knock out the Sentry listener.
 
-**The third is "the sequence number is injected at emit time"**. Notice `seq` is a global counter incremented inside the emit function, not passed by the event producer. This guarantees that **all events have a globally monotonically increasing sequence number** — no gaps, no duplicates, consistent order even with several concurrent turns emitting at once.
+**The third is "the sequence number is injected at emit time"**. Notice `seq` is a global counter incremented inside the emit function, not passed by the event producer. This guarantees that **all events have a globally monotonically increasing sequence number**: no gaps, no duplicates, consistent order even with several concurrent turns emitting at once.
 
 The third thing is **using a special `tool.loop` event type to make "the agent got stuck" first-class observable**. This is the most distinctive of all OpenClaw's diagnostic events:
 
@@ -312,20 +312,20 @@ export type DiagnosticToolLoopEvent = DiagnosticBaseEvent & {
 };
 ```
 
-The event type itself tells a story — it openly acknowledges that agents do get stuck, and it makes "I detected that the agent is stuck" a first-class observable signal instead of burying it in some log file for ops to dig through. The "detector" field tells you which of four loop detectors triggered:
+The event type itself tells a story. It openly acknowledges that agents do get stuck, and it makes "I detected that the agent is stuck" a first-class observable signal instead of burying it in some log file for ops to dig through. The "detector" field tells you which of four loop detectors triggered:
 
-- One called "generic repeat" — the same tool was called with identical arguments N times in a row (think: agent looping on `ls`).
-- One called "known poll no progress" — some tools (`git status`, `docker ps`) are semantically polling tools; the agent keeps calling them but every return is the same, a textbook case of "waiting for something that will never happen".
-- One called "global circuit breaker" — total tool calls in a single session exceeded a threshold regardless of which tool.
-- One called "ping pong" — two agents are bouncing the question back and forth, every call has different arguments so looking at either agent alone reveals no repetition, but from outside the system it is an obvious A→B→A→B pattern.
+- One called "generic repeat": the same tool was called with identical arguments N times in a row (think: agent looping on `ls`).
+- One called "known poll no progress": some tools (`git status`, `docker ps`) are semantically polling tools; the agent keeps calling them but every return is the same, a textbook case of "waiting for something that will never happen".
+- One called "global circuit breaker": total tool calls in a single session exceeded a threshold regardless of which tool.
+- One called "ping pong": two agents are bouncing the question back and forth, every call has different arguments so looking at either agent alone reveals no repetition, but from outside the system it is an obvious A→B→A→B pattern.
 
-Each detector corresponds to a typical failure mode that agents fall into. Productising those patterns as "one of the event types on the bus" lets listeners handle them concisely — for example, subscribe to `tool.loop`, route critical-level events to DingTalk / Slack, and quietly record warning-level events to a database without paging anyone.
+Each detector corresponds to a typical failure mode that agents fall into. Productising those patterns as "one of the event types on the bus" lets listeners handle them concisely. For example, subscribe to `tool.loop`, route critical-level events to Ding Talk / Slack, and quietly record warning-level events to a database without paging anyone.
 
 ### Hermes · Making "how confident am I in this number" a first-class citizen of the cost system
 
-Hermes invests its observability energy in a completely different place from the other three — almost all of its engineering effort goes into one thing: **tagging every cost record with metadata describing how confident the system is in that number**. The context is: Hermes deploys as a privacy-sensitive local service (no remote reporting), so every spending number sits in a local database; meanwhile it supports dozens of different model providers (OpenAI, Anthropic, Google, Cohere, Mistral, OpenRouter, self-hosted models...), and each has its own billing model and data accuracy.
+Hermes invests its observability energy in a completely different place from the other three. Almost all of its engineering effort goes into one thing: **tagging every cost record with metadata describing how confident the system is in that number**. The context is: Hermes deploys as a privacy-sensitive local service (no remote reporting), so every spending number sits in a local database; meanwhile it supports dozens of different model providers (OpenAI, Anthropic, Google, Cohere, Mistral, OpenRouter, self-hosted models...), and each has its own billing model and data accuracy.
 
-If Hermes only stored "cost: $0.0234" in SQLite, a very bad situation would arise — the user sees a monthly bill of $200 but the provider actually charges $250 and they have no way to tell whether that $50 gap is "some provider didn't return cost so local estimation undershot", "a bug in my code", or "the provider's API itself misbehaved". Hermes makes that uncertainty explicit:
+If Hermes only stored "cost: $0.0234" in SQLite, a very bad situation would arise. The user sees a monthly bill of $200 but the provider actually charges $250, and they have no way to tell whether that $50 gap is "some provider didn't return cost so local estimation undershot", "a bug in my code", or "the provider's API itself misbehaved". Hermes makes that uncertainty explicit:
 
 <SourceBlock path="REF/hermes-agent/agent/usage_pricing.py" lines="27-77" system="hermes" summary="CanonicalUsage (5 token dimensions + request_count) plus BillingRoute (provider + model + base_url + billing_mode) plus PricingEntry (5 dimensions + source + version + fetched_at) plus CostResult (amount_usd + status + source + label + pricing_version + notes)">
 
@@ -395,37 +395,37 @@ class CostResult:
 
 </SourceBlock>
 
-The type definitions above hide the essence of Hermes's entire cost system — they split "price credibility" into six levels from high to low, and let the final cost result carry two axes simultaneously: "how was this number derived" and "how confident am I in it".
+The type definitions above hide the essence of Hermes's entire cost system. They split "price credibility" into six levels from high to low, and let the final cost result carry two axes simultaneously: "how was this number derived" and "how confident am I in it".
 
-**The first ranking is "price source"** — meaning "where does this unit price come from". The priorities, from high to low, read like this:
+**The first ranking is "price source"**, meaning "where does this unit price come from". The priorities, from high to low, read like this:
 
-- **provider_cost_api (most accurate)**: the provider's API directly tells you in the response "this call cost $0.0234". This is the most trustworthy — the provider computed the real amount, so it cannot disagree with the final bill. Aggregator platforms like OpenRouter, Together, and Replicate are starting to expose this.
+- **provider_cost_api (most accurate)**: the provider's API directly tells you in the response "this call cost $0.0234". This is the most trustworthy, because the provider computed the real amount, so it cannot disagree with the final bill. Aggregator platforms like OpenRouter, Together, and Replicate are starting to expose this.
 - **provider_generation_api**: the response carries exact token counts with detailed breakdown (input/output/cache_read/cache_write) but no direct dollar amount. You have to multiply by your local unit prices, but because the token counts are provider-authoritative, the resulting figure tracks the actual bill within a percent.
-- **provider_models_api**: the provider's "list models" API tells you "this model's input is $0.0025". Fresher than an offline snapshot — the moment the provider changes prices online, the next pull picks it up.
-- **official_docs_snapshot**: a price snapshot copied into the local code, like Claude Code does. Accurate but lagging — between a provider price change and a snapshot update there is a window of inaccuracy.
-- **user_override**: the user writes "this model uses this price" in a config — common for self-hosted models or private contract pricing.
-- **custom_contract**: enterprise contract pricing. In theory user_override and custom_contract are both "the user knows best", but they are ranked last on purpose — these two sources are the most frequently wrong in practice (user typoed, contract not updated, copied the wrong file), so provider real-time data is given higher priority for accuracy.
+- **provider_models_api**: the provider's "list models" API tells you "this model's input is $0.0025". Fresher than an offline snapshot: the moment the provider changes prices online, the next pull picks it up.
+- **official_docs_snapshot**: a price snapshot copied into the local code, like Claude Code does. Accurate but lagging: between a provider price change and a snapshot update there is a window of inaccuracy.
+- **user_override**: the user writes "this model uses this price" in a config, common for self-hosted models or private contract pricing.
+- **custom_contract**: enterprise contract pricing. In theory user_override and custom_contract are both "the user knows best", but they are ranked last on purpose. These two sources are the most frequently wrong in practice (user typoed, contract not updated, copied the wrong file), so provider real-time data is given higher priority for accuracy.
 
-**The second ranking is "cost status"** — meaning "how certain is this number". It has four values:
+**The second ranking is "cost status"**, meaning "how certain is this number". It has four values:
 
 - **actual**: the actual amount returned by the provider's API; highest confidence.
-- **estimated**: a local computation against the pricing table — may diverge from the final bill by a few percent.
-- **included**: this call is actually covered by the user's subscription (for instance, when the user is on ChatGPT Plus and the agent goes through ChatGPT's built-in auth, this call costs the user nothing extra). This status matters a lot — without it the computed "this month's spend" would significantly overstate what the user actually paid.
+- **estimated**: a local computation against the pricing table. May diverge from the final bill by a few percent.
+- **included**: this call is actually covered by the user's subscription (for instance, when the user is on ChatGPT Plus and the agent goes through ChatGPT's built-in auth, this call costs the user nothing extra). This status matters a lot. Without it the computed "this month's spend" would significantly overstate what the user actually paid.
 - **unknown**: data simply unavailable, amount left blank. The frontend sees this status and shows "price unknown" so the user knows it is missing data, not free.
 
 **The third design is attaching a source URL and a pricing version to every price record**. The local `_OFFICIAL_DOCS_PRICING` dictionary covers 30+ models across anthropic, openai, google, cohere, and so on, and every record carries two audit fields: source URL (which webpage was this price copied from) and pricing version (`2026-05-01` style). Six months later when the user looks back at their cost stats and notices an odd price, they can trace it back to "oh this came from openai.com/pricing on 2026-05, OpenAI hadn't raised prices yet". That auditability is mandatory for enterprise users.
 
-**The fourth design is dropping cost results into a local database and exposing one command that turns them into a report**. All usage data goes into local SQLite — not just the amount but also the status, source, pricing version, and notes. Hermes ships a local tool called InsightsEngine that queries this database directly, doing aggregations by model, by time, by session, and printing a readable report to the terminal. The entire data path has no remote reporting — this is Hermes's biggest difference from the other three. Privacy is elevated to a very high priority; the cost data never leaves the user's machine, even at the cost of giving up a unified cross-machine view.
+**The fourth design is dropping cost results into a local database and exposing one command that turns them into a report**. All usage data goes into local SQLite: not just the amount but also the status, source, pricing version, and notes. Hermes ships a local tool called InsightsEngine that queries this database directly, doing aggregations by model, by time, by session, and printing a readable report to the terminal. The entire data path has no remote reporting, which is Hermes's biggest difference from the other three. Privacy is elevated to a very high priority; the cost data never leaves the user's machine, even at the cost of giving up a unified cross-machine view.
 
 ## §4 · What They Agree On
 
-Despite wildly different engineering trade-offs, the four systems converge on five surprisingly consistent fundamentals — think of these as the "required curriculum" for any agent observability system.
+Despite wildly different engineering trade-offs, the four systems converge on five surprisingly consistent fundamentals. Think of these as the "required curriculum" for any agent observability system.
 
-**The first is recording token usage along at least four independent dimensions**. The minimum split is: pure input tokens, pure output tokens, cache-hit (read) tokens, cache-write tokens. If your model is something like OpenAI o1 or Anthropic extended thinking that exposes a reasoning step, add a "reasoning tokens" dimension; if the model supports server-side web search, add a "web search requests" dimension. These four to six dimensions cannot be collapsed into "total tokens" because their unit prices differ dramatically — cache reads typically cost about one tenth of input price; cache writes cost 1.25x input price. If you only track totals and multiply by some unified rate, the computed bill can be off by an order of magnitude.
+**The first is recording token usage along at least four independent dimensions**. The minimum split is: pure input tokens, pure output tokens, cache-hit (read) tokens, cache-write tokens. If your model is something like OpenAI o1 or Anthropic extended thinking that exposes a reasoning step, add a "reasoning tokens" dimension; if the model supports server-side web search, add a "web search requests" dimension. These four to six dimensions cannot be collapsed into "total tokens" because their unit prices differ dramatically. Cache reads typically cost about one tenth of input price; cache writes cost 1.25x input price. If you only track totals and multiply by some unified rate, the computed bill can be off by an order of magnitude.
 
-**The second is computing cost by multiplying each dimension's usage by its own price and summing, never using a single "average rate"**. This is the direct corollary of the first point — different unit prices mean separate computation. Codex, Claude Code, and Hermes each implement this dimension-wise computation function; OpenClaw leaves the cost field for the gateway to fill but still requires the gateway to compute it dimension-wise.
+**The second is computing cost by multiplying each dimension's usage by its own price and summing, never using a single "average rate"**. This is the direct corollary of the first point: different unit prices mean separate computation. Codex, Claude Code, and Hermes each implement this dimension-wise computation function; OpenClaw leaves the cost field for the gateway to fill but still requires the gateway to compute it dimension-wise.
 
-**The third is making session history replayable**. The persistence mechanism differs — Codex uses rollout-trace bundles with a reducer, Claude Code drops each session into a JSONL file under the project directory, Hermes stuffs everything into local SQLite, OpenClaw hands the decision to listeners — but none of them implement "replay by rerunning". Rerunning runs into LLM nondeterminism, external state, and changed API state — near-impossible to reproduce exactly. So the four systems treat history as "look at a snapshot" rather than "re-execute".
+**The third is making session history replayable**. The persistence mechanism differs: Codex uses rollout-trace bundles with a reducer, Claude Code drops each session into a JSONL file under the project directory, Hermes stuffs everything into local SQLite, and OpenClaw hands the decision to listeners. But none of them implement "replay by rerunning". Rerunning runs into LLM nondeterminism, external state, and changed API state, which makes it near-impossible to reproduce exactly. So the four systems treat history as "look at a snapshot" rather than "re-execute".
 
 **The fourth is not crashing on unknown models**. When a user invokes a model the local pricing table has never heard of, the worst response is throwing (agent crashes, user loses the conversation), and the second worst is charging zero (user thinks the new model is free). All four pick "fall back to some default plus tell the team": Claude Code uses default-model pricing plus an internal alert event, Hermes marks the status as unknown so the frontend shows "price unknown", OpenClaw simply leaves the cost field blank and lets downstream decide.
 
@@ -467,7 +467,7 @@ Below is the recipe distilled from the four systems for writing your own observa
   title="Build recipe"
   minimal={[
     'At least 4 token dimensions (borrow from everyone): input (input tokens) + output (output tokens) + cache_read (cache reads, ~1/10 of input price) + cache_write (cache writes, ~1.25x of input price); add reasoning_tokens / web_search as optional 5th dimensions; tracking only input+output makes cache optimization gains invisible',
-    'Cost formula sums each dimension separately (borrow from Claude Code\'s tokensToUSDCost): each dimension queried for its own price, multiplied independently, then summed; can\'t use "average price" simplification — the four prices differ by up to an order of magnitude (cache_read is 12.5x cheaper than cache_write)',
+    'Cost formula sums each dimension separately (borrow from Claude Code\'s tokensToUSDCost): each dimension queried for its own price, multiplied independently, then summed; can\'t use "average price" simplification, the four prices differ by up to an order of magnitude (cache_read is 12.5x cheaper than cache_write)',
     'Unknown models fall back to default + emit alert event (borrow from Claude Code\'s tengu_unknown_model_cost): when model ID has no price entry, fall back to default estimate and emit telemetry alert (so you know an unknown model appeared); never crash (breaks main flow) and never silently return 0 (misleads users into thinking it\'s free)',
     'Debug builds disable remote reporting (borrow from Codex\' cfg!(debug_assertions)): development runs (tests / debugging) trigger massive call volume; if these hit production metrics they pollute data; use compile-time switch to disable OTEL in debug builds, enable in release',
   ]}
@@ -485,12 +485,12 @@ Below is the recipe distilled from the four systems for writing your own observa
     'Privacy mode (borrow from Hermes): all-local SQLite + terminal report, no remote reporting; this is required for enterprise / compliance scenarios, otherwise they won\'t adopt at all',
   ]}
   avoid={[
-    'Don\'t collapse all tokens to one rate — input cost ≠ cache_read cost ≠ web_search cost, conflating them throws costs off by an order of magnitude; most common error is multiplying all tokens by input price, which makes cache optimization gains completely invisible',
-    'Don\'t emit telemetry synchronously in the hot path — OTLP sending is network IO (can be slow / fail), synchronous emission blocks agent loop; use sender pattern (write to in-memory channel) / async (background task) / batch (batch sending), swallow send failures (monitoring can\'t break business)',
-    'Don\'t let listener exceptions crash the main flow — listeners are user / plugin code that may have bugs; wrap each listener in try-catch, write exception to stderr without re-throwing (monitoring can\'t affect business)',
-    'Don\'t assume the upstream API always returns cost — provider API may not return it (older versions / error cases), need fallback to local estimation (token count × your stored unit price) + mark CostStatus.estimated; can\'t crash, can\'t return 0',
-    'Don\'t hardcode prices without versioning — when models reprice (e.g. Claude 3.5 → 3.7 doubling), no way to know what date the old data\'s price was based on; prices must have version + timestamp + source',
-    'Don\'t slap OTEL spans on every hot path — span has overhead (creation / context propagation / serialization), profile to see what\'s slow then add targeted spans, otherwise trace noise drowns out actual problems',
+    'Don\'t collapse all tokens to one rate: input cost ≠ cache_read cost ≠ web_search cost, conflating them throws costs off by an order of magnitude; most common error is multiplying all tokens by input price, which makes cache optimization gains completely invisible',
+    'Don\'t emit telemetry synchronously in the hot path: OTLP sending is network IO (can be slow / fail), synchronous emission blocks agent loop; use sender pattern (write to in-memory channel) / async (background task) / batch (batch sending), swallow send failures (monitoring can\'t break business)',
+    'Don\'t let listener exceptions crash the main flow: listeners are user / plugin code that may have bugs; wrap each listener in try-catch, write exception to stderr without re-throwing (monitoring can\'t affect business)',
+    'Don\'t assume the upstream API always returns cost: provider API may not return it (older versions / error cases), need fallback to local estimation (token count × your stored unit price) + mark CostStatus.estimated; can\'t crash, can\'t return 0',
+    'Don\'t hardcode prices without versioning: when models reprice (e.g. Claude 3.5 → 3.7 doubling), no way to know what date the old data\'s price was based on; prices must have version + timestamp + source',
+    'Don\'t slap OTEL spans on every hot path: span has overhead (creation / context propagation / serialization), profile to see what\'s slow then add targeted spans, otherwise trace noise drowns out actual problems',
   ]}
 />
 
@@ -587,19 +587,19 @@ class CanonicalUsage:
 
 `codex-otel` / `codex-analytics` / `codex-rollout-trace` have different responsibilities:
 
-**`codex-otel`** — real-time metrics / trace:
+**`codex-otel`**: real-time metrics / trace:
 
 - Real-time export to OTLP / Statsig backend
 - For SRE on-call alerting
 - Hottest path call frequency
 
-**`codex-analytics`** — business events:
+**`codex-analytics`**: business events:
 
 - Offline analysis of "how users use agent"
 - TrackEventRequest 20+ types including SkillInvocation / HookRun / TurnEvent / AcceptedLineFingerprints
 - For product / growth teams
 
-**`codex-rollout-trace`** — full session replay:
+**`codex-rollout-trace`**: full session replay:
 
 - trace.jsonl + manifest.json on disk
 - Reducer computes reduced state offline, replay doesn't block hot path
@@ -680,7 +680,7 @@ Deployer writes 30 lines of code to forward to OTel. But some deployers want to 
 
 **3. Recursion guard / dispatchDepth**
 
-OTel SDK has internal self-protection, but OpenClaw's 13 events are more complex (`tool.loop` — "detecting agent itself stuck" event — may trigger more emits when emitted). OpenClaw's own `dispatchDepth < 100` protection is cleaner than wrapping OTel.
+OTel SDK has internal self-protection, but OpenClaw's 13 events are more complex (`tool.loop`, the "detecting agent itself stuck" event, may trigger more emits when emitted). OpenClaw's own `dispatchDepth < 100` protection is cleaner than wrapping OTel.
 
 **4. Type safety**
 
@@ -715,7 +715,7 @@ For enterprise SaaS scenarios, yes. Customers have OTel / Sentry / Datadog infra
 
 **1. Users don't need a dashboard**
 
-Devs using agent care about "how much did I chat with agent today" / "which prompt was most expensive" / "trend in the last hour." One local `/insights` command outputs report — more convenient than opening browser to see Grafana / Datadog.
+Devs using agent care about "how much did I chat with agent today" / "which prompt was most expensive" / "trend in the last hour." One local `/insights` command outputs report, more convenient than opening browser to see Grafana / Datadog.
 
 **2. Opus excels at processing unstructured data**
 
@@ -908,7 +908,7 @@ Fingerprints make this doable.
 
 OpenClaw's `tool.loop` is "agent itself is stuck" event type. 4 detectors for 4 typical stuck modes:
 
-**1. `generic_repeat`** — same tool call argv repeated > N times in window
+**1. `generic_repeat`**: same tool call argv repeated > N times in window
 
 ```
 turn 1: bash("ls")
@@ -919,7 +919,7 @@ turn 3: bash("ls")
 
 Agent dead-loops same command, no argv change. Dumbest loop.
 
-**2. `known_poll_no_progress`** — known polling tool (git status / docker ps) with no progress
+**2. `known_poll_no_progress`**: known polling tool (git status / docker ps) with no progress
 
 ```
 turn 1: bash("git status") → "nothing to commit"
@@ -930,7 +930,7 @@ turn 3: bash("git status") → "nothing to commit"
 
 Agent is polling but git state hasn't changed. Manual lookup table marks `is_polling_tool: bash("git status") == true`.
 
-**3. `global_circuit_breaker`** — global circuit breaker (single-session tool call total exceeds threshold)
+**3. `global_circuit_breaker`**: global circuit breaker (single-session tool call total exceeds threshold)
 
 ```
 session 1: 50 tool calls
@@ -941,7 +941,7 @@ session 3: 200 tool calls
 
 Agent out of control making too many tool calls. Global threshold backstop, force stop.
 
-**4. `ping_pong`** — agent and another agent / tool bouncing back and forth
+**4. `ping_pong`**: agent and another agent / tool bouncing back and forth
 
 ```
 turn 1: agent_a calls agent_b ask("X")

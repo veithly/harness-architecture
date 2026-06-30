@@ -86,9 +86,9 @@ pub enum OtelExporter {
 
 这套抽象里有几个细节值得专门说一下。第一，**三类数据可以走不同的目的地**。metrics（数值指标，比如每秒请求数）、traces（一次请求的完整调用链）、log（结构化日志）在监控领域是三件本质不同的事，承载它们的后端也常常不一样：Datadog 可能擅长 trace、Grafana 可能更擅长 metrics、ELK 可能负责日志。Codex 允许这三类各自选不同的目的地，不是逼着所有数据都进一个后端。第二，**调试构建默认不上报到生产监控**。代码里有一行很关键的判断：如果当前是 debug 模式（也就是开发者本地编译跑测试时），默认把 exporter 关到 None。这是一种清醒的工程纪律：开发跑测试很容易制造各种异常的指标抖动，如果这些数据进了生产监控的看板，会让运维误以为线上出了问题。
 
-第二件事是**把业务级事件汇总上报**。前面那一层 OTEL 走的是技术指标，但 agent 还有一类很特别的事件——用户用了什么 skill、跑了什么工具、修了哪几个文件、跟模型来回了多少轮、调了多少次 MCP 服务、用户最后接受了多少行模型生成的代码。这些都不是 CPU/内存这种通用指标，而是 agent 产品自己的业务指标。
+第二件事是**把业务级事件汇总上报**。前面那一层 OTEL 走的是技术指标，但 agent 还有一类很特别的事件：用户用了什么 skill、跑了什么工具、修了哪几个文件、跟模型来回了多少轮、调了多少次 MCP 服务、用户最后接受了多少行模型生成的代码。这些都不是 CPU/内存这种通用指标，而是 agent 产品自己的业务指标。
 
-<SourceBlock path="REF/codex/codex-rs/analytics/src/events.rs" lines="56-100" system="codex" summary="业务事件被表达成一个加了标签的联合类型——每种事件都有自己专属的字段定义，不是塞到一个通用结构里靠字符串 key 来区分。">
+<SourceBlock path="REF/codex/codex-rs/analytics/src/events.rs" lines="56-100" system="codex" summary="业务事件被表达成一个加了标签的联合类型：每种事件都有自己专属的字段定义，不是塞到一个通用结构里靠字符串 key 来区分。">
 
 ```rust
 #[derive(Serialize)]
@@ -121,7 +121,7 @@ pub(crate) enum TrackEventRequest {
 
 </SourceBlock>
 
-这种"每种事件都是独立类型"的做法跟你常见的"一个通用 event 结构 + 一堆 string-keyed 属性"完全不同。它的好处是显而易见的：上报端写代码时编译器就能检查你字段填没填全（少一个字段直接编译不过）、接收端在做聚合分析时不会被字段名拼写错误坑到、新增一种事件就是新增一个类型不会破坏现有的事件。这二十多种事件覆盖了 agent 内部几乎所有值得关注的业务面——skill 调用、guardian 审查、hook 执行、上下文压缩、单 turn 内容、命令执行、文件变更、各种类型的工具调用（包括 MCP 和动态工具）、web 搜索、图片生成、插件生命周期，甚至包括一种叫"已接受代码行指纹"的事件——它记录的是用户最终采纳了模型生成的哪几行代码（用行级 hash 而不是内容，避免泄露源码），目的是度量"模型生成的代码被采纳的比例"这种关键产品指标。
+这种"每种事件都是独立类型"的做法跟你常见的"一个通用 event 结构 + 一堆 string-keyed 属性"完全不同。它的好处是显而易见的：上报端写代码时编译器就能检查你字段填没填全（少一个字段直接编译不过）、接收端在做聚合分析时不会被字段名拼写错误坑到、新增一种事件就是新增一个类型不会破坏现有的事件。这二十多种事件覆盖了 agent 内部几乎所有值得关注的业务面。一类是用户驱动的动作：skill 调用、guardian 审查、hook 执行、上下文压缩、单 turn 内容、命令执行、文件变更。另一类覆盖工具面，包括 MCP 和动态工具、web 搜索、图片生成、插件生命周期。甚至还有一种叫"已接受代码行指纹"的事件，它记录的是用户最终采纳了模型生成的哪几行代码（用行级 hash 而不是内容，避免泄露源码），目的是度量"模型生成的代码被采纳的比例"这种关键产品指标。
 
 第三件事是**把整个会话过程打包成可以离线重放的轨迹**。这一件比前两件都重：它解决的是 agent 系统特有的一个调试难题：当一个 agent 跑出了一个奇怪结果，复现起来很难（涉及 LLM 的非确定性、外部 API 的状态、文件系统的状态），事后想知道「它到底是怎么一步步走到那个结果的」几乎是不可能的。Codex 的做法是把每次会话里产生的所有原始事件按顺序写到一个 JSONL 文件里，再加一个清单说明这次会话用的什么模型、什么环境、什么版本，最后打包成一个 trace bundle 可以离线传给任何一个调试工具。配套有一个叫做「reducer」的组件，专门用来把这堆原始事件「折算」成简洁的最终状态：就像 Redux 的 reducer 一样，输入是事件流，输出是某个状态快照。设计哲学有一句话写得很清楚：**会话的热路径只负责写原始事件，重的「reducer 和查看器」不能污染主代码库**。
 
@@ -464,12 +464,12 @@ class CostResult:
     '隐私模式（参考 Hermes）：完全本地 SQLite + 终端报表，不远程上报；这对企业用户 / 合规场景必须有，否则他们根本不会用',
   ]}
   avoid={[
-    '别把 token / cost 算成同一个数 —— input cost ≠ cache_read cost ≠ web_search cost，混算会差一个数量级；最常见错误是把所有 token 用 input 单价乘，导致 cache 优化的收益完全看不出',
-    '别在 hot path 同步发 telemetry —— OTLP 发送是网络 IO（可能慢可能失败），同步发会阻塞 agent loop；用 sender 模式（写到内存 channel）/ async（异步任务）/ batch（批量发），发送失败要 swallow（不能让监控失败拖垮业务）',
-    '别让 listener 异常炸主流程 —— listener 是用户写的 / plugin 注册的代码，可能有 bug；用 try-catch 包住每个 listener，异常写 stderr 不抛出（监控不能影响业务）',
-    '别假设上游 API 一定返回 cost —— provider API 可能没返回（旧版本 / 错误情况），需要 fallback 到本地估算（按 token 数 × 你存的单价）+ 标 CostStatus.estimated；不能 crash 不能算 0',
-    '别把价格写在产品代码里又不带 version —— 模型涨价时（比如 Claude 3.5 → 3.7 涨价 2 倍）根本不知道老数据是哪天的价；价格必须有版本号 + 时间戳 + 来源',
-    '别给每个 hot path 加 OTEL span —— span 也有开销（创建 / context 传递 / 序列化），profile 看哪里慢再有针对性加 span，否则 trace 噪音会淹没真正有问题的地方',
+    '别把 token / cost 算成同一个数：input cost ≠ cache_read cost ≠ web_search cost，混算会差一个数量级；最常见错误是把所有 token 用 input 单价乘，导致 cache 优化的收益完全看不出',
+    '别在 hot path 同步发 telemetry：OTLP 发送是网络 IO（可能慢可能失败），同步发会阻塞 agent loop；用 sender 模式（写到内存 channel）/ async（异步任务）/ batch（批量发），发送失败要 swallow（不能让监控失败拖垮业务）',
+    '别让 listener 异常炸主流程：listener 是用户写的 / plugin 注册的代码，可能有 bug；用 try-catch 包住每个 listener，异常写 stderr 不抛出（监控不能影响业务）',
+    '别假设上游 API 一定返回 cost：provider API 可能没返回（旧版本 / 错误情况），需要 fallback 到本地估算（按 token 数 × 你存的单价）+ 标 CostStatus.estimated；不能 crash 不能算 0',
+    '别把价格写在产品代码里又不带 version：模型涨价时（比如 Claude 3.5 → 3.7 涨价 2 倍）根本不知道老数据是哪天的价；价格必须有版本号 + 时间戳 + 来源',
+    '别给每个 hot path 加 OTEL span：span 也有开销（创建 / context 传递 / 序列化），profile 看哪里慢再有针对性加 span，否则 trace 噪音会淹没真正有问题的地方',
   ]}
 />
 
@@ -566,19 +566,19 @@ class CanonicalUsage:
 
 `codex-otel` / `codex-analytics` / `codex-rollout-trace` 三个 crate，职责各异：
 
-**`codex-otel`** — 实时指标 / trace：
+**`codex-otel`**：实时指标 / trace。
 
 - 实时 export 到 OTLP / Statsig backend
 - 用于 SRE on-call 报警
 - hot path 调用频率最高
 
-**`codex-analytics`** — 业务事件：
+**`codex-analytics`**：业务事件。
 
 - 离线分析「用户用 agent 怎么样」
 - TrackEventRequest 20+ 类，包括 SkillInvocation / HookRun / TurnEvent / AcceptedLineFingerprints
 - 用于产品 / 增长团队
 
-**`codex-rollout-trace`** — 完整 session replay：
+**`codex-rollout-trace`**：完整 session replay。
 
 - trace.jsonl + manifest.json 落盘
 - reducer 离线算 reduced state，让 replay 不阻塞 hot path
@@ -891,7 +891,7 @@ fingerprint 让这件事可做。
 
 OpenClaw 的 `tool.loop` 是「agent 自己失控」的事件类型。4 种检测器对应 4 种典型失控模式：
 
-**1. `generic_repeat`** — 相同 tool call argv 在窗口内重复 > N 次
+**1. `generic_repeat`**：相同 tool call argv 在窗口内重复 > N 次。
 
 ```
 turn 1: bash("ls")
@@ -902,7 +902,7 @@ turn 3: bash("ls")
 
 agent 死循环跑同一个命令，没换 argv。最 dumb 的 loop。
 
-**2. `known_poll_no_progress`** — 已知的轮询 tool（git status / docker ps）没进展
+**2. `known_poll_no_progress`**：已知的轮询 tool（git status / docker ps）没进展。
 
 ```
 turn 1: bash("git status") → "nothing to commit"
@@ -913,7 +913,7 @@ turn 3: bash("git status") → "nothing to commit"
 
 agent 在 polling 但 git 状态没变化。手动 lookup table 标 `is_polling_tool: bash("git status") == true`。
 
-**3. `global_circuit_breaker`** — 全局熔断（单 session tool call 总数超阈值）
+**3. `global_circuit_breaker`**：全局熔断（单 session tool call 总数超阈值）。
 
 ```
 session 1: 50 tool calls
@@ -924,7 +924,7 @@ session 3: 200 tool calls
 
 agent 失控做太多 tool call。global 阈值兜底，强制停止。
 
-**4. `ping_pong`** — agent 跟另一个 agent / 工具反复来回
+**4. `ping_pong`**：agent 跟另一个 agent / 工具反复来回。
 
 ```
 turn 1: agent_a 调用 agent_b ask("X")

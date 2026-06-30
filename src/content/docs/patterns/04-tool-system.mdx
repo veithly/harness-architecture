@@ -107,7 +107,7 @@ const CORE_TOOL_SECTION_ORDER: Array<{ id: string; label: string }> = [
 
 这十几个文件加起来构成了 OpenClaw 的工具中间件能力天花板。
 
-工具事件桥到独立的 `tool` 流（`subscribeEmbeddedPiSession`），订阅这个流的外部观察者能看到所有工具活动（每个 tool call 一个事件 + 参数 + 结果）。这是审计 / 调试 / 监控的核心入口——企业部署时可以挂个外部 logger 订阅这条流把所有工具调用写库，事后追溯不需要从 rollout 文件里捞。
+工具事件桥到独立的 `tool` 流（`subscribeEmbeddedPiSession`），订阅这个流的外部观察者能看到所有工具活动（每个 tool call 一个事件 + 参数 + 结果）。这是审计 / 调试 / 监控的核心入口：企业部署时可以挂个外部 logger 订阅这条流把所有工具调用写库，事后追溯不需要从 rollout 文件里捞。
 
 ### Hermes · 单源 registry 加多模型 adapter 加 skills_guard 硬 deny
 
