@@ -1,0 +1,157 @@
+---
+title: Graph Engineering
+description: "Graph engineering taught from Codex and crewAI source plus Anthropic's production data: organizing work across agent, code, tool, and human nodes."
+sidebar:
+  order: 2
+  label: Graph Engineering
+---
+
+## What graph engineering covers
+
+Clear up one misunderstanding first: graph engineering is not about LangGraph-style graph frameworks. Frameworks are optional plumbing. Graph engineering is the lower-level question — **when a job outgrows one agent loop, how do you split it, who gets each piece, and how do the handoffs work**.
+
+"Who gets each piece" has exactly four node types:
+
+- **Agent nodes**: model execution with its own loop. Expensive, slow, improvises. For paths that can't be written down in advance.
+- **Code nodes**: deterministic code. Cheap, fast, testable. For paths already known.
+- **Tool nodes**: also deterministic code, but with a model-facing interface (Anthropic's ACI, agent-computer interface).
+- **Human nodes**: approvals, judgment calls, missing information. Slowest and priciest, but some boundaries only a human can hold.
+
+The lines between nodes are **execution relationships**: who triggers whom, what a handoff carries, how results come back, who owns failures. Graph engineering is getting those two things — node division, edge wiring — right.
+
+Is splitting worth it at all? Anthropic's [multi-agent research system report](https://www.anthropic.com/engineering/multi-agent-research-system) has the hardest production numbers so far: Opus 4 as orchestrator plus Sonnet 4 workers beat single-agent Opus 4 by 90.2% on their internal research eval, and in their variance analysis token usage alone explained 80% of performance. **Multi-agent works mainly because separate context windows let the system spend more tokens on one problem — not because of emergent teamwork.** The same finding draws the boundary: it pays only when the task's value covers the multiplied token bill and the subtasks can actually run in parallel.
+
+## What an edge carries: three independent sources, one answer
+
+The most underrated element in a graph is the edge. Split nodes beautifully and the graph still collapses if a handoff drops context, leaks permissions, or ships without a budget. Three unrelated systems converged on nearly the same answer for what one edge must carry.
+
+Hermes's `delegate_task`:
+
+```python
+delegate_task(goal, context, toolset, max_iterations)
+#             goal   context  permission allowlist  budget
+```
+
+[crewAI](https://github.com/crewAIInc/crewAI) (commit `f15844b`), `tools/agent_tools/delegate_work_tool.py`:
+
+```python
+class DelegateWorkToolSchema(BaseModel):
+    task: str = Field(..., description="The task to delegate")
+    context: str = Field(..., description="The context for the task")
+    coworker: str = Field(..., description="The role/name of the coworker")
+```
+
+Anthropic's orchestrator prompt requires every subtask description to include: an objective, an output format, tool guidance, and clear task boundaries. They also left the counterexample on record: early on, the lead agent could issue one-liners like "research the semiconductor shortage" — one subagent went off exploring the 2021 automotive chip crisis while two others duplicated 2025 supply-chain searches. **Underspecified edges produce duplicated or drifting work.**
+
+Put together, a complete edge has five elements: **goal, context, permissions, budget, output format**. Skip one and that's the one that blows up at runtime.
+
+The return payload has a copyable implementation too. In [smolagents](https://github.com/huggingface/smolagents) (`agents.py:868`, commit `e3a5b89`), a managed agent doesn't return a bare conclusion: the answer is wrapped in a fixed report template, optionally followed by a `<summary_of_work>` section of truncated key steps. The parent receives conclusion *plus* evidence — it can judge quality instead of trusting blindly.
+
+## What an edge must not carry: permissions only narrow
+
+This discipline is written in black and white in Codex's source. `codex-rs/core/codex_delegate.rs` (commit `fa1d4c4`), spawning a subagent:
+
+```rust
+inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),  // L130
+inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),               // L143
+```
+
+Line one: the child forcibly inherits the parent's exec policy — no "spawn a child to bypass permissions" backdoor. Line two is harsher: the child's multi-agent capability is set to `Disabled` at construction — **a subagent is born unable to spawn subagents**. The recursion ban isn't a prompt plea; it's a constructor argument.
+
+Hermes's counterpart hard-removes 5 tools from every child's toolset: delegating again, asking the user, writing long-term memory, sending cross-channel messages, executing code. Both systems agree on one sentence: **an edge is where permissions narrow, never where they widen.**
+
+## Five topologies, two readable implementations
+
+Ways to organize work collapse into five shapes. The first four have implementations you can read today in crewAI and Anthropic's system.
+
+**Pipeline with gates.** Fixed, ordered steps chained with deterministic checks between them. crewAI's `Process.sequential` is exactly this: tasks run in order, each task's output feeding the next as context. Precondition: the steps can be fixed in advance.
+
+**Triage routing.** A cheap node at the entrance classifies, then routes to a specialized lane. Each lane's prompt and toolset stays narrow and sharp; an inaccurate router is worse than no triage.
+
+**Parallel fan-out.** Independent subtasks run simultaneously: sectioning (each owns a slice) or voting (same question, multiple runs, compare). Anthropic's numbers: the lead spawns 3–5 subagents in parallel, each using 3+ tools in parallel, cutting complex-query time by 90%. The price is aggregation logic — decide who resolves conflicts up front.
+
+**Orchestrator and workers.** When subtasks can't be listed in advance, an agent node orchestrates at runtime. crewAI's `Process.hierarchical` implements this explicitly, and enforces its own precondition with a validator — `crew.py`'s `check_manager_llm` raises unless you provide `manager_llm` or `manager_agent`. **The orchestrator isn't decoration; it's the topology's definition.**
+
+Orchestration also needs an effort scale: how many workers for how big a job? Anthropic wrote the scale straight into the prompt: simple fact-finding, 1 agent with 3–10 tool calls; direct comparisons, 2–4 subagents with 10–15 calls each; complex research, 10+ subagents with divided responsibilities. Worth stealing — they added it because early versions would **spawn 50 subagents for a simple query**.
+
+**Review loop.** One node works, another critiques, cycle until pass. The legitimate cycle in the graph — but it must carry an exit: a round cap plus "stop when comments stop changing."
+
+Real systems are composites. Anthropic's full flow: orchestrator-workers (parallel search) → synthesis → a deterministic CitationAgent bolted on as a pipeline tail to attach citations. Three shapes in one graph.
+
+## Who owns state: blackboard or mail
+
+Multiple nodes working means state questions: where do intermediate results live, who may write.
+
+Two base schemes. **Shared blackboard**: everyone reads and writes one state. Convenient, but write access must be policed — Hermes banning children from writing long-term memory is blackboard policing: unverified child conclusions written into the parent's memory poison the well. **Message passing**: information moves only through edge payloads; state stays private. Better isolation, at the price of designing every payload.
+
+Practice mixes both. One Anthropic detail deserves attention: the lead agent saves its research plan to Memory **before** spawning workers — because context beyond 200K tokens gets truncated, and the plan must live outside the loop to survive truncation. That's the blackboard's correct use: things that must outlive any single context window. Todo lists are the same category; [chapter 21](/en/patterns/21-todo-list/) covers four implementations.
+
+At the principle level, 12-Factor's Factor 5: unify execution state and business state. Store "which step the graph is on" and "what state the business data is in" separately and they will eventually disagree. An event log carries both — each agent node's log concatenated is the whole graph's execution history (see [Loop Engineering](/en/concepts/loop-engineering/), component 4).
+
+## Humans are nodes, not exceptions
+
+Most systems implement human involvement as a special case: popups, blocking waits. Graph engineering treats humans as a regular node type: trigger conditions, inputs, outputs, timeout behavior.
+
+The mechanism is 12-Factor's Factor 7: the model contacts humans through tool calls. `request_approval(action, reason)` and `ask_human(question)` are ordinary tools. Human involvement lands in the event log — replayable, countable.
+
+Three design points. **Routing**: whose screen? Codex routes everything back to the parent session; children never own UI — a user facing three popups can't tell which is which. **Timeouts**: fallbacks (conservative defaults, suspension) defined in advance; the graph can't hang on someone's evening off. **Granularity**: grade by irreversibility — reads pass, reversible writes report after the fact, irreversible actions (outbound messages, deletions, spending) approve first.
+
+## Freezing: the direction graphs evolve
+
+Static regions (code picks edges) and dynamic regions (the model picks edges) share one graph, and the border moves. The healthy direction is **freezing from dynamic toward static**.
+
+The test is one question: did this path's last 100 executions take the same route? If yes, rewrite the agent node as a code node — no tokens, no bad days, unit-testable. Anthropic's CitationAgent is a live example: attaching citations is a fixed path, so it was split out of the main loop into a dedicated pipeline-tail node. The 12-Factor author's observation points the same way: the best production "AI products" are mostly deterministic code with LLM steps only where improvisation is genuinely needed.
+
+The reverse holds too: a hardcoded flow whose exception branches outgrow its if-else chain wants improvisation — hand it to an agent node. Graph engineering is continuous rebalancing.
+
+## Runaway protection
+
+In a dynamic graph the model can open nodes on its own, so guardrails go into code, not prompts.
+
+- **Depth caps.** Hermes hardcodes MAX_DEPTH=2; Codex sets the child's `MultiAgentVersion::Disabled` (source above) — a depth cap of 1 enforced by the type system.
+- **Recursion bans.** The delegation tool isn't passed down. Blocks the child-spawns-grandchild explosion — Anthropic's 50-subagent incident is what no quantity gate looks like.
+- **Concurrency caps plus heartbeats.** Cap active nodes; long-running nodes emit heartbeats (Hermes: every 30s) so the outside can tell "working" from "dead."
+- **Budgets travel down edges.** Every edge carries max_iterations; the parent's budget is a hard ceiling over its children's sum.
+
+## Build it yourself: when you actually need a graph
+
+Honest answer: usually you don't. Every edge is a context retelling and every retelling drops information; multi-agent token costs are multiplied (that's exactly why it works, and why it's expensive). Anthropic states plainly their architecture wins only on breadth-first queries with parallelizable directions.
+
+Split when three signals appear:
+
+1. **Contexts poisoning each other.** Two workstreams crowding one window — split into two nodes.
+2. **Permissions need layering.** Part runs free, part locks down; edges are natural permission boundaries.
+3. **A human needs in.** Model the approval point as a human node instead of a popup inside the loop.
+
+Then work in order: write each edge's five elements (goal, context, permissions, budget, output format), settle state ownership (plan on the blackboard, details as messages), install guardrails (depth, concurrency, recursion bans). Node internals are the least of it — every agent node is a standard loop, and [Loop Engineering](/en/concepts/loop-engineering/)'s components apply as-is.
+
+## Common traps
+
+**Graphs for the sake of graphs.** Seven nodes for one loop's work buys seven rounds of handoff loss. Node count is a cost, not a maturity score.
+
+**One-line delegation.** "Research the semiconductor shortage"-grade vagueness made Anthropic's workers duplicate and drift. All five edge elements, every time — output format is the one most often forgotten.
+
+**Conclusions without evidence on edges.** Copy smolagents: a report template plus optional work summary. Parents must be able to judge child conclusions.
+
+**Guardrails in the prompt.** "Please don't recurse" is a request; `MultiAgentVersion::Disabled` is a constructor argument. Models forget requests in long contexts; they can't route around code.
+
+**Human nodes without timeouts.** Approval goes out, the human's on vacation, the graph hangs a week. Every human node gets a timeout and a fallback.
+
+**One model for every node.** Anthropic's recipe is heterogeneous by design: Opus orchestrates, Sonnet works. Per-node model selection is a direct dividend of splitting — use it.
+
+## Research notes
+
+This chapter is grounded in first-hand material (repos cloned into this workspace's `research/` directory; line numbers refer to the listed commits):
+
+| Source | Version | What was read |
+| --- | --- | --- |
+| [openai/codex](https://github.com/openai/codex) | `fa1d4c4` | `codex-rs/core/src/codex_delegate.rs` (policy inheritance L130, recursion ban L143), `protocol/src/protocol.rs` SubAgentSource (L2822) |
+| [crewAIInc/crewAI](https://github.com/crewAIInc/crewAI) | `f15844b` | `process.py` (sequential/hierarchical), `crew.py` check_manager_llm, `tools/agent_tools/delegate_work_tool.py` |
+| [huggingface/smolagents](https://github.com/huggingface/smolagents) | `e3a5b89` | `agents.py` managed agents' `__call__` (task template, report template, summary_of_work) |
+| [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) | Anthropic | the 90.2% gain, token-variance 80%, the four delegation elements, effort scales, the 50-subagent incident, CitationAgent |
+| [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) | Anthropic | workflow/agent distinction, the five patterns' origin |
+| [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) | HumanLayer | Factors 5 / 7 / 10 |
+
+For the four harnesses' subagent machinery side by side (OpenClaw's push events, Hermes's 5 hard-blocked tools, source included), see [chapter 10](/en/patterns/10-subagents/) and [chapter 12](/en/patterns/12-permissions-approvals/) — that's the evidence library; this chapter is the method.
+
+For how each node runs reliably inside, go back to [Loop Engineering](/en/concepts/loop-engineering/).

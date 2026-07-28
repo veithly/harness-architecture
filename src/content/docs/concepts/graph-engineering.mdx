@@ -1,0 +1,157 @@
+---
+title: Graph Engineering · 图工程
+description: 用 Codex、crewAI 源码和 Anthropic 多智能体系统的生产数据讲透图工程：Agent、代码、工具、人四类节点之间怎么组织工作。
+sidebar:
+  order: 2
+  label: Graph Engineering
+---
+
+## 图工程在管什么
+
+先排除一个误会：图工程（Graph Engineering）不是 LangGraph 那类图框架的用法。框架可用可不用。图工程是更底层的一件事——**活儿大到一个 agent 循环装不下时，怎么拆开、分给谁、怎么交接**。
+
+分给谁，选项只有四类节点：
+
+- **Agent 节点**：带自主循环的模型执行。贵、慢、会即兴。用在路径没法预先写死的地方。
+- **代码节点**：确定性代码。便宜、快、可测试。用在路径已经清楚的地方。
+- **工具节点**：也是确定性代码，但接口面向模型设计（Anthropic 叫 ACI，agent-computer interface）。
+- **人工节点**：审批、拿主意、补信息。最慢最贵，但有些边界只有人能守。
+
+节点之间的连线是**执行关系**：谁触发谁、交接带什么、结果怎么回来、失败归谁。图工程就是把节点怎么分、边怎么连这两件事设计对。
+
+值不值得拆，Anthropic 的[多智能体研究系统报告](https://www.anthropic.com/engineering/multi-agent-research-system)给了目前最硬的一组生产数据：Opus 4 当调度者加 Sonnet 4 当工人的多 agent 组合，在内部研究评测上比单跑 Opus 4 好 90.2%；对性能方差的归因分析里，token 用量一项就解释了 80%——**多 agent 有效的主因不是什么涌现智能，而是多个独立上下文窗口让系统能在一个任务上花更多 token**。这个结论同时划定了边界：它只在任务价值配得上成倍 token 消耗、且子任务能并行时成立。
+
+## 边上带什么：三个独立来源给出同一个答案
+
+图里最容易被轻视的是边。节点拆得再漂亮，交接时上下文断了、权限漏了、预算没限，图照样崩。有意思的是，三个互相独立的系统对"一条边该带什么"给出了几乎相同的答案。
+
+Hermes 的 `delegate_task`：
+
+```python
+delegate_task(goal, context, toolset, max_iterations)
+#             目标    上下文    权限白名单   预算
+```
+
+[crewAI](https://github.com/crewAIInc/crewAI)（commit `f15844b`）的委派工具，`tools/agent_tools/delegate_work_tool.py`：
+
+```python
+class DelegateWorkToolSchema(BaseModel):
+    task: str = Field(..., description="The task to delegate")
+    context: str = Field(..., description="The context for the task")
+    coworker: str = Field(..., description="The role/name of the coworker")
+```
+
+Anthropic 研究系统的调度 prompt 要求每个子任务描述必须包含：objective（目标）、output format（输出格式）、tool guidance（工具指引）、task boundaries（任务边界）。他们还留下了反面教材：早期允许调度者下达"research the semiconductor shortage"这种一句话任务，结果一个子 agent 去查 2021 年汽车芯片危机，另外两个重复调查 2025 年供应链——**边上信息不足，工人就会重复劳动或者跑偏**。
+
+三家合起来，一条边的完整定义是五要素：**目标、上下文、权限、预算、输出格式**。缺哪样，哪样就在运行时爆。
+
+返程 payload 同样有实现可抄。[smolagents](https://github.com/huggingface/smolagents)（`agents.py:868`，commit `e3a5b89`）的 managed agent 被调用时，返回的不是裸结论：结论套进固定的 report 模板，可选再附一段 `<summary_of_work>` 工作摘要（截断后的关键步骤）。父节点拿到的是"结论加依据"，可以判断质量，而不是只能盲信。
+
+## 边上不带什么：权限只收窄，不放宽
+
+这条纪律在 Codex 源码里是白纸黑字。`codex-rs/core/codex_delegate.rs`（commit `fa1d4c4`）spawn 子 agent 时：
+
+```rust
+inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),  // L130
+inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),               // L143
+```
+
+第一行：子代理强制继承父的执行策略，没有"开个子代理绕过权限"的后门。第二行更狠：子代理的多 agent 能力直接置为 `Disabled`——**子代理天生不能再派子代理**，递归禁令不靠 prompt 恳求，靠构造函数参数。
+
+Hermes 的对应做法是从子节点工具集里硬删 5 个工具：再派活、反问用户、写长期记忆、跨通道发消息、执行代码。两家共识一句话：**边是权限收窄的地方，不是放宽的地方。**
+
+## 五种拓扑，与两个真实实现
+
+组织方式收敛到五种形状。前四种在 crewAI 和 Anthropic 系统里都有可以直接读的实现。
+
+**流水线加闸门。** 固定顺序的步骤串行，步间放确定性检查。crewAI 的 `Process.sequential` 就是它：任务列表按序执行，前一个任务的产出作为后一个的上下文。适用前提是步骤能预先写死。
+
+**分诊路由。** 入口用便宜节点分类，再送对应专门节点。每条路的 prompt 和工具做窄做专；路由不准比不分诊更糟。
+
+**并行扇出。** 独立子任务同时跑：切分（各管一块再拼）或投票（同题多跑比对）。Anthropic 的数据：调度者并行 spawn 3-5 个子 agent、每个子 agent 并行调 3 个以上工具，复杂查询的耗时降了 90%。代价是聚合逻辑——结果冲突谁裁决，要提前定。
+
+**调度者加工人。** 子任务没法预先列出时，一个 agent 节点当调度者，运行时决定拆几个活、派给谁。crewAI 的 `Process.hierarchical` 是这个拓扑的显式实现，而且框架用校验器强制了它的前提——`crew.py` 的 `check_manager_llm`：不给 `manager_llm` 或 `manager_agent` 直接报错。**调度者不是可选装饰，是这个拓扑的定义**。
+
+调度还有个预算刻度问题：多大的活配多少工人？Anthropic 把刻度直接写进 prompt：简单事实查询 1 个 agent、3-10 次工具调用；直接对比 2-4 个子 agent、每个 10-15 次调用；复杂研究 10 个以上子 agent 分工明确。这条刻度值得抄——他们加它是因为早期系统会**为一个简单问题 spawn 50 个子 agent**。
+
+**评审回路。** 一个节点干活，另一个挑毛病，循环到通过。图里合法的环，但必须带出口：轮次上限加"意见不再变化就停"。
+
+真实系统是组合拓扑。Anthropic 研究系统完整走一遍是：调度者-工人（并行检索）→ 结果汇总 → 流水线尾巴上接一个确定性的 CitationAgent 专门补引用。三种形状拼成一张图。
+
+## 状态归谁：黑板还是信件
+
+多节点干活，马上遇到状态问题：中间结果放哪、谁能改。
+
+两种基本方案。**共享黑板**：所有节点读写同一份状态。协作方便，但写权限必须管——Hermes 禁止子节点写长期记忆：子节点的结论没经验证，直接写进父的记忆等于污染水源。**消息传递**：只通过边上的 payload 交换信息，状态私有。隔离好，代价是每条边都要认真设计。
+
+实践是混合。Anthropic 有个细节值得注意：调度者在 spawn 工人**之前**先把研究计划写进 Memory——因为上下文超 20 万 token 会被截断，计划必须存在循环外部才能活过截断。这就是黑板的正确用法：放计划这类"必须活得比上下文长"的东西。任务清单（todo list）同理，本站[第 21 章](/patterns/21-todo-list/)拆了四种实现。
+
+原则层面是 12-Factor 的 Factor 5：执行状态和业务状态尽量统一。图跑到哪一步和业务数据什么状态分两处存，迟早对不上账。事件日志是同时承载两者的好载体——每个 agent 节点的日志拼起来就是整张图的执行历史（见 [Loop Engineering](/concepts/loop-engineering/) 部件 4）。
+
+## 人是节点，不是意外
+
+多数系统把人的介入做成特例：弹窗、卡死等输入。图工程把人当正规节点：有触发条件、输入输出、超时行为。
+
+手段是 12-Factor 的 Factor 7：模型通过工具调用联系人。`request_approval(action, reason)`、`ask_human(question)` 是普通工具，模型自己决定何时调。人工介入由此进了事件日志，可回放可统计。
+
+三个设计要点。**路由**：审批送谁面前？Codex 的答案是一律回父 session，子代理永不弹 UI——用户面对三个弹窗分不清哪个是哪个。**超时**：人不在怎么办？降级方案（保守默认、挂起任务）预先定义，别让整张图挂在一个人的下班时间上。**粒度**：按不可逆程度分级——读操作放行，可逆写事后汇报，不可逆操作（外发、删数据、花钱）事前审批。
+
+## 冻结：图的演化方向
+
+静态图（代码定边）和动态图（模型选边）是同一张图的不同区域，边界随时间移动。健康方向是**从动态往静态冻**。
+
+判断标准一个问题：这段路径最近 100 次执行走的是不是同一条路？是，就把它从 agent 节点改写成代码节点——不花 token、不抽风、可写单测。Anthropic 的 CitationAgent 是现成例子：补引用这件事路径固定，就从主循环里拆出来变成流水线上一个专职节点。12-Factor 作者的观察同向：生产里最好的"AI 产品"大多是确定性代码，LLM 步骤只出现在真正需要即兴的那几个点。
+
+反方向也成立：写死的流程异常分支多到 if-else 写不完，说明它需要即兴，让给 agent 节点。图工程是持续再平衡。
+
+## 失控防护
+
+动态图里模型能自己开节点，防护栏必须写进代码，不是写进 prompt。
+
+- **深度上限。** Hermes 硬编码 MAX_DEPTH=2；Codex 直接给子代理 `MultiAgentVersion::Disabled`（上文源码），深度上限做成了类型系统层面的 1。
+- **递归禁令。** 派活工具不下发给子节点。防子派孙、孙派曾孙的指数爆炸——Anthropic 那个"50 个子 agent"事故就是没有数量闸门的下场。
+- **并发上限加心跳。** 活跃节点数封顶；长任务节点定期心跳（Hermes 每 30 秒），外层才分得清"还在干"和"已经死了"。
+- **预算随边下发。** 每条边带 max_iterations，父预算是所有子预算的硬上界。
+
+## 自己动手：什么时候需要图
+
+诚实的答案：多数时候不需要。每条边都是一次上下文复述，每次复述都丢信息；多 agent 的 token 消耗是成倍的（这正是它有效的原因，也是它昂贵的原因）。Anthropic 明确说他们的架构只对"广度优先、多方向并行"的查询占优。
+
+三个信号出现再拆：
+
+1. **上下文互相污染。** 一个窗口里两摊事互相挤占（边查资料边写代码），拆成两个节点各管一摊。
+2. **权限需要分层。** 一部分工作放开跑、另一部分必须收紧，边天生是权限边界。
+3. **有人要进来。** 有审批点就建模成人工节点，比循环里挂弹窗干净。
+
+拆的顺序：先写清每条边的五要素（目标、上下文、权限、预算、输出格式），再定状态归属（计划上黑板、细节走消息），最后装防护栏（深度、并发、递归禁令）。节点内部最不用操心——每个 agent 节点就是一个标准循环，[Loop Engineering](/concepts/loop-engineering/) 的部件原样适用。
+
+## 常见坑
+
+**为了图而图。** 一个循环能干的活拆成七个节点，得到的是七次交接损耗。节点数是成本，不是成熟度。
+
+**一句话委派。** "research the semiconductor shortage"式的模糊任务让 Anthropic 的工人们重复劳动、互相踩线。边的五要素一个都不能省，输出格式尤其容易忘。
+
+**边上只传结论不传依据。** 学 smolagents：report 模板加可选的工作摘要。父节点要能判断子结论的质量。
+
+**防护栏写进 prompt。** "请不要递归调用自己"是请求，`MultiAgentVersion::Disabled` 是构造函数参数。模型会在长上下文里忘掉请求，绕不过硬编码。
+
+**人工节点没有超时。** 审批发出去，人在度假，图挂一周。每个人工节点都要超时和降级路径。
+
+**所有节点用同一个模型。** Anthropic 的配方就是异构的：Opus 当调度者，Sonnet 当工人。节点拆开的直接红利是按节点选型号。
+
+## 研究底稿
+
+本章结论基于以下一手材料（代码库已 clone 到本仓库 `research/` 目录，行号以对应 commit 为准）：
+
+| 来源 | 版本 | 读了什么 |
+| --- | --- | --- |
+| [openai/codex](https://github.com/openai/codex) | `fa1d4c4` | `codex-rs/core/src/codex_delegate.rs`（权限继承 L130、递归禁令 L143）、`protocol/src/protocol.rs` SubAgentSource（L2822） |
+| [crewAIInc/crewAI](https://github.com/crewAIInc/crewAI) | `f15844b` | `process.py`（sequential/hierarchical）、`crew.py` check_manager_llm、`tools/agent_tools/delegate_work_tool.py` |
+| [huggingface/smolagents](https://github.com/huggingface/smolagents) | `e3a5b89` | `agents.py` managed agents 的 `__call__`（task 模板、report 模板、summary_of_work） |
+| [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system) | Anthropic | 90.2% 提升、token 解释 80% 方差、委派四要素、预算刻度、50-subagent 事故、CitationAgent |
+| [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) | Anthropic | workflow/agent 区分、五种模式原始出处 |
+| [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) | HumanLayer | Factor 5 / 7 / 10 |
+
+四个 harness 的 subagent 机制横向对照（含 OpenClaw 的 push 事件、Hermes 的 5 工具硬禁源码），见本站[第 10 章](/patterns/10-subagents/)和[第 12 章](/patterns/12-permissions-approvals/)——那是证据库，本章是方法。
+
+每个节点内部怎么跑得稳，回到 [Loop Engineering](/concepts/loop-engineering/)。

@@ -1,0 +1,177 @@
+---
+title: Loop Engineering
+description: "Loop engineering taught from real source code — mini-swe-agent, smolagents, Codex: budgets, stopping, error taxonomy, trajectory persistence, verification."
+sidebar:
+  order: 1
+  label: Loop Engineering
+---
+
+## What loop engineering covers
+
+An agent's main loop, written out, looks like this:
+
+```python
+context = [user_message]
+while True:
+    step = llm(context)          # model decides the next step
+    context.append(step)
+    if step.intent == "done":
+        return step.final_answer
+    result = execute(step)       # deterministic code runs the tool call
+    context.append(result)
+```
+
+Ten lines. Anyone writes this in half an hour. The problems live outside those ten lines: when should the loop stop? What do you do when the model is still spinning at step 40? What goes back into context when a tool fails? If the machine restarts, can you find this run again?
+
+The answers, taken together, are loop engineering. You can skip all of it in a demo. You can skip none of it in production.
+
+The academic root is the 2022 ReAct paper ([Yao et al., arXiv:2210.03629](https://arxiv.org/abs/2210.03629)): the model interleaves reasoning (thought) with actions, and each action's observation feeds back in. Every tool-calling agent today is an engineered version of that three-beat structure.
+
+## Read a real one first: mini-swe-agent in 191 lines
+
+Before the method, the artifact. [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) (from the SWE-bench team) implements its whole loop in `agents/default.py` — 191 lines that post real benchmark scores. Block by block (quoted from commit `a83fcae`):
+
+**The config is the loop-engineering checklist.** `AgentConfig` has 7 fields, and 4 of them are safety nets:
+
+```python
+step_limit: int = 0            # max steps
+cost_limit: float = 3.0        # stop after spending $3
+wall_time_limit_seconds: int = 0   # wall-clock cap
+max_consecutive_format_errors: int = 3  # exit after 3 format errors in a row
+```
+
+Note `cost_limit` defaults to 3.0 — **dollars**. Budgets aren't just steps; they're money. All three checks (steps, cost, wall time) sit at the top of `query()`, i.e. before every model call, raising `LimitsExceeded` / `TimeExceeded` when breached.
+
+**Exit is a message, not an escaping exception.** The loop's stop check is one line:
+
+```python
+if self.messages[-1].get("role") == "exit":
+    break
+```
+
+Every exit path — normal submission, budget breach, repeated format errors — ends up as a `role="exit"` message appended to the list. Exceptions are just transport (the `LimitsExceeded` exception literally carries the exit message inside it). The payoff: the exit reason and final state land in the trajectory automatically; read the `exit_status` field and you know whether the run was `Submitted`, `LimitsExceeded`, or `RepeatedFormatError`.
+
+**The circuit breaker counts *consecutive* failures.** On a format error, the error text is fed back as a message for retry, and `n_consecutive_format_errors += 1`; any clean step resets it to zero. Only 3 in a row exits. The counter isn't "how many errors total" — it's "are we stuck in the same hole."
+
+**Every step hits disk, including failed ones.** The loop body has `finally: self.save(...)` — success, format error, or uncaught exception, the trajectory file gets written first. After a crash, the disk always holds the complete scene of the last step.
+
+None of the 191 lines is wasted. The five components below generalize them, plus other systems' answers, into a portable method.
+
+## The five components
+
+### 1. Stop conditions: multiple signals, trust none alone
+
+The model's own completion signal is unreliable. Cross-check several:
+
+- **An explicit completion action.** [smolagents](https://github.com/huggingface/smolagents) (`agents.py`, commit `e3a5b89`) force-registers a `final_answer` tool; the model must call it explicitly to finish — "done" becomes a structured action, not free text. The loop condition is one line: `while not returned_final_answer and self.step_number <= max_steps`.
+- **Verify after completion.** smolagents' `final_answer_checks` is a list of callbacks: after the model produces a final answer, each check runs, and any failed `assert` throws an `AgentError` that bounces the run back. The definition of "done" stays in your hands.
+- **Don't trust stop_reason.** A Claude Code source comment states `stop_reason === 'tool_use'` is sometimes wrong, so it counts tool_use blocks in the stream itself (see [chapter 02](/en/patterns/02-agent-loop/)).
+- **A hard cap.** maxTurns / step_limit is the final gate for when everything above fails.
+
+### 2. Budgets: three dimensions, plus one graceful ending
+
+mini-swe-agent gives the complete definition: **steps** (stops spinning), **cost** in dollars (stops wallet fires), **wall-clock time** (stops hangs on slow tools). All three checked before each model call.
+
+Budget exhaustion shouldn't be a silent cutoff. smolagents' `_handle_max_steps_reached` makes one extra call — `provide_final_answer(task)` — forcing the model to produce a final reply from its existing memory, recorded with an `AgentMaxStepsError` marker. Hermes calls this a grace call. The user gets "here's what I did and what's missing," not empty hands.
+
+One more smolagents mechanism worth its own note: `planning_interval`. Every N steps, an independent planning step is inserted — no actions, just the model re-examining the task and progress. On long tasks models sink into detail and forget the goal; periodic re-planning is the anti-drift alarm clock.
+
+### 3. Error taxonomy: not every error deserves a retry
+
+smolagents splits error handling in two, plainly visible in `_run_stream`:
+
+```python
+except AgentGenerationError as e:
+    raise e          # implementation bug: retrying won't help, exit
+except AgentError as e:
+    action_step.error = e    # model's mistake: record and keep iterating
+```
+
+The framework's own bugs get raised immediately; the model's mistakes (bad format, bad tool args) get fed back for it to fix. mini-swe-agent adds the breaker on top: only 3 consecutive same-class failures exit, any success resets.
+
+What goes back into context must be compacted. [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) Factor 9: not the raw stack, but "what failed, what was tried, what options remain." One step further is [Reflexion](https://arxiv.org/abs/2303.11366) (Shinn et al. 2023): have the model write a verbal reflection on each failure into a separate episodic buffer, injected on every retry — no weight updates, language feedback only, and HumanEval pass@1 went from 80% to 91%. A retry that carries its lessons is the only retry worth paying for.
+
+### 4. Trajectory persistence: every step is a replayable record
+
+mini-swe-agent saves in a `finally` on every step; the trajectory file holds the full message sequence, per-step cost, exit status, and a config snapshot (`trajectory_format: "mini-swe-agent-1.1"` — even the format is versioned). Codex goes further: the loop *is* an event machine, every event appended to a rollout JSONL, state rebuilt from the rollout after restart, and agents observe each other by reading each other's rollouts.
+
+The principle is 12-Factor's Factor 12: the agent is a stateless reducer; the state is the event sequence. Once true, pause, resume, and machine migration are the same operation: read the log, rebuild, continue.
+
+### 5. A verifier: completion is ruled by facts outside the loop
+
+Models fake completion. Verifiers come in hardness grades:
+
+- **Hard**: test exit codes, patch syntax validation, command allowlists. Codex chains four in coding scenarios, all machine rulings (in our cloned `codex` repo, `codex-rs/core/`'s `apply_patch.rs` and the exec-policy modules are these verifiers).
+- **Soft**: smolagents' `final_answer_checks` callbacks, another model as reviewer (Anthropic's evaluator-optimizer), Reflexion-style self-critique.
+
+Verifier hardness sets the autonomy budget. With tests to run, let the loop go dozens of steps; with only soft verification, keep it short and bring humans in early.
+
+## Build it yourself: a skeleton
+
+The five components reassembled (structure mirrors mini-swe-agent and smolagents; copy details straight from the two repos):
+
+```python
+def run(task, step_limit=50, cost_limit=3.0):
+    log = TrajectoryLog(task.id)               # component 4
+    ctx = log.replay() or [task.as_message()]
+    errors = ConsecutiveErrorCounter(limit=3)  # breaker for component 3
+
+    while True:
+        if over_budget(step_limit, cost_limit):     # component 2: check before the call
+            ctx.append(grace_prompt())              # one last chance to wrap up
+        step = llm(ctx); log.append(step)
+
+        if step.calls("final_answer"):
+            if all(check(step.answer) for check in final_checks):  # component 5
+                return exit_message(log, "Submitted", step.answer)
+            ctx.append(check_feedback()); continue
+
+        try:
+            ctx.append(compact(execute(step)))
+            errors.reset()
+        except ModelError as e:                # model's fault: feed back to fix
+            ctx.append(compact_error(e))
+            if errors.bump(e): return exit_message(log, "RepeatedError")
+        except FrameworkError:                 # your fault: don't blame the model
+            raise
+        finally:
+            log.save()                         # every step, failures included
+
+        if ctx[-1].role == "exit": break       # component 1: exit is a message
+```
+
+Trade-off notes:
+
+- **Persistence and stop conditions before compression.** They're the safety net. mini-swe-agent's 191 lines contain zero context compression — short tasks don't need it; don't optimize early.
+- **Set all three budget dimensions.** Steps alone won't stop a hang on a slow tool; cost alone won't stop a free-tier infinite loop.
+- **Leave a reason on every continue.** Claude Code tags each continuation with transition.reason; mini-swe-agent stamps every exit with exit_status. Even one extra log field pays for itself.
+
+## Common traps
+
+**Treating the framework's loop as a black box.** Anthropic's advice is to start with the raw API. mini-swe-agent proves a production loop fits in 191 lines — read one that size before deciding you need a framework.
+
+**Using chat history as recovery.** Recovery needs an event log plus deterministic replay. Chat history lacks the side-effect record (was the file changed? did the command run?), so replaying it runs side effects twice.
+
+**Making exit an escaping exception.** Exceptions thrown up the stack lose the exit reason. Copy mini-swe-agent: exit is a message with `exit_status`; exceptions are just transport; everything lands in the trajectory.
+
+**Retrying every error alike.** Classify first: implementation errors raise, model errors feed back, consecutive same-class errors trip the breaker. Unclassified retry systems retry their most expensive bug until the budget dies.
+
+**Verifying only at the end.** Verification sits inside the loop, firing every time the model claims completion. Finding out at the finish line that step 3 was wrong wastes every step in between.
+
+## Research notes
+
+This chapter is grounded in first-hand material (repos cloned into this workspace's `research/` directory; line numbers refer to the listed commits):
+
+| Source | Version | What was read |
+| --- | --- | --- |
+| [SWE-agent/mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) | `a83fcae` | `src/minisweagent/agents/default.py`, all 191 lines |
+| [huggingface/smolagents](https://github.com/huggingface/smolagents) | `e3a5b89` | `agents.py`: `_run_stream`, `_handle_max_steps_reached`, `final_answer_checks`, `planning_interval` |
+| [openai/codex](https://github.com/openai/codex) | `fa1d4c4` | loop and rollout modules under `codex-rs/core/` |
+| ReAct | [arXiv:2210.03629](https://arxiv.org/abs/2210.03629) | the thought-action-observation structure |
+| Reflexion | [arXiv:2303.11366](https://arxiv.org/abs/2303.11366) | verbal-feedback retries, episodic reflection buffer |
+| [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) | Anthropic | augmented LLM, evaluator-optimizer |
+| [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) | HumanLayer | Factors 6 / 8 / 9 / 12 |
+
+For the four harnesses (Codex, Claude Code, OpenClaw, Hermes) compared loop-by-loop, see [chapter 02](/en/patterns/02-agent-loop/) — that's the evidence library; this chapter is the method.
+
+Loop engineering governs the inside of one agent. When the job outgrows one loop — split across agents, parts frozen into code, humans approving — you're in [Graph Engineering](/en/concepts/graph-engineering/) territory.

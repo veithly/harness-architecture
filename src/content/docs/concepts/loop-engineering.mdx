@@ -1,0 +1,177 @@
+---
+title: Loop Engineering · 循环工程
+description: 用 mini-swe-agent、smolagents、Codex 的真实源码讲透循环工程：预算、停止、错误分类、轨迹落盘、验证。
+sidebar:
+  order: 1
+  label: Loop Engineering
+---
+
+## 循环工程在管什么
+
+一个 agent 的主循环写出来是这样的：
+
+```python
+context = [user_message]
+while True:
+    step = llm(context)          # 模型决定下一步
+    context.append(step)
+    if step.intent == "done":
+        return step.final_answer
+    result = execute(step)       # 确定性代码执行工具调用
+    context.append(result)
+```
+
+十行。任何人半小时都能写出来。问题在这十行之外：循环什么时候该停？模型第 40 步还在原地打转怎么办？工具报错了塞什么回上下文？机器重启了这一趟活儿还找不找得回来？
+
+这些问题的答案加起来，就是循环工程（Loop Engineering）。写 demo 时可以全部跳过，上生产时一个都跳不过。
+
+学术源头是 2022 年的 ReAct 论文（[Yao et al., arXiv:2210.03629](https://arxiv.org/abs/2210.03629)）：模型交替产出推理（thought）和动作（action），动作的观察结果（observation）喂回去。今天所有 tool-calling agent 都是这个三拍结构的工程化，只是 thought 变成了模型内部推理，action 变成了结构化 tool call。
+
+## 先读一个真实的：mini-swe-agent 的 191 行
+
+讲方法之前先看实物。[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent)（SWE-bench 团队出品）的 `agents/default.py` 只有 191 行，却是一个在 benchmark 上真实跑分的生产循环。逐块拆（引用自 commit `a83fcae`）：
+
+**配置就是循环工程的清单。** `AgentConfig` 一共 7 个字段，其中 4 个是安全网：
+
+```python
+step_limit: int = 0            # 最多跑多少步
+cost_limit: float = 3.0        # 花超 3 美元就停
+wall_time_limit_seconds: int = 0   # 墙钟时间上限
+max_consecutive_format_errors: int = 3  # 连续格式错误 3 次退出
+```
+
+注意 `cost_limit` 默认是 3.0——**美元**。预算不只是步数，是钱。步数、成本、墙钟时间三个维度的检查全部放在 `query()` 的开头，也就是每次调模型之前，超限直接抛 `LimitsExceeded` / `TimeExceeded`。
+
+**退出是一条消息，不是一个异常逃逸。** 循环体的判停只有一行：
+
+```python
+if self.messages[-1].get("role") == "exit":
+    break
+```
+
+所有退出路径——正常提交、预算超限、连续格式错误——最终都表现为往消息列表里追加一条 `role="exit"` 的消息。异常只是运输工具（`LimitsExceeded` 异常体内装的就是那条 exit 消息）。这个设计的好处：退出原因和退出时的状态天然进了轨迹，事后看 `exit_status` 字段就知道这一趟是 `Submitted`、`LimitsExceeded` 还是 `RepeatedFormatError`。
+
+**断路器管的是"连续"。** 模型输出格式错误时，错误信息作为消息喂回去让它重试，同时 `n_consecutive_format_errors += 1`；任何一次干净的步骤就清零。连续 3 次才退出。计数器管的不是"总共错几次"而是"是不是卡死在同一个坑里"。
+
+**每一步都落盘，包括失败的那步。** `run()` 的循环体里有个 `finally: self.save(...)`——不管这一步是成功、格式错误还是抛了没接住的异常，轨迹文件都先写完再说。崩溃后磁盘上永远有最后一步的完整现场。
+
+191 行里没有一行是多余的。下面的五个部件，就是把这 191 行和其他系统的做法归纳成可迁移的方法。
+
+## 五个部件
+
+### 1. 停止条件：多信号，不信任何单一来源
+
+模型自己的完成信号不可靠，要用几路信号互相兜底：
+
+- **显式完成动作。** [smolagents](https://github.com/huggingface/smolagents)（`agents.py`，commit `e3a5b89`）强制注册一个 `final_answer` 工具，模型必须显式调用它才算完成——把"完成"从自由文本变成结构化动作。主循环判停就一行：`while not returned_final_answer and self.step_number <= max_steps`。
+- **完成后再验一道。** smolagents 的 `final_answer_checks` 是一个回调列表：模型给出最终答案后，逐个跑校验函数，任何一个 `assert` 失败就抛 `AgentError` 打回去继续跑。完成的定义权在你手里，不在模型手里。
+- **不信 stop_reason。** Claude Code 的源码注释写明 `stop_reason === 'tool_use'` 有时是错的，所以它自己数流里的 tool_use block（详见[第 02 章](/patterns/02-agent-loop/)）。
+- **硬上限。** maxTurns / step_limit 是最后一道闸，防的是前面全部失灵。
+
+### 2. 预算：三个维度，加一次优雅收尾
+
+mini-swe-agent 给了预算的完整定义：**步数**（防打转）、**成本**（美元计，防钱包爆炸）、**墙钟时间**（防卡死在慢工具上）。三个检查都在调模型之前执行。
+
+预算耗尽不该是无声中断。smolagents 的 `_handle_max_steps_reached` 在步数用完后额外调一次 `provide_final_answer(task)`——强制模型基于现有记忆给出最终答复，并把这一步标记 `AgentMaxStepsError` 记进轨迹。Hermes 管这叫 grace call。用户拿到的是"做到哪儿了、还差什么"的交代，不是空手而归。
+
+smolagents 还有一个值得单独记的机制：`planning_interval`。每隔 N 步插入一个独立的规划步——不执行动作，只让模型重新审视任务和进展。长任务里模型会逐渐忘记大目标陷进细节，周期性重规划就是防漂移的闹钟。
+
+### 3. 错误分类：不是所有错误都该重试
+
+smolagents 的错误处理分两类，`_run_stream` 里写得很清楚：
+
+```python
+except AgentGenerationError as e:
+    raise e          # 实现层的错，重试没用，直接退出
+except AgentError as e:
+    action_step.error = e    # 模型层的错，记录后继续迭代
+```
+
+框架自己的 bug（生成错误）重试一万次也是错，立即上抛；模型的错（格式错、工具参数错）喂回去让它自己修。mini-swe-agent 对后者再加一层断路器：连续 3 次同类错误才退出，中途任何一次成功就清零。
+
+塞回上下文的错误要压缩。[12-Factor Agents](https://github.com/humanlayer/12-factor-agents) 的 Factor 9：进上下文的不是原始错误栈，而是"出了什么错、试过什么、还剩什么可选"。更进一步是 [Reflexion](https://arxiv.org/abs/2303.11366)（Shinn et al. 2023）的做法：让模型对失败做一段文字反思，存进独立的反思缓冲区随每次重试注入——不改权重，只靠语言反馈，HumanEval 从 80% 提到 91% pass@1。重试带着教训，才叫重试。
+
+### 4. 轨迹落盘：循环的每一步都是可重放的记录
+
+mini-swe-agent 每步 `finally: save()`，轨迹文件里有完整的消息序列、每步成本、退出状态、配置快照（`trajectory_format: "mini-swe-agent-1.1"`——连格式都有版本号）。Codex 走得更远：整个循环就是事件机，每步事件追加写进 rollout JSONL，重启后从 rollout 重建状态续跑，多个 agent 之间也靠读彼此的 rollout 互相观察。
+
+原则是 12-Factor 的 Factor 12：agent 是无状态 reducer，状态就是事件序列。做到这一点，暂停、恢复、迁移机器都是同一个操作：读日志，重建，继续。
+
+### 5. 验证器：完成与否由循环外的事实裁决
+
+模型会装作完成。验证器按"硬度"分层：
+
+- **硬验证**：测试退出码、patch 语法校验、命令白名单。Codex 在 coding 场景串四道，全是机器裁决（我们 clone 的 `codex` 仓库里，`codex-rs/core/` 下 `apply_patch.rs`、`exec_policy` 相关模块就是这些验证器的实现）。
+- **软验证**：smolagents 的 `final_answer_checks` 回调、另一个模型当评审（Anthropic 的 evaluator-optimizer 模式）、Reflexion 式自我反思。
+
+验证器有多硬，自主权就给多大。有测试可跑的场景放心跑几十步；只有软验证的场景把循环收短，让人早介入。
+
+## 自己动手：一个骨架
+
+五个部件装回去（结构对照 mini-swe-agent 和 smolagents，可直接对着两个仓库的源码抄细节）：
+
+```python
+def run(task, step_limit=50, cost_limit=3.0):
+    log = TrajectoryLog(task.id)               # 部件 4
+    ctx = log.replay() or [task.as_message()]
+    errors = ConsecutiveErrorCounter(limit=3)  # 部件 3 的断路器
+
+    while True:
+        if over_budget(step_limit, cost_limit):     # 部件 2：调模型前查
+            ctx.append(grace_prompt())              # 最后一次总结机会
+        step = llm(ctx); log.append(step)
+
+        if step.calls("final_answer"):
+            if all(check(step.answer) for check in final_checks):  # 部件 5
+                return exit_message(log, "Submitted", step.answer)
+            ctx.append(check_feedback()); continue
+
+        try:
+            ctx.append(compact(execute(step)))
+            errors.reset()
+        except ModelError as e:                # 模型的错：喂回去修
+            ctx.append(compact_error(e))
+            if errors.bump(e): return exit_message(log, "RepeatedError")
+        except FrameworkError:                 # 自己的错：别让模型背锅
+            raise
+        finally:
+            log.save()                         # 每步落盘，失败也落
+
+        if ctx[-1].role == "exit": break       # 部件 1：退出是消息
+```
+
+取舍建议：
+
+- **先做落盘和停止条件，再做压缩。** 前两者是安全网。mini-swe-agent 191 行里没有上下文压缩——短任务不需要，别过早优化。
+- **预算三个维度都设。** 只设步数防不住慢工具卡死，只设成本防不住免费死循环。
+- **每个 continue 留下原因。** Claude Code 给每次续跑贴 transition.reason 标签；mini-swe-agent 每个 exit 消息带 exit_status。哪怕只是日志里多一个字段。
+
+## 常见坑
+
+**把框架的循环当黑盒。** Anthropic 的建议是先用裸 API 写。mini-swe-agent 证明了生产级循环 191 行足够——先读懂一个这么大的，再决定要不要上框架。
+
+**用对话历史当恢复机制。** 恢复需要事件日志加确定性重放。对话历史缺工具副作用记录（文件改了吗？命令跑过吗？），直接重放会把副作用执行两遍。
+
+**把退出做成异常逃逸。** 异常一路上抛，退出原因就丢在调用栈里了。学 mini-swe-agent：退出是一条带 `exit_status` 的消息，异常只负责运输，最终一切进轨迹。
+
+**所有错误一律重试。** 先分类：实现的错上抛，模型的错喂回去，连续同类错走断路器。不分类的重试系统，最贵的 bug 会重试到预算耗尽。
+
+**验证器只在结尾跑一次。** 验证嵌在循环里，每次模型声称完成就触发。结尾才发现第 3 步错了，中间几十步全白跑。
+
+## 研究底稿
+
+本章结论基于以下一手材料（代码库已 clone 到本仓库 `research/` 目录，行号以对应 commit 为准）：
+
+| 来源 | 版本 | 读了什么 |
+| --- | --- | --- |
+| [SWE-agent/mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) | `a83fcae` | `src/minisweagent/agents/default.py` 全文 191 行 |
+| [huggingface/smolagents](https://github.com/huggingface/smolagents) | `e3a5b89` | `src/smolagents/agents.py` 的 `_run_stream`、`_handle_max_steps_reached`、`final_answer_checks`、`planning_interval` |
+| [openai/codex](https://github.com/openai/codex) | `fa1d4c4` | `codex-rs/core/` 循环与 rollout 相关模块 |
+| ReAct | [arXiv:2210.03629](https://arxiv.org/abs/2210.03629) | thought-action-observation 三拍结构 |
+| Reflexion | [arXiv:2303.11366](https://arxiv.org/abs/2303.11366) | 语言反馈式重试，episodic 反思缓冲区 |
+| [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) | Anthropic | augmented LLM、evaluator-optimizer |
+| [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) | HumanLayer | Factor 6 / 8 / 9 / 12 |
+
+四个商业/开源 harness（Codex、Claude Code、OpenClaw、Hermes）的循环对照，见本站[第 02 章](/patterns/02-agent-loop/)——那是证据库，本章是方法。
+
+循环工程管一个 agent 内部。活儿大到一个循环装不下——拆给多个 agent、部分冻成代码、人要进来审批——就到了 [Graph Engineering](/concepts/graph-engineering/) 的地界。
