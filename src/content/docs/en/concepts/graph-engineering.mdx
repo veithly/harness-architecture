@@ -6,6 +6,8 @@ sidebar:
   label: 24 · Graph Engineering
 ---
 
+import Diagram from '@components/Diagram.astro';
+
 ## What graph engineering covers
 
 Clear up one misunderstanding first: graph engineering is not about LangGraph-style graph frameworks. Frameworks are optional plumbing. Graph engineering is the lower-level question — **when a job outgrows one agent loop, how do you split it, who gets each piece, and how do the handoffs work**.
@@ -20,6 +22,8 @@ Clear up one misunderstanding first: graph engineering is not about LangGraph-st
 The lines between nodes are **execution relationships**: who triggers whom, what a handoff carries, how results come back, who owns failures. Graph engineering is getting those two things — node division, edge wiring — right.
 
 Is splitting worth it at all? Anthropic's [multi-agent research system report](https://www.anthropic.com/engineering/multi-agent-research-system) has the hardest production numbers so far: Opus 4 as orchestrator plus Sonnet 4 workers beat single-agent Opus 4 by 90.2% on their internal research eval, and in their variance analysis token usage alone explained 80% of performance. **Multi-agent works mainly because separate context windows let the system spend more tokens on one problem — not because of emergent teamwork.** The same finding draws the boundary: it pays only when the task's value covers the multiplied token bill and the subtasks can actually run in parallel.
+
+<Diagram src="/diagrams/24-nodes-edges.svg" alt="Four node types and the five elements every edge must carry" caption="Each node type has its own cost and determinism profile; spell out an edge's five elements and the receiver never has to come back and ask." />
 
 ## What an edge carries: three independent sources, one answer
 
@@ -117,6 +121,8 @@ In a dynamic graph the model can open nodes on its own, so guardrails go into co
 
 Honest answer: usually you don't. Every edge is a context retelling and every retelling drops information; multi-agent token costs are multiplied (that's exactly why it works, and why it's expensive). Anthropic states plainly their architecture wins only on breadth-first queries with parallelizable directions.
 
+<Diagram src="/diagrams/24-delegation-tree.svg" alt="Decision tree for whether to split into a graph" caption="The default answer is don't split. Four signals each map to one topology; once you split, every guardrail goes into code." />
+
 Split when three signals appear:
 
 1. **Contexts poisoning each other.** Two workstreams crowding one window — split into two nodes.
@@ -138,6 +144,92 @@ Then work in order: write each edge's five elements (goal, context, permissions,
 **Human nodes without timeouts.** Approval goes out, the human's on vacation, the graph hangs a week. Every human node gets a timeout and a fallback.
 
 **One model for every node.** Anthropic's recipe is heterogeneous by design: Opus orchestrates, Sonnet works. Per-node model selection is a direct dividend of splitting — use it.
+
+## Interview questions: 6 high-frequency ones
+
+<details>
+<summary>**Q1 · Basics**: How does graph engineering relate to graph frameworks like LangGraph? One sentence on what graph engineering governs.</summary>
+
+Frameworks are implementation plumbing; graph engineering is the design decision you face with or without one. It governs two things: how nodes are divided (which work goes to a model, which to deterministic code, which to a human) and how edges are wired (what a handoff carries, how results return, who owns failures).
+
+The four node types are a complete option set: agent nodes (costly, slow, improvises — for unwriteable paths), code nodes (cheap, testable — for known paths), tool nodes (model-facing code interfaces), human nodes (approvals and judgment). Any "multi-agent architecture" decomposes into combinations of these four.
+
+**Source**: the crewAI and Codex implementations in this chapter's research notes.
+**Follow-up**: "Which part of graph engineering does LangGraph's StateGraph correspond to?" It implements edge execution (message passing, checkpoints) for you. How nodes divide and what edges carry remain your design decisions — the framework doesn't answer those.
+</details>
+
+<details>
+<summary>**Q2 · Edge design**: Which five elements must a delegation edge carry? What incident does each omission cause?</summary>
+
+Goal, context, permissions, budget, output format. Three independent sources converge on this: Hermes's `delegate_task(goal, context, toolset, max_iterations)`, crewAI's `DelegateWorkTool(task, context, coworker)`, and Anthropic's orchestrator prompt (objective / output format / tool guidance / task boundaries).
+
+Incidents, matched up: no goal → drift; no context → guessing; no permissions → overreach; no budget → runaway; no output format → duplicated work. Anthropic has the real case on record: the one-liner "research the semiconductor shortage" sent one worker off to the 2021 automotive chip crisis while two others duplicated 2025 supply-chain searches.
+
+The return leg is part of the edge too: conclusions must carry evidence. smolagents wraps a managed agent's answer in a report template plus a work summary, so the parent can judge quality.
+
+**Source**: `research/crewAI/.../delegate_work_tool.py` (`f15844b`); smolagents `agents.py:868`.
+**Follow-up**: "Which of the five gets forgotten most?" Output format. Everyone writes goals and context; skip the format and the parent ends up writing parser code for every freestyle reply.
+</details>
+
+<details>
+<summary>**Q3 · Permissions**: Why is "an edge is where permissions narrow, never widen"? Give code-level evidence.</summary>
+
+Because a parent can't supervise a child step by step, any widening is an unwatched opening. Classic incidents: a child holding tools the parent lacks (escalation), a child spawning children (recursive blowup), a child writing the parent's long-term memory (unverified conclusions poisoning the well).
+
+The code evidence is in open-source Codex, `codex_delegate.rs` (commit `fa1d4c4`): L130 `inherited_exec_policy` — the child forcibly inherits the parent's exec policy, no bypass channel; L143 `inherited_multi_agent_version: Some(MultiAgentVersion::Disabled)` — the child is born unable to delegate. The recursion ban is a constructor argument, not a prompt plea.
+
+Hermes's equivalent: 5 tools hard-removed from every child's toolset (delegate, ask-user, memory-write, cross-channel send, code exec).
+
+**Source**: `research/codex/codex-rs/core/src/codex_delegate.rs` L130/L143.
+**Follow-up**: "Why can't guardrails live in the prompt?" Models forget requests in long contexts but can't route around hardcoded constants. "Please don't recurse" is a request; `Disabled` is law.
+</details>
+
+<details>
+<summary>**Q4 · Cost judgment**: Anthropic's data shows multi-agent beating single-agent by 90.2% — why should you still default to not splitting?</summary>
+
+Look at the attribution: within that gain, token usage alone explained 80% of the performance variance. Multi-agent works mainly because separate context windows let the system spend more tokens per problem — buying performance with money, not architecture magic.
+
+So the criterion is economic: does the task's value cover a multiplied token bill, and can the subtasks actually parallelize? Anthropic's own boundary is "breadth-first queries with parallelizable directions"; splitting a linear task only adds handoff loss (every edge is a context retelling, every retelling drops information).
+
+The proper triggers are three: contexts poisoning each other, permissions needing layers, a human needing in. Without one of those, one loop plus good tools is optimal.
+
+**Source**: the BrowseComp variance analysis in Anthropic's multi-agent report.
+**Follow-up**: "How to set the orchestrator's effort scale?" Copy Anthropic's prompt-embedded scale: simple facts, 1 agent, 3-10 calls; comparisons, 2-4 workers at 10-15 calls; complex research, 10+ workers with divided duties. They added it after early versions spawned 50 subagents for a simple query.
+</details>
+
+<details>
+<summary>**Q5 · Evolution**: What does "freezing from dynamic toward static" mean? Give an operational test and a real example.</summary>
+
+Dynamic regions (model picks edges) and static regions (code picks edges) share one graph, and the border moves. The healthy direction is rewriting stabilized dynamic paths into deterministic code: no tokens, no bad days, unit-testable.
+
+The operational test in one sentence: did this path's last 100 executions take the same route? If yes, freeze it into a code node.
+
+Real example: Anthropic's CitationAgent. Attaching citations follows a fixed path (take conclusions and documents, locate sources, insert markers), so it was split out of the main loop into a dedicated pipeline-tail node. The reverse also holds: a hardcoded flow drowning in exception branches wants improvisation — hand it to an agent node.
+
+**Source**: the architecture diagram in Anthropic's report (LeadResearcher → Subagents → CitationAgent).
+**Follow-up**: "Does freezing kill the agent's flexibility?" It freezes paths that no longer need flexibility. Graph engineering is continuous rebalancing — check quarterly which dynamic paths have worn into straight lines.
+</details>
+
+<details>
+<summary>**Q6 · Open-ended**: Design an automated refund-request system. Draw your nodes and edges — where do agents, code, and humans go?</summary>
+
+One reference answer (not unique; the reasoning is what's graded):
+
+Entry triage is a **code node** (or a small model): route by amount and order status — the rules are clear, no improvisation needed. Small refunds matching policy go through a **code node** directly: the path is 100% fixed; an agent there is waste. Disputed cases go to an **agent node**: reading chat history, checking logistics, judging responsibility — unwriteable paths. Amounts over a threshold hit a **human node**: irreversible actions (sending money) approve before, via a tool call `request_approval(order, reason)`, 24h timeout suspending to a human queue.
+
+Edge design: the agent node's toolset holds query tools only, no payment tool (permissions narrow); budget 15 steps; output format fixed as "verdict + three pieces of evidence + recommended action." Payment is always executed by a code node; the agent only produces recommendations.
+
+Only one node in this design is an agent — and that's correct. Graph-engineering maturity is measured by whether each node type is used where it belongs, not by agent count.
+
+**Source**: topologies map to crewAI's two `Process` modes; approval routing maps to Codex's route-to-parent design.
+**Follow-up**: "What if the dispute agent's verdict quality is unstable?" Add a review loop: a second, cheaper model audits against a checklist before release, round cap 2. Cheaper than upgrading the main model.
+</details>
+
+## Exercises
+
+1. **Read source**: open `research/crewAI/lib/crewai/src/crewai/crew.py`, find the `check_manager_llm` validator, and answer: why does hierarchical mode require a manager while sequential doesn't?
+2. **Extend the design**: give the human node in the refund system (Q6) a full definition: trigger condition, inputs/outputs, timeout, fallback path. Write it as a tool's JSON schema.
+3. **Audit**: pick a multi-agent framework you've used (or your own delegation code) and check its delegation edge against the five elements: which is missing? Are the guardrails in the prompt or in code?
 
 ## Research notes
 

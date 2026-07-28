@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Base architecture
 
+:::tip[Key takeaways · 30-second read]
+- **Loudest incident source**: arbitrary shell means the model can in principle do anything; the problem splits into deciding safety, handling unsafe commands, defeating obfuscation, and sandboxing execution.
+- **Four routes**: Codex keeps `allow / ask / deny` rules in a self-testing Starlark `.codexpolicy` file returning `Allow` / `Prompt` / `Forbidden`; Claude Code walks a tree-sitter AST through 23 numbered checkers inside `BashTool`; OpenClaw crosses `execSecurity` × `execAsk` × `execHost` into 27 modes plus safe-bin profiles; Hermes skips command filtering and routes the terminal into 7 backends via `TERMINAL_ENV`.
+- **Policy is a rule body, not code**: rules evolve constantly; a git-versionable DSL with `match` / `not_match` self-tests determines whether a broken rule fails the build or silently mis-classifies at runtime.
+- **Never rely on argv alone**: base64, `$()` sub-shells, and `sh -c` wrappers slip past filters; an OS-level sandbox (Landlock + seccomp, seatbelt, bubblewrap, containers) must back the command layer up.
+:::
+
 <Diagram
   src="/diagrams/07-shell-execution-base.svg"
   alt="Shell execution stacks across four systems: from tool_call to disk side effect"

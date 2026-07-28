@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Base architecture
 
+:::tip[Key takeaways · 30-second read]
+- **Git depth is code understanding**: how deeply an agent understands code is largely determined by how deeply it understands git.
+- **Order-of-magnitude split**: Codex ships a full `codex-git-utils` crate (30+ functions, typed `GitInfo` / `GitSha`, baseline snapshots via `ensure_git_baseline_repository` / `reset_git_repository`); Claude Code layers near a thousand lines of IDE git infra (LRU-50 `findGitRoot` cache, `gitSafety.ts`); OpenClaw only stamps versions (`git-root.ts` + reading `.git/HEAD`); Hermes shows one banner line.
+- **A baseline snapshot buys rollback**: copying the workspace at startup and diffing against it (`diff_since_latest_init`) lets a broken run be undone with one command.
+- **Git is an attack surface**: `gitSafety.ts` defends real sandbox escapes—the bare-repo attack and the git-internal-write compound attack that trigger malicious hooks from cwd.
+:::
+
 <Diagram
   src="/diagrams/08-git-workflow-base.svg"
   alt="Git abstraction depth across four systems: from a full crate to one subprocess call"

@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 入口拓扑 4 档对照
 
+:::tip[本章重点 · 30 秒速读]
+- **核心问题**：同一份 agent 内核要同时面对终端、CI 脚本、IDE 插件、标准协议、聊天平台、webhook 这些风格完全不同的调用方。
+- **分歧最大点**：Codex 多 binary 加 stdio-to-uds 桥接 daemon、Claude Code 单 binary 用 commander 组织子命令、OpenClaw 19 个 sub-CLI 全走 RPC 连 gateway 加 ACP、Hermes 把 17 个 platform adapter 压进一个 GatewayRunner。
+- **工程判断**：产品形态决定入口拓扑：开发者工具参考 Codex/Claude Code，ChatOps 参考 Hermes 的 BasePlatformAdapter，开放生态参考 OpenClaw 的 channels-plugins。
+- **动手要点**：CI/SDK 入口先留一个 --bare 式开关，跳过所有自动化行为让上下文完全可控；IDE 集成用 stdio-to-uds 桥让 daemon 升级不打断 IDE。
+:::
+
 <Diagram
   src="/diagrams/14-multi-channel-entry-base.svg"
   alt="四系统的入口拓扑：codex 多 binary、claude code 单 binary 多 subcommand、openclaw sub-CLI 加 plugins、hermes 17 platform adapter"

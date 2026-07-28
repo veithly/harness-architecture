@@ -20,6 +20,13 @@ import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
 ## §2 · 短期可控对比长期自治的光谱
 
+:::tip[本章重点 · 30 秒速读]
+- **四家 = 四种形态**：Codex 硬约束 coding 闭环，Claude Code 协议参考实现，OpenClaw 会话控制面，Hermes 长跑自改进。合起来才是完整光谱。
+- **最深的分歧在信任**：Codex 根本不信模型自评（4 个外部 verifier 串联），Hermes 反而靠模型自评（insights 写回 memory）——信任度决定架构重量。
+- **选型第一问**：你的 agent 偏"短期可控"还是"长期自治"？答案直接决定该抄哪家。
+- **别平均**：四家没有"综合最优解"，混搭之前先检查两套机制的状态假设是否兼容。
+:::
+
 <Diagram
   src="/diagrams/01-overview-base.svg"
   alt="四系统在「短期可控性 ↔ 长期自治度」这条轴上的分布"

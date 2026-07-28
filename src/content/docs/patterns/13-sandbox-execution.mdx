@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 沙箱 4 档对照
 
+:::tip[本章重点 · 30 秒速读]
+- **核心认知**：沙箱不是单一技术，是分层叠加：FS 读写、网络出站、提权、syscall、子进程特权继承，任何一层失守整个隔离就垮。
+- **分歧最大点**：Codex 自写每一层（bubblewrap 加 seccomp 加 landlock 加 seatbelt）、Claude Code 把沙箱做成 JSON schema 配置面（含 enableWeakerNetworkIsolation 这类减弱口子）、OpenClaw 用 ExecHost 3 档抽象不规定实现、Hermes 用 TERMINAL_ENV 委托 6 种容器后端。
+- **工程判断**：部署形态决定路线：桌面级安全 agent 自管三层是底线，SaaS 把沙箱外包给容器或远程基础设施更工程化。
+- **动手要点**：隔离策略只应用到当前线程（PR_SET_NO_NEW_PRIVS 绑线程不绑进程），让子进程精确继承边界、不污染整个 CLI 进程。
+:::
+
 <Diagram
   src="/diagrams/13-sandbox-execution-base.svg"
   alt="四系统的沙箱方案：自管三层、跨平台配置、ExecHost 3 backend、TERMINAL_ENV 6 后端"

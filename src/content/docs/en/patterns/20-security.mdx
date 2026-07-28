@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Architecture diagram
 
+:::tip[Key takeaways · 30-second read]
+- **Four independent fronts**: prompt injection, tool poisoning, credential leakage, supply chain — drop any one and the whole thing falls open.
+- **Each system picks a different main line of defense**: Codex is sandbox-first with per-directory TrustLevel; Claude Code ships `/security-review` as a dedicated tool; OpenClaw wraps external content with random 8-byte IDs and XML boundaries plus ReDoS protection; Hermes delegates verdicts to a signed `tirith` subprocess (SHA-256 + cosign + OIDC provenance).
+- **The chosen defense layer determines what you must secure next**: an outside-process scanner only works if the scanner's own provenance is nailed down, which is why Hermes uses the Sigstore stack.
+- **Cover all four fronts before deepening one**: borrow Codex for sandbox depth, OpenClaw for external-content isolation, Hermes for credential redaction, Claude Code for PR review.
+:::
+
 <Diagram
   src="/diagrams/20-security-base.svg"
   alt="Four security models: codex sandbox+TrustLevel vs claude code /security-review+autoMode vs openclaw 29-file security/ vs hermes tirith subprocess+30 vendor redact"

@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · The base diagram
 
+:::tip[Key takeaways · 30-second read]
+- **The unretryable side effect**: when the model breaks code, the broken state is already on disk; unlike a failed shell command, you cannot fix it by re-running.
+- **Two camps**: Codex teaches the model the V4A inline patch DSL (multi-file, all-succeed-or-all-rollback, dodges the 8-16K function-args ceiling); Claude Code shrinks edits to `str_replace` with an mtime check (`FILE_UNEXPECTEDLY_MODIFIED_ERROR`); OpenClaw exposes generic fs tools guarded only by `workspaceOnly`; Hermes reimplements V4A in `tools/patch_parser.py` but wraps it in function-call args.
+- **Format decides throughput**: which road you pick decides how big one turn can edit, how the loop recovers when a patch fails, and whether external reviewers can audit.
+- **Guard against stale writes**: check filesystem state before writing—Claude Code's mtime compare catches out-of-band modifications that would otherwise be clobbered.
+:::
+
 <Diagram
   src="/diagrams/06-file-edit-patch-base.svg"
   alt="Two roads for file editing: V4A inline DSL vs str_replace call"

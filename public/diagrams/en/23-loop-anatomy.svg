@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 620" role="img" aria-label="How the four bare-loop deaths map to the five components">
+  <defs>
+    <filter id="wb23"><feTurbulence type="fractalNoise" baseFrequency="0.02" numOctaves="2" seed="231" /><feDisplacementMap in="SourceGraphic" scale="1.5" /></filter>
+    <marker id="ar23" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1e293b" /></marker>
+    <style>
+      .h   { font: 600 14px sans-serif; fill: #1e293b; }
+      .lbl { font: 700 11.5px sans-serif; fill: #1e293b; }
+      .t-s { font: 10.5px sans-serif; fill: #64748b; }
+    </style>
+  </defs>
+  <text x="440" y="26" class="h" text-anchor="middle">Loop anatomy: four deaths → five components</text>
+  <text x="440" y="44" class="t-s" text-anchor="middle">Left: how a bare loop dies in production. Right: the components that save it. Middle: the ten-line loop itself</text>
+  <g filter="url(#wb23)">
+    
+    <rect x="30" y="96" width="230" height="96" rx="10" fill="#fee2e2" stroke="#1e293b" stroke-width="1.6" />
+    <text x="145" y="122" class="lbl" text-anchor="middle">Won't stop</text>
+    <foreignObject x="42" y="132" width="206" height="56"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">stop_reason unreliable; single-signal stops jam</p></foreignObject>
+    <rect x="30" y="214" width="230" height="96" rx="10" fill="#fee2e2" stroke="#1e293b" stroke-width="1.6" />
+    <text x="145" y="240" class="lbl" text-anchor="middle">One error forever</text>
+    <foreignObject x="42" y="250" width="206" height="56"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">raw stack fed back, model retries verbatim</p></foreignObject>
+    <rect x="30" y="332" width="230" height="96" rx="10" fill="#fee2e2" stroke="#1e293b" stroke-width="1.6" />
+    <text x="145" y="358" class="lbl" text-anchor="middle">Context blowup</text>
+    <foreignObject x="42" y="368" width="206" height="56"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">long tasks only grow; dumber before it dies</p></foreignObject>
+    <rect x="30" y="450" width="230" height="96" rx="10" fill="#fee2e2" stroke="#1e293b" stroke-width="1.6" />
+    <text x="145" y="476" class="lbl" text-anchor="middle">Crash loses all</text>
+    <foreignObject x="42" y="486" width="206" height="56"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">process dies, in-memory state gone</p></foreignObject>
+    <text x="430" y="112" class="t-s" text-anchor="middle">the ten-line loop</text>
+    
+    <rect x="330" y="130" width="200" height="46" rx="8" fill="#dbeafe" stroke="#1e293b" stroke-width="1.6" />
+    <text x="430" y="158" class="lbl" text-anchor="middle">assemble context</text>
+    <line x1="430" y1="176" x2="430" y2="208" stroke="#1e293b" stroke-width="1.6" marker-end="url(#ar23)" />
+    <rect x="330" y="212" width="200" height="46" rx="8" fill="#dbeafe" stroke="#1e293b" stroke-width="1.6" />
+    <text x="430" y="240" class="lbl" text-anchor="middle">call model</text>
+    <line x1="430" y1="258" x2="430" y2="290" stroke="#1e293b" stroke-width="1.6" marker-end="url(#ar23)" />
+    <rect x="330" y="294" width="200" height="46" rx="8" fill="#dbeafe" stroke="#1e293b" stroke-width="1.6" />
+    <text x="430" y="322" class="lbl" text-anchor="middle">run tools</text>
+    <line x1="430" y1="340" x2="430" y2="372" stroke="#1e293b" stroke-width="1.6" marker-end="url(#ar23)" />
+    <rect x="330" y="376" width="200" height="46" rx="8" fill="#dbeafe" stroke="#1e293b" stroke-width="1.6" />
+    <text x="430" y="404" class="lbl" text-anchor="middle">append results</text>
+    <line x1="430" y1="422" x2="430" y2="454" stroke="#1e293b" stroke-width="1.6" marker-end="url(#ar23)" />
+    <rect x="330" y="458" width="200" height="46" rx="8" fill="#dbeafe" stroke="#1e293b" stroke-width="1.6" />
+    <text x="430" y="486" class="lbl" text-anchor="middle">stop / continue</text>
+    <path d="M 530 545 C 590 545 590 153 534 153" fill="none" stroke="#1e293b" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#ar23)" />
+    
+    <rect x="620" y="88" width="240" height="82" rx="10" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="740" y="110" class="lbl" text-anchor="middle">1 · Stop conditions</text>
+    <foreignObject x="632" y="118" width="216" height="50"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">multiple signals: final_answer tool + checks + hard cap</p></foreignObject>
+    <rect x="620" y="184" width="240" height="82" rx="10" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="740" y="206" class="lbl" text-anchor="middle">2 · Budgets</text>
+    <foreignObject x="632" y="214" width="216" height="50"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">steps / dollars / wall-clock, one grace call before cutoff</p></foreignObject>
+    <rect x="620" y="280" width="240" height="82" rx="10" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="740" y="302" class="lbl" text-anchor="middle">3 · Error taxonomy</text>
+    <foreignObject x="632" y="310" width="216" height="50"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">impl errors raise; model errors compacted; breaker on streaks</p></foreignObject>
+    <rect x="620" y="376" width="240" height="82" rx="10" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="740" y="398" class="lbl" text-anchor="middle">4 · Trajectory</text>
+    <foreignObject x="632" y="406" width="216" height="50"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">every step saved in finally; exit is a message</p></foreignObject>
+    <rect x="620" y="472" width="240" height="82" rx="10" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="740" y="494" class="lbl" text-anchor="middle">5 · Verifier</text>
+    <foreignObject x="632" y="502" width="216" height="50"><p xmlns="http://www.w3.org/1999/xhtml" style="font:10.5px sans-serif;color:#475569;margin:0;line-height:1.35">completion ruled by facts outside the loop</p></foreignObject>
+    <line x1="260" y1="144" x2="326" y2="150" stroke="#b91c1c" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#ar23)" />
+    <line x1="534" y1="200" x2="616" y2="130" stroke="#15803d" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#ar23)" />
+    <line x1="534" y1="380" x2="616" y2="310" stroke="#15803d" stroke-width="1.3" stroke-dasharray="3 3" marker-end="url(#ar23)" />
+  </g>
+  <text x="440" y="600" class="t-s" text-anchor="middle">Mapping: death 1 → comps 1/5 · death 2 → comp 3 · death 3 → comp 2 · death 4 → comp 4</text>
+</svg>

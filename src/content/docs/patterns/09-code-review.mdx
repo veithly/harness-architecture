@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Reviewer 形态 4 档对照
 
+:::tip[本章重点 · 30 秒速读]
+- **核心范式**：让另一个 agent 检查这个 agent 在做的事，要答四问：reviewer 形态、看什么 target、怎么处理审批、输出怎么消费。
+- **分歧最大点**：Codex 独立 sub-agent thread（`run_codex_thread_one_shot` 加 `AskForApproval::Never`）、Claude Code 本地 prompt-as-command 加远程 CCR pipeline、OpenClaw 只留 `after_tool_call` hook、Hermes 连入口都没有。
+- **工程判断**：reviewer 是否独立 agent 决定判断力：同对话便宜但会为自己辩护，独立 agent 贵但批判性强。
+- **动手要点**：先上三件套：独立 sub-agent 加受约束 config 加结构化输出；最大的坑是递归 spawn 和越狱重试（参考 GUARDIAN_REJECTION_INSTRUCTIONS）。
+:::
+
 <Diagram
   src="/diagrams/09-code-review-base.svg"
   alt="四系统的 code review 路径：双 agent vs prompt-as-command vs 远程 vs 不内建"

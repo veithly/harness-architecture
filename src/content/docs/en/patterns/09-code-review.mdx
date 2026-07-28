@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Base architecture
 
+:::tip[Key takeaways · 30-second read]
+- **Another agent checks this one**: review's core pattern is a reviewer separate from the doer; the design questions are reviewer isolation, review target, approval handling, and output format.
+- **Four review models**: Codex spawns a constrained sub-agent (`run_codex_thread_one_shot`: web_search off, `SpawnCsv` / `MultiAgentV2` off, `AskForApproval` = `Never`, cheaper `review_model`) plus a `guardian/review` layer; Claude Code drops a `/review` prompt into the main agent or teleports to remote `/ultrareview`; OpenClaw only offers the `after_tool_call` hook; Hermes has no entry at all.
+- **Same conversation drifts**: an in-context reviewer is cheap but drifts easily; an independent agent is expensive but judges more cleanly.
+- **Constrain the reviewer first**: independent sub-agent + constrained config + structured output is the most reliable three-piece combo—and write the anti-workaround rule down, like `GUARDIAN_REJECTION_INSTRUCTIONS` does.
+:::
+
 <Diagram
   src="/diagrams/09-code-review-base.svg"
   alt="Four review paths: dual-agent vs prompt-as-command vs remote pipeline vs no native build"

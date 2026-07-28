@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 观测栈 4 档对照
 
+:::tip[本章重点 · 30 秒速读]
+- **核心问题**：观测要同时算清四笔账：token 用量、钱、响应延迟、出错率，四笔账的重要性随部署形态变化。
+- **分歧最大点**：Codex 拆三个独立模块（OTEL 适配、analytics 业务事件、rollout trace bundle 离线重放）、Claude Code 把价格硬编码进源码、OpenClaw 用监听器模式发十几种事件由调用方决定落点、Hermes 用 CanonicalUsage 加 CostSource 六级可信度。
+- **工程判断**：部署形态决定观测栈：企业级学 Codex 三模块拆分，隐私敏感的本地服务学 Hermes 全落 SQLite 不上报。
+- **动手要点**：成本数字必须带来源标记：从 provider_cost_api 到 official_docs_snapshot 分级（CostSource），让每条数据都说清「我有多确定这个数字」。
+:::
+
 <Diagram
   src="/diagrams/15-observability-cost-base.svg"
   alt="四系统的观测栈：codex OTEL 加 analytics 加 trace、claude code modelCost 加 insights 加 sessionStorage、openclaw diagnostic-events 13 类、hermes usage_pricing 加 SQLite"

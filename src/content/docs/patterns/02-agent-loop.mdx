@@ -21,6 +21,13 @@ import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
 ## §2 · 共有的最小循环加四家泳道图
 
+:::tip[本章重点 · 30 秒速读]
+- **loop 的难点不在循环本身**：决定工程质量的是循环外那圈兜底——什么时候停、跑挂怎么恢复、谁判对错、上下文撑爆怎么压。
+- **分歧最大在可观察性**：Codex 每步写 rollout（JSONL 事件流）可重放，Claude Code 给每次 continue 贴 7 种 transition.reason，Hermes 用 IterationBudget 加 grace call 硬限步数。
+- **verifier 决定 loop 可信度**：Codex 4 个硬 verifier 串联，完全不信模型自评。
+- **自己动手第一优先**：先把每步事件写盘（rollout 式），否则 loop 跑挂状态全丢只能从零重跑。
+:::
+
 先看 30 秒动画。任何 agent 跑起来都是这四个阶段在循环：
 
 <AgentLoopSVG nodes={['Observe','Plan','Act','Verify']} caption="共有的最小循环：观察 → 规划 → 行动 → 验证" />

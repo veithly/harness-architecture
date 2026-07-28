@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 560" role="img" aria-label="该不该拆图的决策树">
+  <defs>
+    <filter id="wb24t"><feTurbulence type="fractalNoise" baseFrequency="0.02" numOctaves="2" seed="247" /><feDisplacementMap in="SourceGraphic" scale="1.5" /></filter>
+    <marker id="ar24t" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1e293b" /></marker>
+    <style>
+      .h   { font: 600 14px sans-serif; fill: #1e293b; }
+      .lbl { font: 700 11.5px sans-serif; fill: #1e293b; }
+      .t-s { font: 10.5px sans-serif; fill: #64748b; }
+      .ok  { font: 700 11px sans-serif; fill: #15803d; }
+      .no  { font: 700 11px sans-serif; fill: #b45309; }
+    </style>
+  </defs>
+  <text x="440" y="26" class="h" text-anchor="middle">决策树：先问该不该拆，再问怎么拆</text>
+  <text x="440" y="44" class="t-s" text-anchor="middle">默认答案是「不拆」——每条边都是一次上下文复述，多 agent 的 token 成本是成倍的</text>
+  <g filter="url(#wb24t)">
+    <rect x="150" y="86" width="300" height="50" rx="10" fill="#e0e7ff" stroke="#1e293b" stroke-width="1.8" />
+    <text x="300" y="116" class="lbl" text-anchor="middle">一个循环 + 好工具能干完吗？</text>
+
+    <text x="120" y="150" class="ok">能</text>
+    <line x1="230" y1="136" x2="150" y2="168" stroke="#15803d" stroke-width="1.8" marker-end="url(#ar24t)" />
+    <rect x="20" y="172" width="260" height="46" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="2" />
+    <text x="150" y="200" class="lbl" text-anchor="middle">不拆。单循环。（默认答案）</text>
+
+    <text x="360" y="160" class="no">不能——是哪个信号逼你拆？</text>
+    <line x1="330" y1="136" x2="330" y2="200" stroke="#b45309" stroke-width="1.8" marker-end="url(#ar24t)" />
+    
+    <rect x="360" y="210" width="180" height="60" rx="8" fill="#fef9c3" stroke="#1e293b" stroke-width="1.5" />
+    <foreignObject x="370" y="216" width="160" height="30"><p xmlns="http://www.w3.org/1999/xhtml" style="font:700 10.5px sans-serif;color:#1e293b;margin:0;line-height:1.25">步骤固定已知</p></foreignObject>
+    <text x="450" y="262" class="t-s" text-anchor="middle" font-style="italic"></text>
+    <line x1="540" y1="240" x2="566" y2="240" stroke="#1e293b" stroke-width="1.5" marker-end="url(#ar24t)" />
+    <rect x="570" y="210" width="180" height="60" rx="8" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="660" y="236" class="lbl" text-anchor="middle">流水线 + 闸门</text>
+    <text x="660" y="256" class="t-s" text-anchor="middle">crewAI Process.sequential</text>
+    <line x1="330" y1="196" x2="356" y2="240" stroke="#b45309" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#ar24t)" />
+    <rect x="360" y="288" width="180" height="60" rx="8" fill="#fef9c3" stroke="#1e293b" stroke-width="1.5" />
+    <foreignObject x="370" y="294" width="160" height="30"><p xmlns="http://www.w3.org/1999/xhtml" style="font:700 10.5px sans-serif;color:#1e293b;margin:0;line-height:1.25">子任务运行时才知道</p></foreignObject>
+    <text x="450" y="340" class="t-s" text-anchor="middle" font-style="italic"></text>
+    <line x1="540" y1="318" x2="566" y2="318" stroke="#1e293b" stroke-width="1.5" marker-end="url(#ar24t)" />
+    <rect x="570" y="288" width="180" height="60" rx="8" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="660" y="314" class="lbl" text-anchor="middle">调度者 + 工人</text>
+    <text x="660" y="334" class="t-s" text-anchor="middle">crewAI hierarchical + 效力刻度</text>
+    <line x1="330" y1="196" x2="356" y2="318" stroke="#b45309" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#ar24t)" />
+    <rect x="360" y="366" width="180" height="60" rx="8" fill="#fef9c3" stroke="#1e293b" stroke-width="1.5" />
+    <foreignObject x="370" y="372" width="160" height="30"><p xmlns="http://www.w3.org/1999/xhtml" style="font:700 10.5px sans-serif;color:#1e293b;margin:0;line-height:1.25">要多轮打磨到达标</p></foreignObject>
+    <text x="450" y="418" class="t-s" text-anchor="middle" font-style="italic"></text>
+    <line x1="540" y1="396" x2="566" y2="396" stroke="#1e293b" stroke-width="1.5" marker-end="url(#ar24t)" />
+    <rect x="570" y="366" width="180" height="60" rx="8" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="660" y="392" class="lbl" text-anchor="middle">评审回路</text>
+    <text x="660" y="412" class="t-s" text-anchor="middle">带硬轮次上限</text>
+    <line x1="330" y1="196" x2="356" y2="396" stroke="#b45309" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#ar24t)" />
+    <rect x="360" y="444" width="180" height="60" rx="8" fill="#fef9c3" stroke="#1e293b" stroke-width="1.5" />
+    <foreignObject x="370" y="450" width="160" height="30"><p xmlns="http://www.w3.org/1999/xhtml" style="font:700 10.5px sans-serif;color:#1e293b;margin:0;line-height:1.25">有人要中途决策</p></foreignObject>
+    <text x="450" y="496" class="t-s" text-anchor="middle" font-style="italic"></text>
+    <line x1="540" y1="474" x2="566" y2="474" stroke="#1e293b" stroke-width="1.5" marker-end="url(#ar24t)" />
+    <rect x="570" y="444" width="180" height="60" rx="8" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />
+    <text x="660" y="470" class="lbl" text-anchor="middle">人工节点</text>
+    <text x="660" y="490" class="t-s" text-anchor="middle">审批回父 · 带超时兜底</text>
+    <line x1="330" y1="196" x2="356" y2="474" stroke="#b45309" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#ar24t)" />
+  </g>
+  <text x="440" y="544" class="t-s" text-anchor="middle">拆了就上硬防护栏：深度上限、递归禁令、并发上限、预算随边下发——全写进代码，不写进 prompt</text>
+</svg>

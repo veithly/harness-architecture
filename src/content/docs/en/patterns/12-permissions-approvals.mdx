@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Reference architecture
 
+:::tip[Key takeaways · 30-second read]
+- **The real question is when to interrupt**: asking for every operation drives people insane; never asking causes catastrophes.
+- **Four models, four shapes**: Codex types everything as Rust enums (`AskForApproval`, `GuardianAssessmentAction`, `ReviewDecision`); Claude Code tracks 8 rule origins (`PermissionRuleSource`); OpenClaw composes `ExecHost` × `ExecSecurity` × `ExecAsk` into 27 combinations; Hermes reduces every verdict to a `tirith` exit code.
+- **Approval identity determines approval scope**: OpenClaw's `SystemRunApprovalBinding` 5-tuple (argv + cwd + agent + session + env hash) means the same command approves differently per directory, agent, and session.
+- **Start with typed enums for policy, action, and answer**: that is the floor for a serious agent; the biggest trap is leaving `fail_open` behavior undecided when the checker itself dies.
+:::
+
 <Diagram
   src="/diagrams/12-permissions-approvals-base.svg"
   alt="Four permission models: typed decisions vs IDE-style rules vs three-dimensional matrix vs subprocess verdict"

@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Surface Map
 
+:::tip[Key takeaways · 30-second read]
+- **One checklist is not enough**: mature harnesses route execution state through separate surfaces instead of one overloaded global plan.
+- **Four routing styles**: Codex separates `update_plan`, Plan Mode `PlanDelta`, MCP progress notifications, and terminal-title progress; Claude Code adds `hook_progress`, `task_progress`, and OSC 9;4 on top of `TodoWrite` and Tasks V2; OpenClaw projects `tool_call` / `tool_call_update` runtime events; Hermes treats `tool_progress` as display policy with off / new / all / verbose modes.
+- **Audience determines the route**: the same progress fact needs different handling for UI streams, prompt context, and resume hints.
+- **Build an execution-state router first**: each update must record its source, audience, lifetime, context-injection rule, dedupe rule, and a no-progress detector.
+:::
+
 <Diagram
   src="/diagrams/22-execution-state-surfaces-base.svg"
   alt="Execution state surfaces: approval plan, execution todo, tool progress, task progress, terminal status, away summary"

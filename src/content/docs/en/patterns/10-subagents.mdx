@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Reference architecture
 
+:::tip[Key takeaways · 30-second read]
+- **A production minefield**: recursive self-spawns, privilege escalation, parallel approval popups, cross-platform duplicates, and memory poisoning all happen; the real question is what hard boundaries the framework must enforce.
+- **Four spawn models**: Codex types every spawn with a `SubAgentSource` enum and forces children to inherit 7 core services from the parent; Claude Code unifies async work under 7 `TaskType` variants with `isConcurrencySafe()`; OpenClaw ships a 6-file platform with 13-field `SpawnSubagentParams`; Hermes exposes one `delegate_task` with `MAX_DEPTH=2` and 5 hard-blocked tools.
+- **Inheritance beats configuration**: children inheriting the parent's `exec_policy` / `plugins` / `mcp_manager` determines whether "spawn a subagent to bypass execpolicy" is even possible.
+- **Kill the polling habit**: OpenClaw writes "do not poll, wait for the push event" into the spawn tool's return text—polling subagents is the token-burning failure mode to design against.
+:::
+
 <Diagram
   src="/diagrams/10-subagents-base.svg"
   alt="Four subagent models: typed inheritance vs polymorphic TaskType vs full platform vs minimal delegate"

@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 四家任务进度面
 
+:::tip[本章重点 · 30 秒速读]
+- **todo list 是运行时进度面**：不是 Plan Mode，不是长期记忆，也不是最后回复里的进度描述。
+- **托管方式分歧最大**：Codex 的 update_plan 明确是 checklist tool、在 Plan Mode 里直接禁用；OpenClaw 没有模型托管 todo，全靠事件流投影给操作者。
+- **状态机决定可恢复性**：pending / in_progress / completed 小状态机跟踪执行，Hermes 压缩后只把未完成项注回上下文。
+- **第一优先**：把 approval plan、execution todo、durable background task 三层分开，别混成一张表。
+:::
+
 <Diagram
   src="/diagrams/21-todo-list-base.svg"
   alt="四系统 todo list 与任务进度面对照：Codex update_plan、Claude Code TodoWrite 与 Tasks、OpenClaw progress events、Hermes todo tool"

@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 后台任务 4 档对照
 
+:::tip[本章重点 · 30 秒速读]
+- **四个核心问题**：什么时候触发、结果怎么送达、用谁的 session 跑、出错怎么收尾，必须分别回答。
+- **执行位置分歧最大**：Codex 本地干脆不做 cron，全推给云端 cloud-tasks；OpenClaw 在本地配齐 isolated-agent、exponential backoff、独立 failure destination。
+- **宽限期决定重启容忍度**：Hermes 用 ONESHOT_GRACE_SECONDS=120 补跑错过不超 2 分钟的单次任务，扛住进程重启抖动。
+- **最大的坑**：cron prompt 是最高安全敏感度输入，Hermes 用 _CRON_THREAT_PATTERNS 正则加 10 种不可见 Unicode 检查严格扫描。
+:::
+
 <Diagram
   src="/diagrams/18-cron-background-base.svg"
   alt="四系统后台任务模型：codex cloud-tasks、claude code CronCreateTool 加 scheduler、openclaw service 加 isolated-agent 加 delivery、hermes croniter 加 jobs.json"

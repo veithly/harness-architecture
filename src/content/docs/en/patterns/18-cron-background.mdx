@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Architecture diagram
 
+:::tip[Key takeaways · 30-second read]
+- **Four questions before any cron**: when the agent acts, how results reach the user, whose session hosts the work, what happens on failure.
+- **From no local cron to a full subsystem**: Codex hands everything to cloud-tasks (the client only polls); Claude Code wraps 5-field cron in tools plus a cross-process scheduler lock; OpenClaw adds isolated-agent execution, exponential backoff, and a separate failure-alert channel; Hermes uses croniter with a json file and ONESHOT_GRACE_SECONDS=120.
+- **Session ownership determines disruption**: scheduled work in an isolated session never intrudes on the user's live conversation.
+- **Treat every cron prompt as security-critical input**: Hermes scans with _CRON_THREAT_PATTERNS plus a 10-character invisible-Unicode check to stop smuggled malicious prompts.
+:::
+
 <Diagram
   src="/diagrams/18-cron-background-base.svg"
   alt="Four background-task models: codex cloud-tasks vs claude code CronCreateTool + scheduler vs openclaw service + isolated-agent + delivery vs hermes croniter + jobs.json"

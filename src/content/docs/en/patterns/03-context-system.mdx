@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · The base diagram
 
+:::tip[Key takeaways · 30-second read]
+- **A bigger lever than the model**: same model + same tools, plug them into different context systems and the runtime gap is bigger than swapping models.
+- **Four assembly routes**: Codex registers 24 typed `ContextualUserFragment`s with START/END markers; Claude Code splits a `string[]` at `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` for prompt caching; OpenClaw assembles `buildXxxSection()` functions under a 3-mode `PromptMode`; Hermes stacks 10 explicit layers in `prompt_builder.py`.
+- **The cache boundary sets the bill**: content before the static/dynamic split is cached; everything past it is paid for again on every turn.
+- **Scan before you inject**: external files (`AGENTS.md`, `.cursorrules`) can carry prompt injection; only Hermes's `_scan_context_content` checks 9 patterns plus invisible Unicode and replaces hits with `[BLOCKED]`.
+:::
+
 Any agent's context is roughly these seven slots:
 
 <Diagram

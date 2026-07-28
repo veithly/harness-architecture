@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 记忆 4 档对照
 
+:::tip[本章重点 · 30 秒速读]
+- **记忆是四个独立维度**：时间、作用域、写入、检索，取舍要分开做，不是一个单一概念。
+- **写入路径分歧最大**：Codex 靠后台两阶段 pipeline（stage1 + consolidate，SQLite lease 防并发撞车），Hermes 只给两个文件、四种操作加字符硬上限。
+- **注入时机决定缓存成本**：Hermes 用 frozen snapshot 只在启动时注入，会话中途写入只落盘不重塑 prompt，保住 prefix cache。
+- **最大的坑**：记忆只是过去某一刻为真的快照，模型用它给建议前必须先验证今天还成立（Claude Code 专门写了这条提醒）。
+:::
+
 <Diagram
   src="/diagrams/16-memory-base.svg"
   alt="四系统的记忆模型：codex stage1 加 global consolidate、claude code 4 type 加 2 prompt mode、openclaw qmd 加 temporal decay、hermes MEMORY、USER 双文件加 frozen snapshot"

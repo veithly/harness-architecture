@@ -22,6 +22,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · The base diagram
 
+:::tip[Key takeaways · 30-second read]
+- **The only external judge**: "the model says it's done" cannot be trusted in production; every production-grade agent needs a verifier layer independent of the model.
+- **Coverage split**: Codex chains four hard verifiers (`apply_patch` check, tests exit code, `execpolicy` Allow / Prompt / Forbidden, `goals.rs` convergence); Claude Code has no hard-verifier hook but a 60-line `TOKEN_BUDGET` algorithm; OpenClaw mounts verifiers as middleware plus 4 detectors in `tool-loop-detection.ts`; Hermes defers to post-loop `insights` self-evaluation written to memory.
+- **Missing a tier is a failure mode**: hard checks external artefacts, soft checks budgets and convergence, lazy trusts the model's stop signal—production agents need all three.
+- **Missing the hard tier is worst**: the model declares victory before it has any; missing soft burns quota in an OOM state; missing lazy traps simple turns in the loop.
+:::
+
 <Diagram
   src="/diagrams/05-verifier-base.svg"
   alt="Three-tier verifier decision flow: external artifacts → internal budget → model self-report"

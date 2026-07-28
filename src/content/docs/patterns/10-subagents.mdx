@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Subagent 4 档抽象对照
 
+:::tip[本章重点 · 30 秒速读]
+- **核心认知**：子 agent 看似简单实则危险：无限递归烧 token、工具提权、审批混乱、消息重复、状态污染，框架必须画硬性边界。
+- **分歧最大点**：Codex 用 SubAgentSource 枚举类型化 5 种用途、Claude Code 用 TaskType 7 种统一所有异步执行、OpenClaw 的 SpawnSubagentParams 有 13 个配置字段、Hermes 只有 delegate_task 一个函数加 MAX_DEPTH=2 硬编码。
+- **工程判断**：继承策略决定安全下限：子 agent 强制继承父 session 的 exec_policy 等 7 类 service，永远不能比父更宽松。
+- **动手要点**：第一优先是防递归：depth 限制加硬禁子 agent 拿 spawn 类工具（Hermes 硬禁 delegate_task、clarify、memory、send_message、execute_code 5 个）。
+:::
+
 <Diagram
   src="/diagrams/10-subagents-base.svg"
   alt="四系统的 subagent 模型：类型化继承、TaskType 多态、全功能平台、最简 delegate"

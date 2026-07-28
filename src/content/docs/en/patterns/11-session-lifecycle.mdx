@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Reference architecture
 
+:::tip[Key takeaways · 30-second read]
+- **Memory substrate, UX ceiling**: how you start, persist, resume, and reset sessions directly determines whether users work continuously for days or re-explain for ten minutes every return.
+- **Four session routes**: Codex appends JSONL rollouts with a `SessionMeta` first line plus a SQLite index, splitting `ThreadId` from `SessionId`; Claude Code spreads state across 22 files with 4 lifecycle events (startup / resume / clear / compact); OpenClaw keeps session as an identity in under 100 core lines; Hermes routes per-platform sessions via `SessionSource` with 4 reset modes.
+- **Resume needs hidden premises**: replaying messages is not enough—cwd, approval mode, and git state never appear in the transcript and must be captured up front, as Codex's `SessionMeta` does.
+- **Keep startup empty**: Claude Code's comment says "do not add ANY warmup logic"—extra work on the startup path is the trap earned through painful experience.
+:::
+
 <Diagram
   src="/diagrams/11-session-lifecycle-base.svg"
   alt="Four session models: JSONL rollout vs 4 hook events vs minimal id vs multi-platform routing"

@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Reference architecture
 
+:::tip[Key takeaways · 30-second read]
+- **A sandbox is a stack, not a switch**: filesystem, network, privilege escalation, syscalls, child-process inheritance — if any layer fails, the whole isolation falls.
+- **Four positions on the in-house-vs-outsource spectrum**: Codex writes every layer itself (bubblewrap + seccomp + landlock, seatbelt on macOS); Claude Code makes it a JSON schema with honest escape hatches like `enableWeakerNetworkIsolation`; OpenClaw abstracts to 3 `ExecHost` tiers; Hermes delegates to 6 backends via one `TERMINAL_ENV` variable.
+- **Where you apply the policy determines what inherits it**: Codex binds `PR_SET_NO_NEW_PRIVS` to the calling thread only, so children get a precise boundary without contaminating the CLI process.
+- **Pick the spectrum position before writing code**: desktop security demands Codex's in-house three-layer floor; SaaS should outsource isolation to containers or remote infrastructure.
+:::
+
 <Diagram
   src="/diagrams/13-sandbox-execution-base.svg"
   alt="Four sandbox strategies: in-house three-layer vs cross-platform schema vs 3-backend ExecHost vs 6-backend TERMINAL_ENV"

@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 自我改进 4 档对照
 
+:::tip[本章重点 · 30 秒速读]
+- **难题不是能不能学**：而是什么时候学、用谁的算力学、学到的写到哪、怎么保证学习过程安全，四个子问题互相拉扯。
+- **触发权分歧最大**：Codex 让后台 LLM 任务定期自动整合（stage1 + global consolidate），Claude Code 用 disableModelInvocation 规定模型无权自写 skill、必须用户主动确认。
+- **prompt 决定产物质量**：Codex 用一份数百行的 prompt 严格规定什么算高价值经验、什么坚决不能写进来。
+- **最大的坑**：prompt 注入混进记忆等于植入长期后门，Hermes 写入前过 _MEMORY_THREAT_PATTERNS 11 条正则加 10 种不可见 Unicode 检查。
+:::
+
 <Diagram
   src="/diagrams/19-self-improvement-base.svg"
   alt="四系统自我改进模型：codex Phase1 加 Phase2 后台 LLM、claude code skillify 加 autoMode 加 insights 用户驱动、openclaw 被动索引、hermes 工具内显式写"

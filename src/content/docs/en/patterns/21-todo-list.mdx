@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · Four Progress Surfaces
 
+:::tip[Key takeaways · 30-second read]
+- **A todo list is not Plan Mode, memory, or prose**: it is the runtime progress surface — visible tasks, a tiny status machine, updated as facts change.
+- **Four shapes**: Codex's `update_plan` is a pure checklist tool disallowed in Plan Mode; Claude Code layers `TodoWrite` with file-backed Tasks V2 (owner, blockers, claim logic); Hermes keeps an in-memory `todo` tool per session; OpenClaw has no model-owned todo and projects progress from runtime events.
+- **Structured state determines survivability**: only structured todos can be preserved across compaction, resume, and UI surfaces — Hermes re-injects only pending / in_progress items after compaction.
+- **Keep three things separate**: approval plan, execution todo, and durable background task; fusing them is the trap.
+:::
+
 <Diagram
   src="/diagrams/21-todo-list-base.svg"
   alt="Four todo and progress surfaces: Codex update_plan, Claude Code TodoWrite and Tasks, OpenClaw progress events, Hermes todo tool"

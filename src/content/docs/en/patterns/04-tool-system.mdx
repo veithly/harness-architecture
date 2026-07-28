@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · The base diagram
 
+:::tip[Key takeaways · 30-second read]
+- **The only channel out**: tools are the agent's sole path to files, commands, and HTTP; the design reduces to schema, dispatch order, permission interception, MCP integration, and protocol adaptation.
+- **Permission split**: Codex crosses `execpolicy` (allow | ask | deny) with `approval_mode` and `sandbox_mode` into a 3D matrix; Claude Code filters at runtime via the `canUseTool` hook plus 4 permission modes; OpenClaw runs the `tool-policy-pipeline` middleware chain (`before_tool_call` / `after_tool_call` / `tool_result_persist`); Hermes hard-denies dangerous paths with `skills_guard`.
+- **Definitions decide swap cost**: decoupling tool definitions from model protocols (Hermes's single registry + three adapters) means swapping models only edits adapters, never tools.
+- **Do not trust `stop_reason`**: Claude Code treats `stop_reason='tool_use'` as unreliable and scans `tool_use` blocks itself; count tool calls yourself before dispatch.
+:::
+
 Every agent's tool stack is four layers:
 
 <Diagram

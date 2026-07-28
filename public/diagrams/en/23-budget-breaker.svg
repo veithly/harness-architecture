@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 520" role="img" aria-label="Where budgets and the breaker sit inside one iteration">
+  <defs>
+    <filter id="wb23b"><feTurbulence type="fractalNoise" baseFrequency="0.02" numOctaves="2" seed="237" /><feDisplacementMap in="SourceGraphic" scale="1.5" /></filter>
+    <marker id="ar23b" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1e293b" /></marker>
+    <style>
+      .h   { font: 600 14px sans-serif; fill: #1e293b; }
+      .lbl { font: 700 11.5px sans-serif; fill: #1e293b; }
+      .t-s { font: 10.5px sans-serif; fill: #64748b; }
+      .tag { font: 700 10.5px sans-serif; fill: #b91c1c; }
+      .ok  { font: 700 10.5px sans-serif; fill: #15803d; }
+    </style>
+  </defs>
+  <text x="440" y="26" class="h" text-anchor="middle">Budgets & breaker: check order in one iteration</text>
+  <text x="440" y="44" class="t-s" text-anchor="middle">Budgets are checked BEFORE the model call (mini-swe-agent); the breaker counts CONSECUTIVE failures, any success resets</text>
+  <g filter="url(#wb23b)">
+    <rect x="40" y="90" width="130" height="44" rx="8" fill="#e0e7ff" stroke="#1e293b" stroke-width="1.6" />
+    <text x="105" y="117" class="lbl" text-anchor="middle">iteration start</text>
+    <line x1="170" y1="112" x2="196" y2="112" stroke="#1e293b" stroke-width="1.6" marker-end="url(#ar23b)" />
+
+    <rect x="200" y="82" width="100" height="110" rx="10" fill="#fef9c3" stroke="#1e293b" stroke-width="1.8" />
+    <text x="250" y="106" class="lbl" text-anchor="middle">budget check (pre-call)</text>
+    <text x="250" y="140" class="t-s" text-anchor="middle">steps max_turns</text><text x="250" y="156" class="t-s" text-anchor="middle">cost max_cost_usd (dollars)</text><text x="250" y="172" class="t-s" text-anchor="middle">wall max_wall_seconds</text>
+
+    <text x="330" y="100" class="ok">within budget</text>
+    <line x1="300" y1="112" x2="392" y2="112" stroke="#15803d" stroke-width="1.8" marker-end="url(#ar23b)" />
+    <rect x="396" y="90" width="110" height="44" rx="8" fill="#dbeafe" stroke="#1e293b" stroke-width="1.6" />
+    <text x="451" y="117" class="lbl" text-anchor="middle">call model</text>
+    <line x1="506" y1="112" x2="546" y2="112" stroke="#1e293b" stroke-width="1.6" marker-end="url(#ar23b)" />
+    <rect x="550" y="90" width="110" height="44" rx="8" fill="#dbeafe" stroke="#1e293b" stroke-width="1.6" />
+    <text x="605" y="117" class="lbl" text-anchor="middle">run tools</text>
+    <line x1="660" y1="112" x2="706" y2="112" stroke="#1e293b" stroke-width="1.6" marker-end="url(#ar23b)" />
+    <rect x="710" y="90" width="130" height="44" rx="8" fill="#fde68a" stroke="#1e293b" stroke-width="1.6" />
+    <text x="775" y="117" class="lbl" text-anchor="middle">all failed?</text>
+
+    <line x1="775" y1="134" x2="775" y2="196" stroke="#b91c1c" stroke-width="1.6" marker-end="url(#ar23b)" />
+    <rect x="700" y="200" width="150" height="40" rx="8" fill="#fee2e2" stroke="#1e293b" stroke-width="1.6" />
+    <text x="775" y="225" class="lbl" text-anchor="middle">error_streak += 1</text>
+    <text x="640" y="270" class="tag">3 in a row</text>
+    <line x1="775" y1="240" x2="775" y2="292" stroke="#b91c1c" stroke-width="1.6" marker-end="url(#ar23b)" />
+    <rect x="670" y="296" width="180" height="44" rx="8" fill="#fecaca" stroke="#b91c1c" stroke-width="2" />
+    <text x="760" y="323" class="lbl" text-anchor="middle">exit: repeated_errors</text>
+
+    <line x1="605" y1="134" x2="605" y2="200" stroke="#15803d" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#ar23b)" />
+    <rect x="540" y="204" width="120" height="36" rx="8" fill="#dcfce7" stroke="#1e293b" stroke-width="1.4" />
+    <text x="600" y="227" class="lbl" text-anchor="middle">reset streak</text>
+
+    <text x="230" y="230" class="tag">exhausted</text>
+    <line x1="250" y1="192" x2="250" y2="292" stroke="#b91c1c" stroke-width="1.8" marker-end="url(#ar23b)" />
+    <rect x="90" y="296" width="330" height="44" rx="8" fill="#ffedd5" stroke="#1e293b" stroke-width="1.8" />
+    <text x="255" y="323" class="lbl" text-anchor="middle">grace turn: summarize only, no new tools</text>
+    <line x1="255" y1="340" x2="255" y2="392" stroke="#b91c1c" stroke-width="1.6" marker-end="url(#ar23b)" />
+    <rect x="150" y="396" width="210" height="44" rx="8" fill="#fecaca" stroke="#b91c1c" stroke-width="2" />
+    <text x="255" y="423" class="lbl" text-anchor="middle">exit: budget_exceeded</text>
+  </g>
+  <text x="440" y="490" class="t-s" text-anchor="middle">Both exits land in the trajectory with a transition_reason — one glance tells you how the run ended</text>
+</svg>

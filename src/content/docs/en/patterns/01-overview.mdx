@@ -20,6 +20,13 @@ import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
 ## §2 · The base diagram
 
+:::tip[Key takeaways · 30-second read]
+- **Four species, not four clones**: Codex / Claude Code / OpenClaw / Hermes are optimised for different users, not four implementations of the same thing.
+- **Verifier split**: Codex chains four hard verifiers (apply_patch, tests exit code, execpolicy, goals.rs); Claude Code tags every continue with 7 `transition.reason` labels plus a TOKEN_BUDGET soft verifier; OpenClaw mounts verifiers as middleware via hooks like `before_tool_call`; Hermes self-grades with `insights.py` and injects lessons via `prefetch_all()`.
+- **Self-evaluation is not verification**: whether "done" is machine-checkable, not the model's claim, determines how much you can trust the agent.
+- **Pick by workload**: Codex for a hard-constraint coding agent, Claude Code for an Anthropic-stack production reference, OpenClaw for a multi-channel agent server, Hermes for a long-runner that remembers and learns.
+:::
+
 <Diagram
   src="/diagrams/01-overview-base.svg"
   alt="Four systems on the short-term control ↔ long-term autonomy axis"

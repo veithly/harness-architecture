@@ -6,6 +6,8 @@ sidebar:
   label: 23 · Loop Engineering
 ---
 
+import Diagram from '@components/Diagram.astro';
+
 ## What loop engineering covers
 
 An agent's main loop, written out, looks like this:
@@ -59,6 +61,10 @@ None of the 191 lines is wasted. The five components below generalize them, plus
 
 ## The five components
 
+A bare loop dies four ways in production: it won't stop, it repeats one error forever, its context blows up, a crash loses everything. Five components answer them:
+
+<Diagram src="/diagrams/23-loop-anatomy.svg" alt="How the four bare-loop deaths map to the five components" caption="Each death has a component that saves it: stop signals for won't-stop, error taxonomy for repeat-forever, budgets for blowup, persistence for crashes, and the verifier takes the ruling on done away from the model." />
+
 ### 1. Stop conditions: multiple signals, trust none alone
 
 The model's own completion signal is unreliable. Cross-check several:
@@ -75,6 +81,8 @@ mini-swe-agent gives the complete definition: **steps** (stops spinning), **cost
 Budget exhaustion shouldn't be a silent cutoff. smolagents' `_handle_max_steps_reached` makes one extra call — `provide_final_answer(task)` — forcing the model to produce a final reply from its existing memory, recorded with an `AgentMaxStepsError` marker. Hermes calls this a grace call. The user gets "here's what I did and what's missing," not empty hands.
 
 One more smolagents mechanism worth its own note: `planning_interval`. Every N steps, an independent planning step is inserted — no actions, just the model re-examining the task and progress. On long tasks models sink into detail and forget the goal; periodic re-planning is the anti-drift alarm clock.
+
+<Diagram src="/diagrams/23-budget-breaker.svg" alt="Where budgets and the breaker sit inside one iteration" caption="Budgets are checked before the model call; the breaker counts consecutive failures. Both exits land in the trajectory with a transition_reason." />
 
 ### 3. Error taxonomy: not every error deserves a retry
 
@@ -157,6 +165,94 @@ Trade-off notes:
 **Retrying every error alike.** Classify first: implementation errors raise, model errors feed back, consecutive same-class errors trip the breaker. Unclassified retry systems retry their most expensive bug until the budget dies.
 
 **Verifying only at the end.** Verification sits inside the loop, firing every time the model claims completion. Finding out at the finish line that step 3 was wrong wastes every step in between.
+
+## Interview questions: 6 high-frequency ones
+
+<details>
+<summary>**Q1 · Basics**: The agent loop is ten lines — why do production loops run to thousands? What's the extra code?</summary>
+
+The extra code is the safety ring around the loop, countable as five components: stop conditions (multi-signal + completion checks), budgets (steps/dollars/wall-clock + grace call), error handling (taxonomy, compaction, breaker), trajectory persistence (every step on disk, replayable), and a verifier (external facts rule on completion). A demo needs the loop body; production needs all five.
+
+Reference point: mini-swe-agent fits all five in 191 lines — "production-grade" means "components complete," not "large." Conversely, thousands of lines missing budgets or persistence is still a demo.
+
+**Source**: `research/mini-swe-agent/src/minisweagent/agents/default.py` (commit `a83fcae`).
+**Follow-up**: "Which component first?" Persistence and stop conditions. Without them you can't even answer "why did the loop die."
+</details>
+
+<details>
+<summary>**Q2 · Budget design**: Which two incidents does a bare max_turns fail to prevent? How many dimensions does a complete budget have?</summary>
+
+Two: slow-tool hangs (every step legal, one step stuck 10 minutes — the step count never runs out) and expensive-call burns (steps fine, one call swallows a 10MB file).
+
+Three dimensions: steps (stops spinning), cost in dollars (stops the wallet), wall-clock (stops hangs). mini-swe-agent's `AgentConfig` is exactly these three plus a consecutive-error cap, all checked **before** the model call — check first, then spend.
+
+Plus one more piece on exhaustion: the grace call. Force one final summarizing call so the user gets "here's what I did and what's missing" instead of silence.
+
+**Source**: mini-swe-agent `query()`; smolagents `_handle_max_steps_reached`.
+**Follow-up**: "Does the grace call itself blow the budget?" It costs one extra call by design. Implementations disable tool dispatch on the grace turn — talk only, no work — capping the overhead at one text call.
+</details>
+
+<details>
+<summary>**Q3 · Error handling**: Tools keep failing — when to retry, when to stop? Give an implementable criterion.</summary>
+
+Classify first. Implementation errors (framework bugs, protocol errors) gain nothing from retries — raise immediately. Model errors (bad args, bad format) get compacted and fed back for the model to fix. In smolagents' `_run_stream` these are two except branches going opposite directions.
+
+The implementable criterion is a consecutive counter: N same-class failures in a row (3 is common) stops the run; any clean step resets to zero. The counter measures "stuck in one hole," not "total errors" — 20 errors across a 200-step task can be normal; 3 identical ones in a row means the model can't get out.
+
+What goes back must be compacted to three things: what failed (one line), what was tried, what options remain. Paste the raw stack and the model retries verbatim.
+
+**Source**: mini-swe-agent `max_consecutive_format_errors`; smolagents error branches; 12-Factor Factor 9.
+**Follow-up**: "Reflexion vs plain error compaction?" Reflexion has the model write a verbal reflection per failure into a separate buffer injected on retries — retries carry lessons, not just facts. HumanEval went 80% → 91%.
+</details>
+
+<details>
+<summary>**Q4 · Recoverability**: Why can't "resend the chat history" serve as recovery? What's the key to doing it right?</summary>
+
+Chat history lacks the side-effect record. Was the file changed? Did the command run? Was the patch submitted? None of that is in the message list, so replaying executes side effects twice (double-submitting the same patch is the classic incident).
+
+The right mechanism is an event log plus deterministic replay: every step appended as an event (tool calls and results included), recovery reads the log, rebuilds state, and skips already-executed steps. The principle is 12-Factor's Factor 12: the agent is a stateless reducer; the state is the event sequence.
+
+Two details worth copying: mini-swe-agent saves in a `finally` (the failed step also has a complete scene on disk), and exit is a message carrying `exit_status` rather than an escaping exception (the exit reason lands in the trajectory automatically).
+
+**Source**: mini-swe-agent `run()`'s `finally: self.save(...)`; Codex rollout JSONL.
+**Follow-up**: "Version the trajectory file?" Yes — mini-swe-agent writes `trajectory_format: "mini-swe-agent-1.1"`, so old trajectories still parse after a format change.
+</details>
+
+<details>
+<summary>**Q5 · Verifier**: Why does "verifier hardness set the autonomy budget"? One example in each direction.</summary>
+
+The verifier decides who rules on "done." Hard verifiers are machine rulings — test exit codes, patch syntax checks, command allowlists — the model has no appeal and lies get caught instantly, so the loop can safely run dozens of autonomous steps. Codex chains four hard verifiers in coding scenarios on exactly this logic.
+
+With only soft verification (another model as reviewer, or a human), "faked completion" can slip through. Those scenarios should shorten the loop, lower max_turns, and bring humans in early — giving a research-report agent a 90-step budget is gambling.
+
+The reverse inference also works: to grant more autonomy, first ask whether you can build a harder verification signal (a fact-check script for writing tasks, schema validation for data tasks) rather than just raising the budget.
+
+**Source**: Codex `apply_patch.rs` and exec-policy modules; smolagents `final_answer_checks`.
+**Follow-up**: "When should the verifier run?" On every completion claim, not once at the end. Finding out at the finish line that step 3 was wrong wastes everything in between.
+</details>
+
+<details>
+<summary>**Q6 · Open-ended**: Half a day to upgrade a bare while-loop agent — in what order do you add components, and why?</summary>
+
+Order: persistence → stop conditions → budgets → error taxonomy → verifier.
+
+Persistence first (1h): every step saved in a finally as JSONL; exit becomes a message with exit_status. This is the precondition for debugging everything else — without a trajectory, every later component is blind repair.
+
+Stop conditions next (1h): register an explicit final_answer action, add a hard max_turns. Now the loop at least can't run away.
+
+Then budgets (30min): add cost and wall-clock dimensions plus the grace call. Then error taxonomy (1h): two except branches plus the consecutive counter.
+
+The verifier goes last not because it matters least but because it's the most domain-dependent (are there tests to run? a schema to validate?). The first four are pure engineering — copy mini-swe-agent block by block; the verifier requires thought.
+
+**Source**: the whole order maps onto mini-swe-agent's 191 lines.
+**Follow-up**: "When does context compression get added?" When long tasks appear. mini-swe-agent contains zero compression — adding it for short tasks is premature optimization plus a new class of information-loss bugs.
+</details>
+
+## Exercises
+
+1. **Read source**: open `research/mini-swe-agent/src/minisweagent/agents/default.py` and mark the lines for each of the five components. Which component uses the fewest lines? (Hint: one is a single `finally`.)
+2. **Modify code**: add a fourth budget dimension to this chapter's skeleton — a per-step token cap (truncate and flag any tool result over N tokens). Decide: does the truncation notice go into the trajectory?
+3. **Design**: your agent is a long-running "compile the team's weekly report" task with no tests to run. Design its stop conditions and verifier: at least two stop signals, one soft-verification scheme, and whether max_turns should be large or small.
 
 ## Research notes
 

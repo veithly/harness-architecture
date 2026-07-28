@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 安全战线 4 档对照
 
+:::tip[本章重点 · 30 秒速读]
+- **安全是四条独立战线**：prompt injection、tool poisoning、credential leak、supply chain，任何一条松了整套系统都会被攻破。
+- **主防线位置分歧最大**：Codex 先在操作系统层沙箱压权、再用 TrustLevel 扩权，Hermes 把最终判决交给主程序之外的独立扫描器子进程 tirith。
+- **外部内容隔离决定注入下限**：OpenClaw 用随机 8 字节 ID 加 XML 边界包裹不可信文本，让模型一眼看出「这是数据不是指令」。
+- **第一优先**：把供应链来源钉死，Hermes 用 SHA-256 + cosign + OIDC provenance 验证扫描器二进制本身。
+:::
+
 <Diagram
   src="/diagrams/20-security-base.svg"
   alt="四系统安全模型：codex sandbox 加 TrustLevel、claude code /security-review 加 autoMode、openclaw 29 file security/、hermes tirith subprocess 加 30 vendor redact"

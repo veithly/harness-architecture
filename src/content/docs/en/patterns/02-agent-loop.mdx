@@ -21,6 +21,13 @@ import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
 ## §2 · The base diagram
 
+:::tip[Key takeaways · 30-second read]
+- **The loop is not the hard part**: an agent's engineering quality is determined by the four safety nets around it—stop condition, crash recovery, answer verification, context compression.
+- **Four loop shapes**: Codex runs a 4-layer event machine (submit / event / turn / goal) with replayable rollout files; Claude Code tags every `continue` with one of 7 `transition.reason` labels; OpenClaw returns `runId` and treats the loop as an observable background job; Hermes keeps one `while` line plus IterationBudget (parent 90 / subagent 50 + grace call).
+- **The stop condition sets the token bill**: run forever and burn tokens, stop too early and leave the task unfinished.
+- **Give compression a fuse**: stack pipelines cheap-before-expensive (`applyToolResultBudget → snipCompact → contextCollapse → autocompact`) and trip a 3-strike circuit breaker—Claude Code cites ~250K wasted API calls/day without one.
+:::
+
 Every agent loop boils down to these four phases. Watch the 30-second animation:
 
 <AgentLoopSVG nodes={['Observe','Plan','Act','Verify']} caption="The shared minimal loop: observe → plan → act → verify" />

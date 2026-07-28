@@ -20,6 +20,13 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 ## §2 · 文件编辑 4 件套对照
 
+:::tip[本章重点 · 30 秒速读]
+- **文件编辑是唯一无法靠重试解决的副作用**：改坏了「坏」状态已经写在磁盘上，不能像 shell 失败那样直接重跑。
+- **两大流派分歧最大**：Codex 用 V4A 内嵌 patch DSL 一次原子提交几千行 diff，Claude Code 的 FileEditTool 三参数一次只改一处，Hermes 复用 V4A 但走 function call 参数撞回 token 上限。
+- **编辑格式决定一轮能改多大、出错怎么回滚、reviewer 能不能审**。
+- **自己动手第一优先**：先做写盘前校验——patch 解析失败全部 reject，mtime 变了抛 FILE_UNEXPECTEDLY_MODIFIED_ERROR 防 race。
+:::
+
 <Diagram
   src="/diagrams/06-file-edit-patch-base.svg"
   alt="文件编辑两条路线：V4A 内嵌 DSL 对比 str_replace 调用"
