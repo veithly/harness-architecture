@@ -1,9 +1,9 @@
 ---
-title: Loop Engineering · 循环工程
+title: 23 · Loop Engineering 循环工程
 description: 用 mini-swe-agent、smolagents、Codex 的真实源码讲透循环工程：预算、停止、错误分类、轨迹落盘、验证。
 sidebar:
-  order: 1
-  label: Loop Engineering
+  order: 23
+  label: 23 · Loop Engineering
 ---
 
 ## 循环工程在管什么
@@ -172,6 +172,6 @@ def run(task, step_limit=50, cost_limit=3.0):
 | [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) | Anthropic | augmented LLM、evaluator-optimizer |
 | [12-Factor Agents](https://github.com/humanlayer/12-factor-agents) | HumanLayer | Factor 6 / 8 / 9 / 12 |
 
-四个商业/开源 harness（Codex、Claude Code、OpenClaw、Hermes）的循环对照，见本站[第 02 章](/patterns/02-agent-loop/)——那是证据库，本章是方法。
+四个商业/开源 harness（Codex、Claude Code、OpenClaw、Hermes）的循环对照，见本站[第 02 章](/patterns/02-agent-loop/)——那里是逐行对照的实现细节，本章是方法。
 
 循环工程管一个 agent 内部。活儿大到一个循环装不下——拆给多个 agent、部分冻成代码、人要进来审批——就到了 [Graph Engineering](/concepts/graph-engineering/) 的地界。

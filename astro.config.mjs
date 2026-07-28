@@ -83,17 +83,8 @@ export default defineConfig({
       ],
       sidebar: [
         {
-          label: '核心方法',
-          translations: { en: 'Core Methods' },
-          items: [
-            { slug: 'concepts/loop-engineering' },
-            { slug: 'concepts/graph-engineering' },
-          ],
-        },
-        {
-          label: '证据库 1 · Agent 基础设计',
-          translations: { en: 'Evidence 1 · Agent Fundamentals' },
-          collapsed: true,
+          label: '第一组 · Agent 基础设计',
+          translations: { en: 'Group 1 · Agent Fundamentals' },
           items: [
             { slug: 'patterns/01-overview' },
             { slug: 'patterns/02-agent-loop' },
@@ -103,9 +94,8 @@ export default defineConfig({
           ],
         },
         {
-          label: '证据库 2 · Coding Agent 工程',
-          translations: { en: 'Evidence 2 · Coding Agent Engineering' },
-          collapsed: true,
+          label: '第二组 · Coding Agent 工程',
+          translations: { en: 'Group 2 · Coding Agent Engineering' },
           items: [
             { slug: 'patterns/06-file-edit-patch' },
             { slug: 'patterns/07-shell-execution' },
@@ -114,9 +104,8 @@ export default defineConfig({
           ],
         },
         {
-          label: '证据库 3 · 并发与运行时',
-          translations: { en: 'Evidence 3 · Concurrency & Runtime' },
-          collapsed: true,
+          label: '第三组 · 并发与运行时',
+          translations: { en: 'Group 3 · Concurrency & Runtime' },
           items: [
             { slug: 'patterns/10-subagents' },
             { slug: 'patterns/11-session-lifecycle' },
@@ -126,9 +115,8 @@ export default defineConfig({
           ],
         },
         {
-          label: '证据库 4 · 演化与安全',
-          translations: { en: 'Evidence 4 · Evolution & Safety' },
-          collapsed: true,
+          label: '第四组 · 演化与安全',
+          translations: { en: 'Group 4 · Evolution & Safety' },
           items: [
             { slug: 'patterns/15-observability-cost' },
             { slug: 'patterns/16-memory' },
@@ -138,6 +126,14 @@ export default defineConfig({
             { slug: 'patterns/20-security' },
             { slug: 'patterns/21-todo-list' },
             { slug: 'patterns/22-execution-state-surfaces' },
+          ],
+        },
+        {
+          label: '第五组 · 工程方法',
+          translations: { en: 'Group 5 · Engineering Methods' },
+          items: [
+            { slug: 'concepts/loop-engineering' },
+            { slug: 'concepts/graph-engineering' },
           ],
         },
         {
