@@ -8,11 +8,11 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import CompareTable from '@components/CompareTable.astro';
 
-<Verdict tldr="build-your-own-agent 是随项目一起用的工程索引：22 章、220 道面试题和 4 个系统对比被压成 5 阶段 Build 流程、4 路径 Diagnose 流程、10 条铁律静态 lint 和 9 个 anti-pattern 运行时诊断。每一步都给到源码依据和可执行脚本。" tone="insight" />
+<Verdict tldr="build-your-own-agent 是随项目一起用的工程索引。它把 22 章、220 道复盘题和 4 个系统对比重新组织为 5 阶段 Build 流程、4 路径 Diagnose 流程、10 条铁律静态 lint 和 9 个 anti-pattern 运行时诊断。每一步都保留源码依据和可执行脚本。" tone="insight" />
 
-## §1 · 这个 Skill 是什么
+## 它解决什么问题
 
-本书的姐妹工程产物。把 22 章工程结论压成一个 Claude Code 或 Cursor 可直接 `load skill` 的 `build-your-own-agent`，干两件事：
+这是本站的姐妹工程产物。它把 22 章的工程结论整理成 Claude Code 或 Cursor 可直接 `load skill` 的 `build-your-own-agent`，做两件事：
 
 1. Build：从零搭一个生产级 agent harness；
 2. Diagnose & Optimize：审计或优化既有 agent，按 10 条铁律找问题、按 9 个 anti-pattern 给修复方案。
@@ -51,7 +51,7 @@ build-your-own-agent/
     └── scaffold/                        # 生成项目源码单一来源
 ```
 
-## §2 · 安装方法
+## 安装到哪里
 
 skill 已随仓库一起开源。两种安装方式：
 
@@ -70,7 +70,7 @@ git clone https://github.com/veithly/build-your-own-agent.git ./skills/build-you
 # "When designing an agent, load skill at ./skills/build-your-own-agent/SKILL.md."
 ```
 
-## §3 · 一句话调用模式
+## 按任务调用
 
 skill 按需加载，不污染上下文。日常用法分 Build 和 Diagnose 两条主线：
 
@@ -108,7 +108,7 @@ skill 按需加载，不污染上下文。日常用法分 Build 和 Diagnose 两
       label: '执行状态面路由',
       values: [
         '"tool progress、todo、away summary 应该分别显示到哪里"',
-        'SKILL.md + picking-from-spectrum.md + docs-site §22',
+        'SKILL.md + picking-from-spectrum.md + Execution State Surfaces 章节',
         'execution state router：source / audience / lifetime / context policy',
         '设计多层进度面'
       ],
@@ -153,7 +153,7 @@ skill 按需加载，不污染上下文。日常用法分 Build 和 Diagnose 两
   caption="按 sub-task 加载，平均一次只看 SKILL.md + 1-2 个 reference。Build 和 Diagnose 两条主线，加载分明。"
 />
 
-### §3.1 · 一行命令：CI / 本地巡检
+### CI 与本地巡检
 
 ```bash
 # 标准初始化新 agent 项目
@@ -175,7 +175,7 @@ python ~/.claude/skills/build-your-own-agent/scripts/diagnose-agent.py /path/to/
 
 退出码 0 表示通过，1 表示有 finding。JSON 格式稳定，可直接喂 GitHub Actions / Jenkins / GitLab CI。`assets/ci-lint-diagnose.yml.template` 是一个开箱即用的 CI 流水线骨架。
 
-## §4 · 10 条铁律一览
+## 先守住这十条约束
 
 这 10 条是 skill 的核心。摘自全书 4 系统对比，4 家全部遵守才进表。
 
@@ -195,9 +195,9 @@ python ~/.claude/skills/build-your-own-agent/scripts/diagnose-agent.py /path/to/
   title="10 Iron Laws of Agent Harness"
 />
 
-每条都对应一章详尽案例。想知道 Codex、Claude Code、OpenClaw、Hermes 具体怎么落地这条规则，去对应章节的 §11 面试题段落。
+每条都对应一章详尽案例。想知道 Codex、Claude Code、OpenClaw、Hermes 具体怎么落地这条规则，去对应章节附录看复盘题和源码说明。
 
-## §5 · 与本书的对照
+## 它与站内章节如何互相补足
 
 skill 不替代本书。是读完本书后随手能用的工具箱。两者关系：
 
@@ -212,12 +212,12 @@ skill 不替代本书。是读完本书后随手能用的工具箱。两者关�
 
 读 skill 时某条铁律觉得没说透，跳回本书对应章。写 agent 时记不清「Codex 那条转换怎么写」，让 skill 替你找出处。
 
-## §6 · 路线图
+## 后续维护
 
 skill 跟本书同步更新。如果新增 reference 或修改规则，会在仓库 `CHANGELOG.md` 中记录。欢迎在 issues 里贡献：
 
 - 你做了一个 agent，哪些铁律实际遇到坑、怎么调；
-- 哪些 use case 没在第 5 节的对照表里；
+- 哪些 use case 没在上面的对照表里；
 - 某条 reference 文档跑你的真实项目时漏了什么。
 
 <SourceTrail

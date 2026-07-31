@@ -15,18 +15,21 @@ import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
-## §1 · TL;DR
+## 循环先要扛住哪些事故
 
 <Verdict tldr="Agent Loop 看上去就是 while 循环加几句 prompt，写下来才发现真正决定工程质量的是循环外那圈兜底：什么时候停、跑挂怎么恢复、谁判断答案对不对、上下文撑爆怎么压缩。四家答案截然不同。Codex 把 loop 拆成 submit / event / turn / goal 四层事件机器（外部动作进入 → loop 每步输出事件 → 一次「模型说话加工具执行」叫 turn → 跨多个 turn 的任务目标叫 goal），每步事件写进 rollout（事件流 JSONL，即 loop 的物理时间线，机器重启可读它重建状态），4 个硬 verifier 串联。Claude Code 用 7 种 transition.reason（每次 loop continue 都贴一个原因标签：要不要重试、要不要压缩、是不是 token 见顶等）把状态机做到最显式，4 道压缩管线加 60 行 TOKEN_BUDGET（按 token 收敛速率判退的软 verifier 算法）防 OOM。OpenClaw 是唯一把 loop 文档化的，`agent` RPC 异步返回 runId（一次 loop 运行的唯一 ID，外部用它订阅事件流），十几个 plugin hook 让 verifier 完全中间件化。Hermes 主循环一行 while 塞满长跑必备：IterationBudget（迭代次数硬上限）加 grace call（耗尽前最后一次强制总结调用）加 prefetch_all（loop 启动前注入跨会话记忆）加 insights（loop 结束后跑一遍自评写回 memory）。要做 coding agent 参考 Codex，IDE 工具参考 Claude Code，多通道控制面参考 OpenClaw，长跑助理参考 Hermes。" />
 
-## §2 · 共有的最小循环加四家泳道图
+## 最小循环与四条执行泳道
 
-:::tip[本章重点 · 30 秒速读]
+<details>
+<summary>读前提示（按需展开）</summary>
+
 - **loop 的难点不在循环本身**：决定工程质量的是循环外那圈兜底——什么时候停、跑挂怎么恢复、谁判对错、上下文撑爆怎么压。
 - **分歧最大在可观察性**：Codex 每步写 rollout（JSONL 事件流）可重放，Claude Code 给每次 continue 贴 7 种 transition.reason，Hermes 用 IterationBudget 加 grace call 硬限步数。
 - **verifier 决定 loop 可信度**：Codex 4 个硬 verifier 串联，完全不信模型自评。
 - **自己动手第一优先**：先把每步事件写盘（rollout 式），否则 loop 跑挂状态全丢只能从零重跑。
-:::
+
+</details>
 
 先看 30 秒动画。任何 agent 跑起来都是这四个阶段在循环：
 
@@ -36,7 +39,7 @@ import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
 <Diagram src="/diagrams/02-agent-loop-lanes.svg" alt="四系统 Agent Loop 泳道对比图" caption="同一个循环，四种工程取舍：停止条件、verifier、可重入与并发模型各不相同。" />
 
-## §3 · 四家怎么实现 loop
+## 四套循环，四种失败处理
 
 <CompareTable
   rows={[
@@ -52,7 +55,7 @@ import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
 ### Codex · loop 拆成 submit / event / turn / goal 四层事件机器，每步写盘可重放
 
-Codex 对 agent loop 的核心判断：传统的 `while True` 循环在 agent 上行不通。一旦循环跑挂（机器重启、网络断、用户 Ctrl+C），状态全丢，从零重跑既浪费 token 又把已经做对的步骤撤销。`while True` 内部全部耦合，外部观察工具看不到循环为什么在跑（等模型？等工具？等用户？）。
+Codex 在 agent loop 上的出发点是：传统的 `while True` 循环在 agent 上行不通。一旦循环跑挂（机器重启、网络断、用户 Ctrl+C），状态全丢，从零重跑既浪费 token 又把已经做对的步骤撤销。`while True` 内部全部耦合，外部观察工具看不到循环为什么在跑（等模型？等工具？等用户？）。
 
 Codex 不写 `while True`，而是拆成事件机器：外部动作（用户输入、超时、中断信号）都包装成 `Op` 通过 `submit()` 进入；loop 内部每步事件（模型开始流式、工具调用、错误）通过 `next_event()` 输出给外部观察者。loop 变成可暂停可观察的状态机，而不是闷头跑的黑盒函数。
 
@@ -78,7 +81,7 @@ loop 内部按时间粒度从短到长分四层：
 
 ### Claude Code · 7 种 transition.reason 把状态机做到最显式
 
-Claude Code 对 agent loop 的核心判断：loop 跑挂的最大原因不是模型不会，而是外部观察者不知道 loop 在做什么。一份 rollout 写满 message，但看不出当时为什么决定再跑一轮：模型主动要继续？用户问题没回完？上下文压缩了需要重启？不知道原因就没法做分析、监控、告警、优化。
+Claude Code 在 agent loop 上的出发点是：loop 跑挂的最大原因不是模型不会，而是外部观察者不知道 loop 在做什么。一份 rollout 写满 message，但看不出当时为什么决定再跑一轮：模型主动要继续？用户问题没回完？上下文压缩了需要重启？不知道原因就没法做分析、监控、告警、优化。
 
 所以 Claude Code 把「为什么 loop 还要再跑一轮」的转移原因都显式建模成 `transition.reason` 标签，loop 状态机变成带原因注释的状态机。
 
@@ -117,7 +120,9 @@ async function* queryLoop(params, consumedCommandUuids) {
 3. `contextCollapse` 把已确认的历史片段折叠成 view 引用放进 collapse store。REPL 主数组只保留 view 句柄而不是完整内容。开始变贵但极大减少上下文体积。
 4. `autocompact` 越阈值就 fork 独立 agent 总结整段历史。最贵但最有效。
 
-前两步便宜（局部 LLM 或纯字符串处理），后两步贵（fork 完整 agent 全文总结）。任一档失败连续 3 次走断路器（`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3`），代码注释直接写线上数据：「1,279 sessions had 50+ consecutive failures (up to 3,272) in a single session, wasting ~250K API calls/day globally」。没有这个断路器，OOM 状态下每轮都会浪费一次失败的压缩 API 调用。
+前两步便宜（局部 LLM 或纯字符串处理），后两步贵（fork 完整 agent 全文总结）。任一档失败连续 3 次走断路器（`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3`），代码注释直接写线上数据：「1,279 sessions had 50+ consecutive failures (up to 3,272) in a single session, wasting ~250K API calls/day globally」。
+
+没有这个断路器，OOM 状态下每轮都会浪费一次失败的压缩 API 调用。
 
 **循环退出条件**：Claude Code 用 3 个信号判断是否退出：
 
@@ -145,7 +150,7 @@ async function* queryLoop(params, consumedCommandUuids) {
 
 ### OpenClaw · loop 做成可观察的后台 job，整个管线官方文档化
 
-OpenClaw 对 agent loop 的核心判断：作为同时支持 Telegram、Slack、Web、IDE 多通道入口的 agent 控制面，loop 不能是函数调用式（调用方等到结果才返回）。一个用户在 Telegram 发消息，agent 要跑 30 秒，期间用户可能想看进度、想中断、另一个用户也想开新对话。同步函数模式撑不起这些场景。
+OpenClaw 在 agent loop 上的出发点是：作为同时支持 Telegram、Slack、Web、IDE 多通道入口的 agent 控制面，loop 不能是函数调用式（调用方等到结果才返回）。一个用户在 Telegram 发消息，agent 要跑 30 秒，期间用户可能想看进度、想中断、另一个用户也想开新对话。同步函数模式撑不起这些场景。
 
 OpenClaw 把 loop 设计成可观察的后台 job：用户调用 `agent` RPC 立即返回 `{ runId, acceptedAt }`，job 在后台跑，外部任何时候都可通过 `runId` 订阅事件流看进度，最后调用 `agent.wait` 阻塞拿最终结果。loop 变成一等公民的后台资源，对接多通道、多用户场景天然适配。
 
@@ -163,7 +168,7 @@ OpenClaw 是四家里唯一显式把整个 loop 写成官方文档的（`docs/co
 
 ### Hermes · 主循环最简单但塞满长期 agent 该有的东西，verifier 摊到时间轴
 
-Hermes 对 agent loop 的核心判断：长期跑（一天、一周、一个月）的 agent 和短期跑（一次会话）的 agent 是完全不同的物种。短期 agent 追求「这一次任务必须做对」（需要强 verifier），长期 agent 追求「跨会话累积变好」（需要 memory 加自评加 skill 自学）。
+Hermes 在 agent loop 上的出发点是：长期跑（一天、一周、一个月）的 agent 和短期跑（一次会话）的 agent 是完全不同的物种。短期 agent 追求「这一次任务必须做对」（需要强 verifier），长期 agent 追求「跨会话累积变好」（需要 memory 加自评加 skill 自学）。
 
 基于这个判断，单次 loop 不用写得复杂，verifier 也不用硬卡。单次跑挂无妨，下次跑会因为 memory 变聪明。强行加硬 verifier 反而让 agent 太死板，处理不了长跑场景的多样性。
 
@@ -193,7 +198,14 @@ loop 结束后写回 memory，下次类似任务 prefetch 时注入这些经验�
 
 ---
 
-### 提示词怎么搭：四家对比
+## 五个容易把循环写坏的地方
+
+下面五组源码对照全部保留。第一次阅读只看标题和小结；需要实现时再展开具体代码。
+
+<details>
+<summary>提示词怎么搭</summary>
+
+### 四家提示词装配对比
 
 System prompt 是 agent 的第一性参数。模型一样、tool 一样，prompt 不一样的两个 agent，跑出来的行为差距比换模型还大。四个系统在「怎么把 system prompt 拼出来」这件事上的取舍完全不同。
 
@@ -471,7 +483,12 @@ range of tasks including answering questions, writing and editing code...
 
 ---
 
-### 上下文怎么压：四家对比
+</details>
+
+<details>
+<summary>上下文怎么压</summary>
+
+### 四家上下文压缩对比
 
 四家的 agent 都长跑，迟早撞 context window，所以四家都得压。具体到「什么时候压、压什么、谁来压」，四家走了完全不同的路。
 
@@ -622,7 +639,12 @@ OpenClaw 把「持久化摘要」和「内存剪枝」分成两件事：
 
 ---
 
-### 出错了怎么续：四家对比
+</details>
+
+<details>
+<summary>出错了怎么续</summary>
+
+### 四家错误恢复对比
 
 循环里的「出错」有三个来源：model 返回 error 或异常 stop、tool 调用失败、用户中断。四家拆解角度不一样。
 
@@ -695,7 +717,12 @@ OpenClaw 的 `before_tool_call`、`after_tool_call`、`tool_result_persist` hook
 
 ---
 
-### 工具怎么派：四家对比
+</details>
+
+<details>
+<summary>工具怎么派</summary>
+
+### 四家工具派发对比
 
 工具调用是 Agent Loop 的 Act 阶段。把模型说的 `call_tool(args)` 执行起来这一步，四家走了四条不同实现。
 
@@ -741,7 +768,12 @@ Hermes 在 registry 注册工具时只写一次定义，runtime 按当前模型�
 
 ---
 
-### 何时停止：四家对比
+</details>
+
+<details>
+<summary>何时停止</summary>
+
+### 四家停止条件对比
 
 停的决定决定 loop 的输出质量。停早了任务没完成，停晚了烧 token 或死循环。四家给出 verifier 的三种形态。
 
@@ -799,7 +831,9 @@ Hermes 的 verifier 是跨会话的累积学习，不是单 loop 关口。短期
 
 ---
 
-## §4 · 四家共有的 4 条 Loop 工程底线
+</details>
+
+## Loop 已经形成的共识
 
 四家在 Agent Loop 设计上有四个明显的共同认知，这是所有生产级 agent 都该遵循的工程底线：
 
@@ -811,7 +845,7 @@ Hermes 的 verifier 是跨会话的累积学习，不是单 loop 关口。短期
 
 **4 · 必须有明确的循环结束条件（max_steps、token_budget、goal_done）**：四家都设计了多重结束条件防止 loop 无限跑。Codex 用 turn 计数加 goal 收敛加 rollout flush，Claude Code 用 maxTurns 加 stop_hook 加 token_budget，OpenClaw 用 lifecycle:end/error 加 runtime timeout，Hermes 用 IterationBudget 耗尽加 grace call。任何 agent 没有结束条件最后一定会跑爆 quota。
 
-## §5 · 关键分歧 · 按场景选型
+## 选型取决于完成信号
 
 <Diagram
   src="/diagrams/02-tradeoff.svg"
@@ -829,7 +863,7 @@ Hermes 的 verifier 是跨会话的累积学习，不是单 loop 关口。短期
 
 **做长跑助理、跨会话学习场景**：参考 Hermes 的 IterationBudget 加 memory prefetch 加 insights 自评路线。短期不严格（单 loop 跑短一点没关系）但长期收敛（memory 累积让下次更聪明）。grace call 兜底让 budget 耗尽时优雅退出而非硬 kill，insights 把 verifier 摊到时间轴上让 agent 跨会话变好。缺口在 verifier：没有结构化硬校验，强依赖 skill 自评。另外 trajectory 大了之后 compaction 会改变 loop 表现（同一个 trajectory 不同时间观察可能压缩程度不同）。
 
-## §6 · 我的点评
+## 我的判断：先做可恢复，再做聪明
 
 <ScoreCard
   rows={[
@@ -841,7 +875,7 @@ Hermes 的 verifier 是跨会话的累积学习，不是单 loop 关口。短期
   caption="评分理由带证据加风险，不允许裸分"
 />
 
-## §7 · 自己实现 Agent Loop 的最佳实践
+## 从一个能恢复的最小循环开始
 
 下面是从四家 agent 系统提炼出来的「自己写 Agent Loop」工程配方。先把最小可行版本跑起来，再慢慢加生产级特性，最后规避四个常见死路。
 
@@ -866,11 +900,11 @@ Hermes 的 verifier 是跨会话的累积学习，不是单 loop 关口。短期
   ]}
 />
 
-## §8 · 动画图解
+## 把循环跑一遍
 
-<AgentLoopSVG duration={5} caption="把 §7 的『最小可行方案』动起来" />
+<AgentLoopSVG duration={5} caption="把上面的最小可行方案动起来" />
 
-## §9 · 延伸阅读 / 源码入口
+## 沿着主循环读源码
 
 <SourceTrail
   entries={[
@@ -892,13 +926,18 @@ Hermes 的 verifier 是跨会话的累积学习，不是单 loop 关口。短期
   ]}
 />
 
-## §10 · 小练习
+## 附录：练习与复盘
+
+<details id="interview-drill">
+<summary>按需展开练习和十道复盘题</summary>
+
+### 练习
 
 1. **🟢 入门**：写一个 30 行 Python 的 agent loop，stop condition = `max_steps`，tool = `run_shell`，verifier = `exit_code == 0`。
 2. **🟠 进阶**：把上一步的 loop 改成事件流：每一步发一个 JSON 事件到 stdout，可被外部进程消费。
 3. **🔴 挑战**：给 loop 加上 `resume(session_id)`，要求中断后再次启动可以从最后一步继续，不丢失 verifier 状态。
 
-## §11 · 面试题：10 道带答案的高频考点
+### 复盘题
 
 <details>
 <summary>**Q1 · 概念**：Agent Loop 的最小骨架是什么？为什么再砍一刀就不再是 agent？</summary>
@@ -948,7 +987,9 @@ Hermes 用 `IterationBudget(90, 50)`：90 步硬上限，50 步软上限触发 `
 <details>
 <summary>**Q4 · 上下文压缩**：Claude Code 的 4 道压缩链顺序是什么？为什么不能换？</summary>
 
-顺序（看 `query.ts:1100+` `runContextCompression()` 系列调用）：第一道 `transcript-rewriter`，把对话历史里口语化、冗余的部分改写。第二道 `tool-result-compactor`，按工具类型摘要工具返回（grep 折叠匹配行，bash 折叠 stdout）。第三道 `system-prompt-resnapshot`，重新生成 system prompt 部分把过时段拿掉。第四道 `fork-summarizer`，开一个 forked agent 对剩下 history 写一段 prose 摘要。
+顺序（看 `query.ts:1100+` `runContextCompression()` 系列调用）：第一道 `transcript-rewriter`，把对话历史里口语化、冗余的部分改写。第二道 `tool-result-compactor`，按工具类型摘要工具返回（grep 折叠匹配行，bash 折叠 stdout）。第三道 `system-prompt-resnapshot`，重新生成 system prompt 部分把过时段拿掉。
+
+第四道 `fork-summarizer`，开一个 forked agent 对剩下 history 写一段 prose 摘要。
 
 不能换顺序的原因：每一道「对什么压缩」上有依赖前序的产物。第二道压缩的是原始工具返回，必须在 transcript 改写前跑（改写过的工具返回会丢工具协议格式）。第三道依赖前两道压完后的总 token 数判断是否还需要 resnapshot。第四道是最后的兜底手段，前三道都救不了才会启动 forked agent 做整体改写，开销也最大。
 
@@ -993,7 +1034,9 @@ Claude Code 在 `dispatchToolUseBlocks()` 里把 tool_use 数组并发派发（�
 
 层 0-2 都是相对静态的（身份、任务模式、工具用法），同一 session 内基本不变，进 cache 命中率高。层 3 开始引入动态内容：长期记忆每次 session 都可能不同。层 4 的项目本地文件可能根据 cwd 变化。层 5 的环境每 turn 都变。层 6 输出风格虽静态但放在最末。
 
-Claude Code 的做法最明确：用 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 显式分界，上面所有 section 都跑 cache，下面所有 section 都不 cache。Codex 一份大 markdown 没有分界（整体 cache 或整体不 cache）。OpenClaw 用 PromptMode 三档（`full`、`minimal`、`none`）近似拟合，精度不如 Claude Code。Hermes 10 层显式装配，每层独立函数可单独打开或关闭 cache。
+Claude Code 的做法最明确：用 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 显式分界，上面所有 section 都跑 cache，下面所有 section 都不 cache。Codex 一份大 markdown 没有分界（整体 cache 或整体不 cache）。OpenClaw 用 PromptMode 三档（`full`、`minimal`、`none`）近似拟合，精度不如 Claude Code。
+
+Hermes 10 层显式装配，每层独立函数可单独打开或关闭 cache。
 
 边界放错的后果：放太靠前（比如层 1 之后），cache 段太小，命中率低。放太靠后（比如层 5 之后），cache 段大但里面有动态内容，每次 invalidate。
 
@@ -1044,4 +1087,4 @@ LLM-as-judge 没有确定 oracle，硬 verifier 路线（Codex）不适用。你
 **追问**：「不加沙箱直接跑本地 shell 风险有多大？」很大。先用 `--dry-run` 飞两天再考虑解掉沙箱。即使你信模型，模型也可能 `rm -rf $HOME` 因为它把变量解析错了。
 </details>
 
-
+</details>

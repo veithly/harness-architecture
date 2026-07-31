@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## 先回答这次运行发生了什么
 
 <Verdict tldr="给一个 agent 做观测，本质上要同时算清楚四笔账：用了多少 token、花了多少钱、每次响应延迟多少、出错率多高。这四笔账在不同部署形态下重要性不同，因此四家系统的取舍也完全不同。Codex 把观测当成生产基础设施来做：它把整个观测能力拆成三个完全独立的模块：一个负责跟业界标准的 OpenTelemetry（CNCF 主导的可观测性数据采集标准，统一指标、日志、trace 三类信号的协议格式）协议对接（这样可以接入任何企业级的监控后端，如 Datadog、Honeycomb、Splunk）、一个负责把用户用了什么 skill、跑了什么工具、修了哪几个文件、生成的代码最后被接受了多少这种业务级事件汇总上报、还有一个负责把整个会话的轨迹打包成可以离线重放的 trace bundle（trace 数据包，一个 zip 包含会话 ID、所有事件、配置和 rollout JSONL，离线可以喂回 Codex 重放出当时的状态）。Claude Code 选了更贴近 IDE 用户的路线：它把主流模型的价格硬编码到代码里（写死在源码里的 cost tier 常量，哪怕涨价就要发新版本也认了），把每个会话落盘成 JSONL 文件，让用户通过一个命令就能用最强的模型去分析自己的历史会话出一份可读的报告。OpenClaw 走事件总线思路：它定义了十几种语义清晰的观测事件（模型用量、webhook 收发、消息排队、会话卡住、工具陷入循环），用监听器模式（observer pattern，发布订阅型的事件分发模式）分发，至于这些事件最终落到哪里（监控平台、本地文件、自家 Elasticsearch 全文搜索与分析引擎）完全由调用方决定。Hermes 把成本精度当成头等大事：它定义了一个跨供应商统一的 CanonicalUsage 用量结构，把价格来源按可信度分成六个等级（CostSource provider_cost_api 最准的是供应商 API 直接返回的实际成本，次之是 provider_generation_api 供应商的生成 API、再次是 provider_models_api 供应商模型列表 API，official_docs_snapshot 最差也是官方文档快照，再加上 user_override 用户手动覆盖和 custom_contract 自定义合同价），让每一条成本数据都附带我有多确定这个数字的来源标记，所有历史落盘到本地 SQLite（嵌入式 SQL 数据库，单文件无服务进程），并提供一个本地报告工具直接出聚合统计。结论：要做企业级 agent 参考 Codex 的三模块拆分。要让开发者自助看报表参考 Claude Code。要做一个跨多种部署形态的事件管道参考 OpenClaw。要做隐私敏感的、需要精确账单的本地服务参考 Hermes。" />
 
-## §2 · 观测栈 4 档对照
+## 四种观测栈
 
-:::tip[本章重点 · 30 秒速读]
+<details>
+<summary>读前提示（按需展开）</summary>
+
 - **核心问题**：观测要同时算清四笔账：token 用量、钱、响应延迟、出错率，四笔账的重要性随部署形态变化。
 - **分歧最大点**：Codex 拆三个独立模块（OTEL 适配、analytics 业务事件、rollout trace bundle 离线重放）、Claude Code 把价格硬编码进源码、OpenClaw 用监听器模式发十几种事件由调用方决定落点、Hermes 用 CanonicalUsage 加 CostSource 六级可信度。
 - **工程判断**：部署形态决定观测栈：企业级学 Codex 三模块拆分，隐私敏感的本地服务学 Hermes 全落 SQLite 不上报。
 - **动手要点**：成本数字必须带来源标记：从 provider_cost_api 到 official_docs_snapshot 分级（CostSource），让每条数据都说清「我有多确定这个数字」。
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/15-observability-cost-base.svg"
@@ -47,13 +50,15 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## §3 · 四家怎么实现观测、成本与日志
+## 四套系统怎样记录行为与成本
 
 ### Codex · 把观测拆成三件互不打架的事
 
 Codex 在观测这件事上的态度很工程化：它认为观测要解决的是三个性质完全不同的问题，硬塞到一个模块里会让每件事都做得不好。所以它把整个观测能力拆成了三个相互独立的代码模块，每个只负责一件事，三件事之间没有耦合。
 
-第一件事是**接通业界标准的监控协议**。任何认真做生产的团队都已经有一套监控基础设施了：可能是 Datadog、Honeycomb、Splunk、阿里云的 ARMS，或者自建的 Prometheus 加 Grafana。这些后端都支持 OpenTelemetry 标准（简称 OTEL）。Codex 不去自己造监控系统，而是写一个适配层，把 agent 内部产生的指标、trace、日志按 OTEL 协议（支持 HTTP 和 gRPC 两种传输）发出去，让用户接入自家的监控就好。除此之外它还内置了一个针对 Statsig 这套系统的默认 exporter：之所以做这一项，是因为它内部团队在用 Statsig 收集自家产品的使用数据。
+第一件事是**接通业界标准的监控协议**。任何认真做生产的团队都已经有一套监控基础设施了：可能是 Datadog、Honeycomb、Splunk、阿里云的 ARMS，或者自建的 Prometheus 加 Grafana。这些后端都支持 OpenTelemetry 标准（简称 OTEL）。
+
+Codex 不去自己造监控系统，而是写一个适配层，把 agent 内部产生的指标、trace、日志按 OTEL 协议（支持 HTTP 和 gRPC 两种传输）发出去，让用户接入自家的监控就好。除此之外它还内置了一个针对 Statsig 这套系统的默认 exporter：之所以做这一项，是因为它内部团队在用 Statsig 收集自家产品的使用数据。
 
 <SourceBlock path="REF/codex/codex-rs/otel/src/config.rs" lines="50-108" system="codex" summary="观测后端被抽象成可插拔的 exporter：可以选择完全关闭、用内部默认、走 HTTP 上报或走 gRPC 上报；metrics、traces、log 三种数据可以各自配置不同的目的地。">
 
@@ -91,7 +96,9 @@ pub enum OtelExporter {
 
 </SourceBlock>
 
-这套抽象里有几个细节值得专门说一下。第一，**三类数据可以走不同的目的地**。metrics（数值指标，比如每秒请求数）、traces（一次请求的完整调用链）、log（结构化日志）在监控领域是三件本质不同的事，承载它们的后端也常常不一样：Datadog 可能擅长 trace、Grafana 可能更擅长 metrics、ELK 可能负责日志。Codex 允许这三类各自选不同的目的地，不是逼着所有数据都进一个后端。第二，**调试构建默认不上报到生产监控**。代码里有一行很关键的判断：如果当前是 debug 模式（也就是开发者本地编译跑测试时），默认把 exporter 关到 None。这是一种清醒的工程纪律：开发跑测试很容易制造各种异常的指标抖动，如果这些数据进了生产监控的看板，会让运维误以为线上出了问题。
+这套抽象里有几个细节值得专门说一下。第一，**三类数据可以走不同的目的地**。metrics（数值指标，比如每秒请求数）、traces（一次请求的完整调用链）、log（结构化日志）在监控领域是三件本质不同的事，承载它们的后端也常常不一样：Datadog 可能擅长 trace、Grafana 可能更擅长 metrics、ELK 可能负责日志。Codex 允许这三类各自选不同的目的地，不是逼着所有数据都进一个后端。第二，**调试构建默认不上报到生产监控**。
+
+代码里有一行很关键的判断：如果当前是 debug 模式（也就是开发者本地编译跑测试时），默认把 exporter 关到 None。这是一种清醒的工程纪律：开发跑测试很容易制造各种异常的指标抖动，如果这些数据进了生产监控的看板，会让运维误以为线上出了问题。
 
 第二件事是**把业务级事件汇总上报**。前面那一层 OTEL 走的是技术指标，但 agent 还有一类很特别的事件：用户用了什么 skill、跑了什么工具、修了哪几个文件、跟模型来回了多少轮、调了多少次 MCP 服务、用户最后接受了多少行模型生成的代码。这些都不是 CPU/内存这种通用指标，而是 agent 产品自己的业务指标。
 
@@ -128,9 +135,15 @@ pub(crate) enum TrackEventRequest {
 
 </SourceBlock>
 
-这种"每种事件都是独立类型"的做法跟你常见的"一个通用 event 结构 + 一堆 string-keyed 属性"完全不同。它的好处是显而易见的：上报端写代码时编译器就能检查你字段填没填全（少一个字段直接编译不过）、接收端在做聚合分析时不会被字段名拼写错误坑到、新增一种事件就是新增一个类型不会破坏现有的事件。这二十多种事件覆盖了 agent 内部几乎所有值得关注的业务面。一类是用户驱动的动作：skill 调用、guardian 审查、hook 执行、上下文压缩、单 turn 内容、命令执行、文件变更。另一类覆盖工具面，包括 MCP 和动态工具、web 搜索、图片生成、插件生命周期。甚至还有一种叫"已接受代码行指纹"的事件，它记录的是用户最终采纳了模型生成的哪几行代码（用行级 hash 而不是内容，避免泄露源码），目的是度量"模型生成的代码被采纳的比例"这种关键产品指标。
+这种"每种事件都是独立类型"的做法跟你常见的"一个通用 event 结构 + 一堆 string-keyed 属性"完全不同。它的好处是显而易见的：上报端写代码时编译器就能检查你字段填没填全（少一个字段直接编译不过）、接收端在做聚合分析时不会被字段名拼写错误坑到、新增一种事件就是新增一个类型不会破坏现有的事件。这二十多种事件覆盖了 agent 内部几乎所有值得关注的业务面。
 
-第三件事是**把整个会话过程打包成可以离线重放的轨迹**。这一件比前两件都重：它解决的是 agent 系统特有的一个调试难题：当一个 agent 跑出了一个奇怪结果，复现起来很难（涉及 LLM 的非确定性、外部 API 的状态、文件系统的状态），事后想知道「它到底是怎么一步步走到那个结果的」几乎是不可能的。Codex 的做法是把每次会话里产生的所有原始事件按顺序写到一个 JSONL 文件里，再加一个清单说明这次会话用的什么模型、什么环境、什么版本，最后打包成一个 trace bundle 可以离线传给任何一个调试工具。配套有一个叫做「reducer」的组件，专门用来把这堆原始事件「折算」成简洁的最终状态：就像 Redux 的 reducer 一样，输入是事件流，输出是某个状态快照。设计哲学有一句话写得很清楚：**会话的热路径只负责写原始事件，重的「reducer 和查看器」不能污染主代码库**。
+一类是用户驱动的动作：skill 调用、guardian 审查、hook 执行、上下文压缩、单 turn 内容、命令执行、文件变更。另一类覆盖工具面，包括 MCP 和动态工具、web 搜索、图片生成、插件生命周期。甚至还有一种叫"已接受代码行指纹"的事件，它记录的是用户最终采纳了模型生成的哪几行代码（用行级 hash 而不是内容，避免泄露源码），目的是度量"模型生成的代码被采纳的比例"这种关键产品指标。
+
+第三件事是**把整个会话过程打包成可以离线重放的轨迹**。这一件比前两件都重：它解决的是 agent 系统特有的一个调试难题：当一个 agent 跑出了一个奇怪结果，复现起来很难（涉及 LLM 的非确定性、外部 API 的状态、文件系统的状态），事后想知道「它到底是怎么一步步走到那个结果的」几乎是不可能的。
+
+Codex 的做法是把每次会话里产生的所有原始事件按顺序写到一个 JSONL 文件里，再加一个清单说明这次会话用的什么模型、什么环境、什么版本，最后打包成一个 trace bundle 可以离线传给任何一个调试工具。配套有一个叫做「reducer」的组件，专门用来把这堆原始事件「折算」成简洁的最终状态：就像 Redux 的 reducer 一样，输入是事件流，输出是某个状态快照。
+
+设计哲学有一句话写得很清楚：**会话的热路径只负责写原始事件，重的「reducer 和查看器」不能污染主代码库**。
 
 ### Claude Code · 把价格硬编码到代码里，让用户能在终端就看到自己花了多少钱
 
@@ -181,17 +194,27 @@ export const COST_TIER_30_150 = {
 
 这看上去很「不工程化」：价格变了不就要重新发版本吗？但仔细想，这正是 Claude Code 想要的取舍：它的用户是开发者，开发者运行的是他们自己机器上的 Claude Code 二进制。如果价格能被远程下发，意味着 Anthropic 服务器可以悄悄改一次价格让所有用户的本地成本统计跟着变，这反而会让用户失去信任。把价格写死在代码里、跟版本号绑定，意味着用户清楚地知道「我装的这一版认的就是这个价格表」，要涨价就升级版本，整件事是透明的。
 
-价格被组织成 6 个档位（叫 cost tier），每个档位对应同一价格区间的一组模型：比如 Sonnet 级别走 $3 加 $15 一档（输入每百万 token $3、输出每百万 token $15），Opus 4、4.1 走 $15 加 $75 一档，Haiku 走更便宜的一档。每个档位记录五种价格：输入价、输出价、提示缓存写入价、提示缓存读取价、web 搜索按次价。算成本就是把这五种用量分别乘以对应单价再加总，没有任何花哨之处，但要把这五种分开算才会准：缓存读取的价格往往只有输入价的十分之一左右，如果不分开混在一起就会算错一个数量级。
+价格被组织成 6 个档位（叫 cost tier），每个档位对应同一价格区间的一组模型：比如 Sonnet 级别走 $3 加 $15 一档（输入每百万 token $3、输出每百万 token $15），Opus 4、4.1 走 $15 加 $75 一档，Haiku 走更便宜的一档。每个档位记录五种价格：输入价、输出价、提示缓存写入价、提示缓存读取价、web 搜索按次价。
 
-第二件事是**未知模型不报错也不算成 0**。Claude Code 的代码里有一段工程化的处理：当用户用了一个本地价格表里没有的新模型，做法是**自动回落到默认模型的价格**做估算，同时上报一个「未知模型价格」事件让团队感知。这个事件会进入 Anthropic 内部的分析系统，让他们知道「哎，已经有一批用户在用某某新模型但我们的客户端还没更新价格表」，于是触发下一次的版本更新。这种「fail soft 加告警」的取舍背后有一个明确的产品判断：抛错会让 agent 直接崩，算 0 会让用户以为新模型免费：这两个都是糟糕的用户体验。回落到默认价加内部告警，既保证用户不崩，又不会丢失「需要更新价格表」这个信号。
+算成本就是把这五种用量分别乘以对应单价再加总，没有任何花哨之处，但要把这五种分开算才会准：缓存读取的价格往往只有输入价的十分之一左右，如果不分开混在一起就会算错一个数量级。
 
-第三件事是**让用户在终端里用 `/insights` 命令看到自己的会话报表**。它的实现方式很特别：先把所有会话的 JSONL 文件从 `~/.claude/projects/<dir>/sessions/` 读出来（这个目录每个项目有一个独立子目录，是一种干净的命名空间设计），然后跑两次 Opus 推理：第一次让 Opus 从原始会话里抽取出「这个 session 干了什么」这种结构化的事实清单，第二次让 Opus 基于这些事实写出一段自然语言总结。最后把这份报表打印到终端。
+第二件事是**未知模型不报错也不算成 0**。Claude Code 的代码里有一段工程化的处理：当用户用了一个本地价格表里没有的新模型，做法是**自动回落到默认模型的价格**做估算，同时上报一个「未知模型价格」事件让团队感知。这个事件会进入 Anthropic 内部的分析系统，让他们知道「哎，已经有一批用户在用某某新模型但我们的客户端还没更新价格表」，于是触发下一次的版本更新。
 
-为什么挑 Opus 而不是更便宜的 Haiku 跑这个？因为「分析自己历史会话」这件事对质量要求很高：Haiku 在长上下文上偶尔会编造（输出 session 里根本没出现过的工具调用），Opus 在长文本理解和摘要上稳得多。一次 `/insights` 大约会花掉用户 $0.5 到 $1 的成本，但开发者一天使用 agent 的总成本通常在 $20 到 $50，这个 5% 以内的额外支出是值得的：它换来的是「不用打开浏览器看 dashboard，在终端里就能看到自己今天用了多少钱」这种直接的开发者体验。
+这种「fail soft 加告警」的取舍背后有一个明确的产品判断：抛错会让 agent 直接崩，算 0 会让用户以为新模型免费：这两个都是糟糕的用户体验。回落到默认价加内部告警，既保证用户不崩，又不会丢失「需要更新价格表」这个信号。
+
+第三件事是**让用户在终端里用 `/insights` 命令看到自己的会话报表**。它的实现方式很特别：先把所有会话的 JSONL 文件从 `~/.claude/projects/<dir>/sessions/` 读出来（这个目录每个项目有一个独立子目录，是一种干净的命名空间设计），然后跑两次 Opus 推理：第一次让 Opus 从原始会话里抽取出「这个 session 干了什么」这种结构化的事实清单，第二次让 Opus 基于这些事实写出一段自然语言总结。
+
+最后把这份报表打印到终端。
+
+为什么挑 Opus 而不是更便宜的 Haiku 跑这个？因为「分析自己历史会话」这件事对质量要求很高：Haiku 在长上下文上偶尔会编造（输出 session 里根本没出现过的工具调用），Opus 在长文本理解和摘要上稳得多。
+
+一次 `/insights` 大约会花掉用户 $0.5 到 $1 的成本，但开发者一天使用 agent 的总成本通常在 $20 到 $50，这个 5% 以内的额外支出是值得的：它换来的是「不用打开浏览器看 dashboard，在终端里就能看到自己今天用了多少钱」这种直接的开发者体验。
 
 ### OpenClaw · 用一根"诊断事件总线"把所有观测信号都汇到同一根管子上
 
-OpenClaw 的取舍跟前面两家都不一样。它要服务的场景不是企业级 SRE，也不是单机 IDE 用户，而是一种常见的 ChatOps 部署形态：一个 agent 同时挂在 Slack、Telegram、Discord、自家 Web、API gateway 上接消息，多用户并发，背后是一堆 worker 在跑会话。在这种场景下，观测有一个独特挑战：你不能预判用户会把日志汇到哪：可能是 Datadog、可能是 Sentry、可能是公司自建的 Elasticsearch、可能甚至只是想直接打到 stderr。
+OpenClaw 的取舍跟前面两家都不一样。它要服务的场景不是企业级 SRE，也不是单机 IDE 用户，而是一种常见的 ChatOps 部署形态：一个 agent 同时挂在 Slack、Telegram、Discord、自家 Web、API gateway 上接消息，多用户并发，背后是一堆 worker 在跑会话。
+
+在这种场景下，观测有一个独特挑战：你不能预判用户会把日志汇到哪：可能是 Datadog、可能是 Sentry、可能是公司自建的 Elasticsearch、可能甚至只是想直接打到 stderr。
 
 针对这个挑战 OpenClaw 选了一种经典的解耦模式：**所有观测都通过同一根叫「诊断事件」的总线发出来，至于这根总线的另一端连到哪里完全由部署方决定**。它做了三件事来让这根总线真正可用：
 
@@ -403,7 +426,7 @@ class CostResult:
 
 **第四个设计是把成本结果落到本地数据库再用一个命令出报表**。所有的 usage 数据都进了本地 SQLite：存进去的不只是金额，还包括状态、来源、价格版本、备注。Hermes 提供一个叫做 InsightsEngine 的本地工具直接查这个数据库，做按模型、按时间、按 session 的聚合统计，最后在终端打印出可读报表。整条数据通路上没有任何远程上报：这是 Hermes 跟前面三家最大的区别，它把隐私这件事的优先级拉得很高，宁可放弃跨机统一视图也不让任何成本数据离开用户机器。
 
-## §4 · 共同点
+## 可观测性已经形成的共识
 
 虽然四家的工程取舍迥异，但仔细对比会发现它们在五件最基本的事情上达成了惊人的一致：这五件事可以理解为 agent 观测系统的「必修课」。
 
@@ -417,7 +440,7 @@ class CostResult:
 
 **第五件事是开发模式下默认关上远程上报**。Codex 用 Rust 的 `cfg!(debug_assertions)` 编译开关在 debug 构建里把 exporter 切到 None，OpenClaw 默认把诊断功能关掉要用户主动开启。这背后是同一个工程纪律：开发跑测试时会制造各种异常的指标抖动（无限循环、超大输入、故意失败），如果这些数据进了生产监控的看板，运维会被误导以为线上出问题，整个团队都会被噪声淹没。
 
-## §5 · 差异点
+## 事件、价格与不确定性怎么记录
 
 <Diagram
   src="/diagrams/15-tradeoff.svg"
@@ -432,7 +455,7 @@ class CostResult:
 - **要做多平台 ChatOps**：参考 OpenClaw 的 DiagnosticEvent + listener 模式。事件流出，落哪儿由部署方决定。
 - **要做隐私敏感场景**：参考 Hermes 的 CostSource 5 优先级 + 全本地 SQLite。没远程上报。
 
-## §6 · 我的点评
+## 我的判断：先能复盘，再谈仪表盘
 
 <ScoreCard
   rows={[
@@ -445,7 +468,7 @@ class CostResult:
   headers={['系统', '评分', '亮点', '风险']}
 />
 
-## §7 · 自己实现可观测性 / 成本系统的最佳实践
+## 从最小事件记录开始
 
 下面是从四家 agent 系统提炼出来的「自己写可观测性 + 成本系统」的工程配方。先把最基础的 token 多维统计 + 准确成本核算跑起来，再加生产级的解耦架构 + 多源价格 + 用户报表，最后规避六个会让指标失真或拖慢主流程的常见错误。
 
@@ -480,7 +503,7 @@ class CostResult:
   ]}
 />
 
-## §8 · 四种观测栈并列
+## 四套观测栈并列
 
 <Diagram
   src="/diagrams/15-observability-flows.svg"
@@ -490,7 +513,7 @@ class CostResult:
 
 把 4 种放一起，观测投入差距一眼可见：Codex 是企业级 SRE 友好，Claude Code 是开发者自助，OpenClaw 是事件流给运维选，Hermes 是隐私本地 + 价格精度优先。
 
-## §9 · 延伸阅读 / 源码入口
+## 沿着事件出口读源码
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -513,14 +536,19 @@ class CostResult:
   ]}
 />
 
-## §10 · 小练习
+## 附录：练习与复盘
+
+<details id="interview-drill">
+<summary>按需展开练习和十道复盘题</summary>
+
+### 练习
 
 1. **🟢 算一次 turn 成本**：给定 `{input: 8000, output: 2000, cache_read: 12000, cache_write: 4000}` + `claude-sonnet-4`（COST_TIER_3_15），手算 USD 成本。验证：约 `(8/1000)*3 + (2/1000)*15 + (12/1000)*0.3 + (4/1000)*3.75 = 0.024 + 0.030 + 0.0036 + 0.015 ≈ $0.0726`。
 2. **🟠 实现 DiagnosticEvent listener**：写一个 Python 函数 `on_event(event: dict)`，把所有 `event['type'] == 'model.usage'` 的事件累加 `costUsd`，每 100 个事件 print 一次累计金额。
 3. **🟠 CostSource 优先级**：写一个函数 `pick_pricing(entries: list[PricingEntry]) -> PricingEntry`，按 `provider_cost_api > provider_generation_api > provider_models_api > official_docs_snapshot > user_override > custom_contract > none` 优先级选最高的一个。
 4. **🔴 trace bundle replay**：用一个简单 JSONL 文件模拟 `trace.jsonl`，每行一条 `{type, ts, payload}` 事件。写 reducer 函数：聚合 `type == "turn.start"` / `"turn.end"` 算出 turn 数 + 总耗时 + 每 turn token 平均值。
 
-## §11 · 面试题：10 道带答案的高频考点
+### 复盘题
 
 <details>
 <summary>**Q1 · 概念**：token 至少要分多少维度？为什么不能只算总数？</summary>
@@ -1174,4 +1202,6 @@ def insights_cli():
 **追问**：「跨语言怎么共享？」CanonicalUsage / DiagnosticEvent schema 用 JSON Schema 定义，codegen 类型。具体 emit / export 各语言独立实现。OTel 自己也是这个模式（spec + 各语言 SDK）。
 
 **源码组合**：[`codex/codex-rs/otel/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/otel/) + [`codex/codex-rs/analytics/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/analytics/) + `claude-code/src/utils/modelCost.ts` + [`openclaw/src/infra/diagnostic-events.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/infra/diagnostic-events.ts) + [`hermes-agent/agent/usage_pricing.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/usage_pricing.py)。
+</details>
+
 </details>

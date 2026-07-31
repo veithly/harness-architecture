@@ -4,7 +4,7 @@
  *  A. entries=[{ system, path, lines?, desc, external? }]
  *  B. pins=[{ label, path, system, lines?, external? }]   (system 可写 codex/claudeCode/openclaw/hermes)
  *
- * 章末 §9「延伸阅读 / 源码入口」。
+ * 章末的延伸阅读与源码入口。
  * 对 Codex / OpenClaw / Hermes 的 REF 路径自动转为 GitHub blob 链接（基于固定 SHA），
  * Claude Code 因闭源保留为纯文本。
  */
@@ -24,11 +24,12 @@ interface Props {
   title?: string;
   externalLabel?: string;
 }
+const isEnglish = Astro.url.pathname.startsWith('/en/');
 const {
   entries,
   pins,
-  title = '延伸阅读 / 源码入口',
-  externalLabel = '官方文档 ↗',
+  title = isEnglish ? 'Source map' : '延伸阅读 / 源码入口',
+  externalLabel = isEnglish ? 'Official docs ↗' : '官方文档 ↗',
 } = Astro.props;
 
 const systemColor: Record<string, string> = {
@@ -78,7 +79,7 @@ const normalized = raw.map((e) => {
         ) : (
           <code class="aap-trail__path aap-trail__path--plain">{e.display}</code>
         )}
-        {e.desc && <span class="aap-trail__desc">— {e.desc}</span>}
+        {e.desc && <span class="aap-trail__desc">{e.desc}</span>}
         {e.external && (
           <a href={e.external} target="_blank" rel="noreferrer">{externalLabel}</a>
         )}

@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## A skill is behavior loaded on demand
 
 <Verdict tldr="A skill is the idea of «taking a workflow you do over and over again, writing it in a markdown file, and attaching a frontmatter block (the YAML header wrapped in --- at the top of the file) that tells the agent when to reach for it and which tools it may use». The four systems pull this idea in four very different directions: Codex treats it as a platform problem and breaks loading, injection, dependency resolution and distribution into independent modules so skills can be shipped per user / per project / per organization (three stacking scopes); Claude Code treats it as a user-experience problem and provides skillify, a four-round wizard that automatically extracts a reusable workflow from the conversation the user just finished; OpenClaw treats it as a software-supply-chain problem and wires download, extract and static scanning (frontmatter compliance, shell-command risk, external URLs) into one auditable install pipeline; Hermes treats it as a trust problem and combines 4 origins (builtin / trusted / community / agent-created) × 3 verdicts (safe / caution / dangerous) into a 12-cell INSTALL_POLICY matrix that decides whether each skill is allowed, blocked, or has to be confirmed by the user. In one sentence: study Codex if you want a platform, Claude Code if you want users to actually write skills, OpenClaw if you need a marketplace, Hermes if you need compliance-friendly install." />
 
-## §2 · Architecture diagram
+## Four skill systems
 
-:::tip[Key takeaways · 30-second read]
+<details>
+<summary>Before reading (optional)</summary>
+
 - **A skill freezes a recurring workflow into markdown**: a frontmatter block tells the agent when to reach for it and which tools it may use.
 - **Four framings of the same idea**: Codex builds a platform with per-user / per-project / per-organization scopes; Claude Code ships skillify, a four-round wizard extracting skills from finished conversations; OpenClaw scans installs for frontmatter compliance, shell risk, and external URLs; Hermes gates installs with a 12-cell INSTALL_POLICY.
 - **Skill origin determines install treatment**: Hermes crosses 4 origins (builtin / trusted / community / agent-created) with 3 verdicts (safe / caution / dangerous) to decide allow, block, or confirm.
 - **Pick your study target by goal**: Codex for a platform, Claude Code to make users actually write skills, OpenClaw for a marketplace, Hermes for compliance-friendly install.
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/17-skills-base.svg"
@@ -47,13 +50,17 @@ The four systems on skill discovery, injection, execution, and install:
   dimensionLabel="Dimension"
 />
 
-## §3 · How each system does it
+## How four systems discover and load skills
 
 ### Codex · build it like a platform
 
-Codex slices the problem of "load a skill" the most finely of any system in this book. It does not treat skill-loading as "read a file, paste it into the prompt". It treats it as a small internal product pipeline, and deliberately splits that pipeline into eight pieces, each owning one concern: one module reads SKILL.md from disk or remote storage, one keeps an in-memory registry of which skills are alive, one defines the data structure that describes "what a skill looks like", one renders SKILL.md into a prompt fragment, one decides whether the current turn should pull a particular skill in, one handles remote install and sync, one checks whether the environment variables a skill requires are actually present, and one parses the policy that decides where a skill is allowed to be visible.
+Codex slices the problem of "load a skill" the most finely of any system in this book. It does not treat skill-loading as "read a file, paste it into the prompt".
 
-The reason for cutting things this finely is to let each concern evolve independently: changing the remote protocol does not touch the injection logic, changing the injection logic does not touch the dependency check. It also lets several engineers work in parallel: someone iterating on the marketplace protocol does not block someone tightening the env-var resolver.
+It treats it as a small internal product pipeline, and deliberately splits that pipeline into eight pieces, each owning one concern: one module reads SKILL.md from disk or remote storage, one keeps an in-memory registry of which skills are alive, one defines the data structure that describes "what a skill looks like", one renders SKILL.md into a prompt fragment, one decides whether the current turn should pull a particular skill in, one handles remote install and sync, one checks whether the environment variables a skill requires are actually present, and one parses the policy that decides where a skill is allowed to be visible.
+
+The reason for cutting things this finely is to let each concern evolve independently: changing the remote protocol does not touch the injection logic, changing the injection logic does not touch the dependency check.
+
+It also lets several engineers work in parallel: someone iterating on the marketplace protocol does not block someone tightening the env-var resolver.
 
 What information does a single skill actually carry? Let's look at the data structure once, then come back and read it in plain language:
 
@@ -102,9 +109,17 @@ pub struct SkillToolDependency {
 
 </SourceBlock>
 
-The point of this structure is not the field names. The point is that everything an agent might want to know about a skill is made explicit: not just its name and description, but also who owns it (private to a user, shared in a project, distributed by an organization, or shipped with the binary), how it should look in the UI (icons, brand color, default prompt for IDE rendering), which tools or MCP endpoints it depends on (so the agent can know up-front that this skill needs `git` and a GitHub token), and which product surfaces are allowed to show it (the same skill can be visible in the CLI but hidden in the cloud product). When everything is described in metadata like this, a skill stops being "a piece of prompt" and starts looking more like a listing in an app store.
+The point of this structure is not the field names. The point is that everything an agent might want to know about a skill is made explicit: not just its name and description, but also who owns it (private to a user, shared in a project, distributed by an organization, or shipped with the binary), how it should look in the UI (icons, brand color, default prompt for IDE rendering), which tools or MCP endpoints it depends on (so the agent can know up-front that this skill needs `git` and a GitHub token), and which product surfaces are allowed to show it (the same skill can be visible in the CLI but hidden in the cloud product).
 
-The next problem this design tackles is one of the most common pain points in skill systems: many skills actually need external credentials to run. A skill that calls the GitHub API needs `GITHUB_TOKEN`, an internal-service skill needs `INTERNAL_API_KEY`. If the model has to discover this by trying, failing, asking, retrying, the experience falls apart. Codex's answer is to look ahead: before each turn starts, it scans through the skills that might be relevant, collects the environment variables they declare as required, checks which are already present, and if any are still missing, fires one consolidated question to the user that asks for all of them at once. Variables already filled in earlier in the session are not re-asked. The upshot is that the user is interrupted at most once, and the interruption happens before they try to do work, not in the middle of it.
+When everything is described in metadata like this, a skill stops being "a piece of prompt" and starts looking more like a listing in an app store.
+
+The next problem this design tackles is one of the most common pain points in skill systems: many skills actually need external credentials to run.
+
+A skill that calls the GitHub API needs `GITHUB_TOKEN`, an internal-service skill needs `INTERNAL_API_KEY`. If the model has to discover this by trying, failing, asking, retrying, the experience falls apart.
+
+Codex's answer is to look ahead: before each turn starts, it scans through the skills that might be relevant, collects the environment variables they declare as required, checks which are already present, and if any are still missing, fires one consolidated question to the user that asks for all of them at once.
+
+Variables already filled in earlier in the session are not re-asked. The upshot is that the user is interrupted at most once, and the interruption happens before they try to do work, not in the middle of it.
 
 <SourceBlock path="REF/codex/codex-rs/core/src/skills.rs" lines="59-100" system="codex" summary="Before a turn starts, scan which env vars the eligible skills declare as required; collect the missing ones into one prompt, so the user is interrupted up-front instead of mid-execution.">
 
@@ -147,15 +162,43 @@ pub(crate) async fn resolve_skill_dependencies_for_turn(
 
 </SourceBlock>
 
-Around this data model, Codex makes a handful of engineering choices that are worth studying carefully. First, every skill belongs to one of four **visibility scopes**: private to the user, shared inside a project, distributed by an organization, or bundled with the product. The same SKILL.md in different physical locations means different propagation radii: drop it under the user's home directory and only that user sees it; check it into a repository and every collaborator inherits it; publish it as an organization distribution and everyone in that org gets it; or compile it into the binary and it ships with the next release. Second, skills are implicitly invocable by default unless the author opts out, which avoids the unhappy state where someone writes a skill and the model never picks it up. Third, disabling a skill does not delete it; the system marks its metadata as "disabled" so re-enabling later is one toggle. Fourth, when a user types a command, Codex first does cheap textual reverse-matching against known skill triggers (see `detect_implicit_skill_invocation_for_command` in the source, which looks up which skills a given command name directly matches) instead of paying for a full LLM intent-recognition pass on every keystroke; only when local matching is ambiguous does it ask the model. These four choices, stacked together, give Codex a very "productized" feel: scopes act like file permissions, enable/disable acts like an app switch, triggers act like keyboard shortcuts, and distribution acts like an app store.
+Around this data model, Codex makes a handful of engineering choices that are worth studying carefully.
+
+First, every skill belongs to one of four **visibility scopes**: private to the user, shared inside a project, distributed by an organization, or bundled with the product.
+
+The same SKILL.md in different physical locations means different propagation radii: drop it under the user's home directory and only that user sees it; check it into a repository and every collaborator inherits it; publish it as an organization distribution and everyone in that org gets it; or compile it into the binary and it ships with the next release.
+
+Second, skills are implicitly invocable by default unless the author opts out, which avoids the unhappy state where someone writes a skill and the model never picks it up.
+
+Third, disabling a skill does not delete it; the system marks its metadata as "disabled" so re-enabling later is one toggle.
+
+Fourth, when a user types a command, Codex first does cheap textual reverse-matching against known skill triggers (see `detect_implicit_skill_invocation_for_command` in the source, which looks up which skills a given command name directly matches) instead of paying for a full LLM intent-recognition pass on every keystroke; only when local matching is ambiguous does it ask the model.
+
+These four choices, stacked together, give Codex a very "productized" feel: scopes act like file permissions, enable/disable acts like an app switch, triggers act like keyboard shortcuts, and distribution acts like an app store.
 
 ### Claude Code · put "people will actually write one" first
 
-Claude Code goes the opposite direction. It treats the skill problem not as a structure problem but as a user-experience problem. Its key insight is: **most users will never sit down and write a SKILL.md from scratch, but they will happily "save the thing we just figured out together"**. So it ships more than a dozen example skills as built-ins, partly as working tools, partly as a teaching gallery: one for telling the model how to drive a careful step-by-step loop, one for verifying its own claims before reporting back, one for asking for help when it is stuck, one for recording facts, several for opening specific interfaces, and so on. Each is also a "look, this is what a skill can look like" demonstration.
+Claude Code goes the opposite direction. It treats the skill problem not as a structure problem but as a user-experience problem.
 
-The most important of them is a meta-skill whose only job is to **turn the conversation you just finished into a reusable skill**. It does not dump a wall of fields on the user. Instead it splits the extraction process into four small question rounds: first, summarize in one sentence what the session was about. That becomes the skill's description. Then lay out the steps in order and ask the user to confirm or edit them. Then list the tools the session actually used and ask the user to tick which ones the skill should be allowed to call. Finally ask one architectural question: should the skill run inline in the main conversation, or be spawned off into its own sub-process? With those four taps, the user has produced a SKILL.md complete with metadata, trigger description, and tool whitelist, and dropped it onto disk.
+Its key insight is: **most users will never sit down and write a SKILL.md from scratch, but they will happily "save the thing we just figured out together"**.
 
-Why four rounds instead of a single form? Because of a very practical observation: ask a user to fill out seven fields at once and most will quit; ask them one short multiple-choice question per round and almost everyone finishes. This is what makes the difference between "a skill format you have in theory" and "skills people actually write".
+So it ships more than a dozen example skills as built-ins, partly as working tools, partly as a teaching gallery: one for telling the model how to drive a careful step-by-step loop, one for verifying its own claims before reporting back, one for asking for help when it is stuck, one for recording facts, several for opening specific interfaces, and so on.
+
+Each is also a "look, this is what a skill can look like" demonstration.
+
+The most important of them is a meta-skill whose only job is to **turn the conversation you just finished into a reusable skill**. It does not dump a wall of fields on the user.
+
+Instead it splits the extraction process into four small question rounds: first, summarize in one sentence what the session was about. That becomes the skill's description.
+
+Then lay out the steps in order and ask the user to confirm or edit them. Then list the tools the session actually used and ask the user to tick which ones the skill should be allowed to call.
+
+Finally ask one architectural question: should the skill run inline in the main conversation, or be spawned off into its own sub-process?
+
+With those four taps, the user has produced a SKILL.md complete with metadata, trigger description, and tool whitelist, and dropped it onto disk.
+
+Why four rounds instead of a single form? Because of a very practical observation: ask a user to fill out seven fields at once and most will quit; ask them one short multiple-choice question per round and almost everyone finishes.
+
+This is what makes the difference between "a skill format you have in theory" and "skills people actually write".
 
 Below is the prompt that drives that wizard. It is itself a skill file. Read it not for its string details but for the choreography it imposes: first understand what happened in the session, then ask the user four targeted questions, then emit a polished SKILL.md.
 
@@ -235,19 +278,33 @@ Clearly stated goal.
 
 A few details in this design deserve a second look.
 
-One is the rule that the **trigger description must start with "Use when…"** and must list concrete trigger phrases together with sample user messages. The reason is that the model's judgment about whether to invoke this skill is based entirely on that description. The more specific and example-rich the description, the lower both the false-positive and false-negative rates. If you only write "for git-related tasks" the model will hesitate every time someone mentions git.
+One is the rule that the **trigger description must start with "Use when…"** and must list concrete trigger phrases together with sample user messages.
 
-Another is the rule that **every step has to declare a success criterion**. Skills are usually multi-step; if the model finishes one step but does not know "did that count as done?", it will either retry pointlessly or steamroll ahead incorrectly. Forcing a "what proves this step is complete" line acts as a checkpoint after each step.
+The reason is that the model's judgment about whether to invoke this skill is based entirely on that description. The more specific and example-rich the description, the lower both the false-positive and false-negative rates.
 
-Another is the **sub-command-level scoping of tool permissions**. A release-workflow skill should not be allowed to run any shell command; it should be limited to a narrow whitelist like `git cherry-pick`, `gh pr` and similar. This granularity is the difference between "a prompt injection causes localised damage" and "a prompt injection wipes the system".
+If you only write "for git-related tasks" the model will hesitate every time someone mentions git.
 
-Finally there is the very practical knob: **inline vs forked execution**. Inline means the skill runs directly inside the main conversation: the user sees every step and can intervene. Forked means the skill is spawned into a sub-agent or sub-process and only its final result is folded back in. The first suits workflows that need a human in the loop (a cherry-pick that may run into conflicts). The second suits clean, self-contained tasks (writing a release note) and keeps the main conversation tidy.
+Another is the rule that **every step has to declare a success criterion**. Skills are usually multi-step; if the model finishes one step but does not know "did that count as done?", it will either retry pointlessly or steamroll ahead incorrectly.
+
+Forcing a "what proves this step is complete" line acts as a checkpoint after each step.
+
+Another is the **sub-command-level scoping of tool permissions**. A release-workflow skill should not be allowed to run any shell command; it should be limited to a narrow whitelist like `git cherry-pick`, `gh pr` and similar.
+
+This granularity is the difference between "a prompt injection causes localised damage" and "a prompt injection wipes the system".
+
+Finally there is the very practical knob: **inline vs forked execution**. Inline means the skill runs directly inside the main conversation: the user sees every step and can intervene.
+
+Forked means the skill is spawned into a sub-agent or sub-process and only its final result is folded back in. The first suits workflows that need a human in the loop (a cherry-pick that may run into conflicts).
+
+The second suits clean, self-contained tasks (writing a release note) and keeps the main conversation tidy.
 
 ### OpenClaw · treat skills like software packages
 
 OpenClaw frames skills differently again. It views them as **third-party code that will be downloaded, unpacked and executed**, and therefore handles them with software-supply-chain hygiene: download, extract, statically scan, install, with audit trails at each step and a path to roll back.
 
-The first stage of that pipeline is a **static scanner**. When the user decides to install a skill, the scanner reads every code file inside the package, applies file-type-specific rule sets (dynamic execution in scripts, hard-coded credentials in config files, "ignore the previous instructions" templates in documentation), and records a finding whenever a rule fires. Each finding carries a rule ID, a file/line locator, a snippet of evidence, and a severity (info, warn, critical). By the time the installer has to decide "go or no go", it has a structured risk inventory in front of it.
+The first stage of that pipeline is a **static scanner**. When the user decides to install a skill, the scanner reads every code file inside the package, applies file-type-specific rule sets (dynamic execution in scripts, hard-coded credentials in config files, "ignore the previous instructions" templates in documentation), and records a finding whenever a rule fires.
+
+Each finding carries a rule ID, a file/line locator, a snippet of evidence, and a severity (info, warn, critical). By the time the installer has to decide "go or no go", it has a structured risk inventory in front of it.
 
 <SourceBlock path="REF/openclaw/src/security/skill-scanner.ts" lines="10-53" system="openclaw" summary="The structured finding produced by one scan: rule id, severity, file and line, evidence; plus the scanner's file-type scope and caching bounds.">
 
@@ -290,7 +347,11 @@ const DIR_ENTRY_CACHE_MAX = 5000;
 
 </SourceBlock>
 
-How does the inventory feed back into the install decision? OpenClaw does not adopt a heavy-handed "one warning = blocked" rule. It maps severity to response: critical findings cause an outright refusal with the offending file and line printed out; non-critical suspicious patterns cause a softer prompt asking the user to run a deeper audit if they want details; and if the scanner itself crashes the install is allowed to proceed but with a suggestion to run a deep audit afterwards. The result is a deliberate balance between "we don't ship dangerous skills" and "we don't paralyse the user every time something looks slightly off".
+How does the inventory feed back into the install decision? OpenClaw does not adopt a heavy-handed "one warning = blocked" rule.
+
+It maps severity to response: critical findings cause an outright refusal with the offending file and line printed out; non-critical suspicious patterns cause a softer prompt asking the user to run a deeper audit if they want details; and if the scanner itself crashes the install is allowed to proceed but with a suggestion to run a deep audit afterwards.
+
+The result is a deliberate balance between "we don't ship dangerous skills" and "we don't paralyse the user every time something looks slightly off".
 
 <SourceBlock path="REF/openclaw/src/agents/skills-install.ts" lines="58-83" system="openclaw" summary="Translate scan results into different install-time prompts: hard-block on critical with concrete evidence, soft-prompt on warnings, and fail-open with audit guidance when the scanner itself errors.">
 
@@ -328,13 +389,23 @@ async function collectSkillInstallScanWarnings(entry: SkillEntry): Promise<strin
 
 </SourceBlock>
 
-A few other engineering choices on this pipeline stand out. Scan results are cached for up to several thousand files, with the cache keyed on file size and modification time, meaning a file that hasn't changed since the last scan is not re-scanned, saving a lot of repeated regex work. Bundled skills follow a separate audit path that does not block user-installed workspace skills, which avoids a single built-in skill tripping a rule and bricking the whole install system. And extraction of third-party packages is done with verbose logging so the system records exactly which file ended up where, which is invaluable when auditing "what got installed?" later.
+A few other engineering choices on this pipeline stand out. Scan results are cached for up to several thousand files, with the cache keyed on file size and modification time, meaning a file that hasn't changed since the last scan is not re-scanned, saving a lot of repeated regex work.
+
+Bundled skills follow a separate audit path that does not block user-installed workspace skills, which avoids a single built-in skill tripping a rule and bricking the whole install system.
+
+And extraction of third-party packages is done with verbose logging so the system records exactly which file ended up where, which is invaluable when auditing "what got installed?" later.
 
 ### Hermes · let trust drive the decision
 
-Hermes summarises the entire skill problem into one question: **whose word do you take for it?**. It argues that whether a skill should be installed depends less on counting suspicious lines and more on the combination of *where it came from* and *what the scan found*.
+Hermes summarises the entire skill problem into one question: **whose word do you take for it?**.
 
-So it tags every skill with one of four **origins**: skills that ship with the binary are "built-in"; skills from official vendor repositories such as OpenAI's or Anthropic's are "trusted"; skills from the wider community or a marketplace are "community"; and skills the model has just generated in conversation are "agent-created". Independently it assigns each skill a **verdict** from a static scan: safe, suspicious, or dangerous. Cross these two dimensions and you get a 4x3 grid (twelve cells), and each cell is hard-coded with one of three install outcomes: allow, block, or ask the user.
+It argues that whether a skill should be installed depends less on counting suspicious lines and more on the combination of *where it came from* and *what the scan found*.
+
+So it tags every skill with one of four **origins**: skills that ship with the binary are "built-in"; skills from official vendor repositories such as OpenAI's or Anthropic's are "trusted"; skills from the wider community or a marketplace are "community"; and skills the model has just generated in conversation are "agent-created".
+
+Independently it assigns each skill a **verdict** from a static scan: safe, suspicious, or dangerous.
+
+Cross these two dimensions and you get a 4x3 grid (twelve cells), and each cell is hard-coded with one of three install outcomes: allow, block, or ask the user.
 
 <SourceBlock path="REF/hermes-agent/tools/skills_guard.py" lines="37-49" system="hermes" summary="A 4-by-3 decision table: rows are the origin of the skill, columns are what static scanning thinks of it, and each cell is the resulting install decision (allow, block, or ask the human).">
 
@@ -354,9 +425,17 @@ VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 
 </SourceBlock>
 
-Two cells in this table are especially worth dwelling on. The "trusted origin + dangerous verdict" cell is set to *block*, meaning even a skill from the official vendor repository will be refused if the scanner finds something genuinely dangerous in it; vendors are held to their own promises. The "agent-created + dangerous" cell is set to *ask*, meaning if the model writes itself a skill that looks risky, the system trusts neither the model (which may have been tricked) nor blanket-blocks it (the user may legitimately need that power); instead it hands the decision back to a human. Those two cells together let the table cover both straightforward and adversarial cases without overstepping.
+Two cells in this table are especially worth dwelling on. The "trusted origin + dangerous verdict" cell is set to *block*, meaning even a skill from the official vendor repository will be refused if the scanner finds something genuinely dangerous in it; vendors are held to their own promises.
 
-Alongside the trust matrix, Hermes also makes a very "progressive-disclosure" choice: every skill, regardless of origin, lives under one root directory in the user's home, and the metadata fields have hard character limits: names cap at 64 characters and descriptions at 1024. These look arbitrary but they are calibrated: a 64-character name fits on one terminal line; a 1024-character description is roughly 200 tokens, which is enough for the model to know "what this skill is and when to use it" but small enough that a directory of dozens of skills does not blow up the prompt. The full SKILL.md body (which can be thousands of characters) is only loaded into the prompt the moment the model decides to invoke that particular skill.
+The "agent-created + dangerous" cell is set to *ask*, meaning if the model writes itself a skill that looks risky, the system trusts neither the model (which may have been tricked) nor blanket-blocks it (the user may legitimately need that power); instead it hands the decision back to a human.
+
+Those two cells together let the table cover both straightforward and adversarial cases without overstepping.
+
+Alongside the trust matrix, Hermes also makes a very "progressive-disclosure" choice: every skill, regardless of origin, lives under one root directory in the user's home, and the metadata fields have hard character limits: names cap at 64 characters and descriptions at 1024.
+
+These look arbitrary but they are calibrated: a 64-character name fits on one terminal line; a 1024-character description is roughly 200 tokens, which is enough for the model to know "what this skill is and when to use it" but small enough that a directory of dozens of skills does not blow up the prompt.
+
+The full SKILL.md body (which can be thousands of characters) is only loaded into the prompt the moment the model decides to invoke that particular skill.
 
 <SourceBlock path="REF/hermes-agent/tools/skills_tool.py" lines="28-100" system="hermes" summary="A SKILL.md metadata schema that is compatible with the emerging cross-agent standard yet leaves room for vendor-specific extensions: hard caps on name and description, optional platform/dependency declarations, and a private metadata sub-tree.">
 
@@ -398,9 +477,11 @@ _PLATFORM_MAP = {
 
 </SourceBlock>
 
-This schema is also "ecosystem-friendly" in another way: it aligns with the cross-agent skill standard that is starting to emerge in the industry, meaning the same SKILL.md can be loaded by multiple agent runtimes without forking. At the same time it keeps a dedicated extension slot for Hermes's own metadata (tags, related skills) so vendor-specific information does not contaminate the public schema and is not overwritten by upstream upgrades.
+This schema is also "ecosystem-friendly" in another way: it aligns with the cross-agent skill standard that is starting to emerge in the industry, meaning the same SKILL.md can be loaded by multiple agent runtimes without forking.
 
-## §4 · Structured depth vs ease of authoring
+At the same time it keeps a dedicated extension slot for Hermes's own metadata (tags, related skills) so vendor-specific information does not contaminate the public schema and is not overwritten by upstream upgrades.
+
+## Structured depth versus authoring ease
 
 <Diagram
   src="/diagrams/17-tradeoff.svg"
@@ -408,9 +489,17 @@ This schema is also "ecosystem-friendly" in another way: it aligns with the cros
   caption="Codex pushes structure deep, Claude Code keeps authoring light, OpenClaw makes distribution strict, Hermes makes trust granular."
 />
 
-The four systems sit on two axes that pull against each other: "how structured is the design?" versus "how easy is it for an author or end user to get something working?". In principle the deeper the structure, the better you can evolve and govern it long-term, but the higher the up-front cost; conversely, easy authoring gets you participation but makes permission control, ecosystem interop and supply-chain auditing harder.
+The four systems sit on two axes that pull against each other: "how structured is the design?" versus "how easy is it for an author or end user to get something working?".
 
-Codex sits at the deep-structure end: it slices the problem finely, but at the cost of expecting authors to understand scope, policy, dependencies and injection timing. Claude Code sits at the opposite end: it ships built-ins as samples and turns "saving a workflow" into a wizard, so users do not need to learn any concept to produce a working skill, at the cost of less rigorous permission boundaries and trust governance than Codex. OpenClaw doesn't compete on author experience at all; instead it makes the *download → extract → scan → install* pipeline very strict, which is exactly what an IT-administered environment needs. Hermes sits between these: its compact 12-cell matrix lets even non-technical users understand why one skill is installable and another is not.
+In principle the deeper the structure, the better you can evolve and govern it long-term, but the higher the up-front cost; conversely, easy authoring gets you participation but makes permission control, ecosystem interop and supply-chain auditing harder.
+
+Codex sits at the deep-structure end: it slices the problem finely, but at the cost of expecting authors to understand scope, policy, dependencies and injection timing.
+
+Claude Code sits at the opposite end: it ships built-ins as samples and turns "saving a workflow" into a wizard, so users do not need to learn any concept to produce a working skill, at the cost of less rigorous permission boundaries and trust governance than Codex.
+
+OpenClaw doesn't compete on author experience at all; instead it makes the *download → extract → scan → install* pipeline very strict, which is exactly what an IT-administered environment needs.
+
+Hermes sits between these: its compact 12-cell matrix lets even non-technical users understand why one skill is installable and another is not.
 
 Lined up side by side, the four take-points along the same "author → load → inject → distribute → install" pipeline become clearer:
 
@@ -420,25 +509,53 @@ Lined up side by side, the four take-points along the same "author → load → 
   caption="The same author → load → inject → distribute → install pipeline; each system bets heavily on a different stage."
 />
 
-## §5 · Four common mistakes
+## The four mistakes that recur
 
 ### Mistake 1: longer skill equals better skill
 
-A common first instinct when writing a skill is to put everything in: two thousand lines of prompt, thirty steps, dozens of clarifications under each step. It feels "thorough" but it almost always fails in practice. The model loses focus in long middle sections and starts dropping context; and the longer the skill, the harder it is to maintain and to reuse. The skills that hold up well in production do two things: they describe "when to trigger" and "what success looks like" in the smallest number of words possible, and they reveal execution detail progressively rather than dumping it. The two-stage loading idea (show a short description in the listing, only pull the full body in when the skill is actually invoked) exists precisely to defeat the "more is better" temptation.
+A common first instinct when writing a skill is to put everything in: two thousand lines of prompt, thirty steps, dozens of clarifications under each step. It feels "thorough" but it almost always fails in practice.
+
+The model loses focus in long middle sections and starts dropping context; and the longer the skill, the harder it is to maintain and to reuse.
+
+The skills that hold up well in production do two things: they describe "when to trigger" and "what success looks like" in the smallest number of words possible, and they reveal execution detail progressively rather than dumping it.
+
+The two-stage loading idea (show a short description in the listing, only pull the full body in when the skill is actually invoked) exists precisely to defeat the "more is better" temptation.
 
 ### Mistake 2: implicit invocation by stuffing every skill into the system prompt
 
-A brute-force way to make all skills "automatically available" is to concatenate every SKILL.md into the system prompt at start-up. The problem is arithmetic: with a hundred skills averaging five thousand characters each, the prompt budget is gone before the user has even said hello. The right structure is two stages: at start-up the model only sees a catalogue (one line per skill with a description capped at maybe a thousand characters); only when the model actually decides to invoke a skill is its full SKILL.md pulled in. That way the steady-state cost barely changes whether you have ten skills or ten thousand. Codex adds an extra filter on top of this so that the catalogue only contains skills the current user and current product surface are actually allowed to implicitly trigger, keeping the listing from becoming noise of its own.
+A brute-force way to make all skills "automatically available" is to concatenate every SKILL.md into the system prompt at start-up.
+
+The problem is arithmetic: with a hundred skills averaging five thousand characters each, the prompt budget is gone before the user has even said hello.
+
+The right structure is two stages: at start-up the model only sees a catalogue (one line per skill with a description capped at maybe a thousand characters); only when the model actually decides to invoke a skill is its full SKILL.md pulled in.
+
+That way the steady-state cost barely changes whether you have ten skills or ten thousand.
+
+Codex adds an extra filter on top of this so that the catalogue only contains skills the current user and current product surface are actually allowed to implicitly trigger, keeping the listing from becoming noise of its own.
 
 ### Mistake 3: setting tool permissions to "allow Bash"
 
-If a skill's frontmatter says "this skill is allowed to use Bash", it effectively has root: anything the shell can do, the skill can do. One prompt injection later, all bets are off. The correct posture is to confine tool permissions to specific sub-commands: a cherry-pick skill is allowed `git cherry-pick`, `git status` and `gh pr` and nothing else. Codex goes further and structures dependencies as typed declarations ("I need this category of tool, over this transport, calling this endpoint") so that permission checks can run statically rather than after the fact.
+If a skill's frontmatter says "this skill is allowed to use Bash", it effectively has root: anything the shell can do, the skill can do. One prompt injection later, all bets are off.
+
+The correct posture is to confine tool permissions to specific sub-commands: a cherry-pick skill is allowed `git cherry-pick`, `git status` and `gh pr` and nothing else.
+
+Codex goes further and structures dependencies as typed declarations ("I need this category of tool, over this transport, calling this endpoint") so that permission checks can run statically rather than after the fact.
 
 ### Mistake 4: treating every source of skill the same
 
-It is tempting to assume that since "they're all SKILL.md files", they can all just be installed and run. In reality the risk profile of a built-in skill, an official-vendor skill, a community skill and a skill the model wrote for itself are radically different. Letting unreviewed third-party content execute is equivalent to opening the door to whoever shows up. The 12-cell trust matrix and the static scanner that this chapter described are both ways of saying: **origin matters as much as content**. An unknown origin plus a faint hint of suspicion is enough to refuse; a model-written skill that scans dangerous must go via the user; a definitely-dangerous skill is refused even if it came from an official source. Both layers together let you keep an open ecosystem without an open door.
+It is tempting to assume that since "they're all SKILL.md files", they can all just be installed and run.
 
-## §6 · Scorecard
+In reality the risk profile of a built-in skill, an official-vendor skill, a community skill and a skill the model wrote for itself are radically different.
+
+Letting unreviewed third-party content execute is equivalent to opening the door to whoever shows up.
+
+The 12-cell trust matrix and the static scanner that this chapter described are both ways of saying: **origin matters as much as content**.
+
+An unknown origin plus a faint hint of suspicion is enough to refuse; a model-written skill that scans dangerous must go via the user; a definitely-dangerous skill is refused even if it came from an official source.
+
+Both layers together let you keep an open ecosystem without an open door.
+
+## My take: trigger rules matter more than file length
 
 <ScoreCard
   systems={[
@@ -462,7 +579,7 @@ It is tempting to assume that since "they're all SKILL.md files", they can all j
   caption="Five dimensions (1 = weakest, 5 = strongest)."
 />
 
-## §7 · Build recipe
+## Start with one auditable skill
 
 <BuildRecipe
   steps={[
@@ -477,7 +594,7 @@ It is tempting to assume that since "they're all SKILL.md files", they can all j
   ]}
 />
 
-## §8 · Decision checklist
+## A checklist before implementation
 
 Whether you actually need to add a skill subsystem to your agent can be self-diagnosed against the following seven questions:
 
@@ -489,9 +606,11 @@ Whether you actually need to add a skill subsystem to your agent can be self-dia
 6. **Does the workflow need a human in the loop?** Workflows that need intervention are better off running in the main conversation; clean, self-contained workflows are better off spawned into a sub-process so they do not pollute the main conversation with hundreds of tool calls.
 7. **How will skills come into existence?** If authors are happy to write them by hand, a template and some examples are enough. If you want users to distill skills from conversations they just finished, you need to build a guided wizard: non-trivial, but the highest return on investment.
 
-Rule of thumb: one or two yeses means a prompt template plus a few examples is plenty. Five or more yeses, and it is worth treating the skill subsystem as its own engineering project: borrow structure from Codex, authoring experience from Claude Code, install and scan from OpenClaw, trust matrix from Hermes.
+Rule of thumb: one or two yeses means a prompt template plus a few examples is plenty.
 
-## §9 · Source pointers
+Five or more yeses, and it is worth treating the skill subsystem as its own engineering project: borrow structure from Codex, authoring experience from Claude Code, install and scan from OpenClaw, trust matrix from Hermes.
+
+## Follow the skill loader through source
 
 <SourceTrail
   pins={[
@@ -510,14 +629,19 @@ Rule of thumb: one or two yeses means a prompt template plus a few examples is p
   ]}
 />
 
-## §10 · Where this connects
+## Where to continue
 
 - The previous chapter [16 · Memory](/en/patterns/16-memory/) covered how the agent remembers facts.
 - The next chapter [18 · Cron & Background Tasks](/en/patterns/18-cron-background/) covers how the agent runs when you are not there.
 - See [04 · Tool system](/en/patterns/04-tool-system/) for how skills interact with tools.
 - See [12 · Permissions and approvals](/en/patterns/12-permissions-approvals/) for how `allowed-tools` constrain skills.
 
-## §11 · Interview drill: 10 questions with worked answers
+## Appendix: review questions
+
+<details id="interview-drill">
+<summary>Open ten review questions</summary>
+
+### Ten questions
 
 <details>
 <summary>**Q1 · Concept**: What's the essential difference between skill, prompt template, tool, and agent?</summary>
@@ -1238,4 +1362,6 @@ Total v0.1 (Layer 1-2) one month, v1.0 (Layer 5) three months.
 **Follow-up**: "How to version skills?" SemVer + immutable distribution. Upgrade = reinstall.
 
 **Source mosaic**: All four systems' best parts layered together.
+</details>
+
 </details>

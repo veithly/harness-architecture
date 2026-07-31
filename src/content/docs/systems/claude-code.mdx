@@ -1,6 +1,6 @@
 ---
 title: Claude Code
-description: "Anthropic Claude Code：TypeScript 加 skill engine 加多入口 IDE 集成的 agent 形态最完整"
+description: "Anthropic Claude Code：TypeScript、skill engine 与多入口 IDE 集成"
 sidebar:
   order: 2
 ---
@@ -9,13 +9,13 @@ import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 
-<Verdict tldr="Claude Code 是开发者 UX 做得最完整的 agent。17 个内置 skill、skillify 元 skill、4 种入口（CLI、IDE、Web、Mobile），`/insights` 加 `/security-review` 加 autoMode 三件套构成 agent 自我审计的闭环。系统闭源，本站分析基于公开文档加 npm 包 sourcemap 解包。基于解包的结论显式标「行为推断」。" tone="insight" />
+<Verdict tldr="Claude Code 把 17 个内置 skill、skillify 元 skill、CLI、IDE、Web、Mobile 四种入口，以及 `/insights`、`/security-review`、autoMode 放在同一套开发者工作流里。系统闭源，本站只把公开文档与 npm sourcemap 能支持的结论写成事实，其余明确标为行为推断。" tone="insight" />
 
-## §1 · Claude Code 是什么
+## 一套循环接住四种入口
 
 Anthropic 出品的 agentic coding tool，以 npm 包 `@anthropic-ai/claude-code` 发布。同一份 TypeScript 代码库支持终端、Cursor 风格 IDE 插件、Web、Mobile 四种入口。
 
-## §2 · 按目录分层的架构栈
+## 目录围绕开发者动作展开
 
 <CompareTable
   rows={[
@@ -26,25 +26,25 @@ Anthropic 出品的 agentic coding tool，以 npm 包 `@anthropic-ai/claude-code
     { label: '挂钩与钩子', values: ['`hooks/` 生命周期钩子', '`buddy/` 协作模式', '`coordinator/` 多 agent 调度', '`outputStyles/` 输出格式注入'] },
     { label: '观测与计费', values: ['`cost-tracker.ts` 加 `costHook.ts` 实时跟成本', '`commands/insights.ts` Opus 跑 jsonl 出 narrative', '`logEvent("tengu_*")` 事件流', '`modelCost.ts` 硬编码定价表'] },
   ]}
-  caption="Claude Code 把每个能力都尽量给到 slash command 入口，开发者 UX 拉满。"
+  caption="Claude Code 尽量把能力暴露为 slash command，入口层只做协议适配。"
 />
 
-## §3 · 工程亮点
+## Skill、自审计与记忆校验
 
-1. **skill 机制是行业天花板**：内置 17 个 skill 加 `skillify` 元 skill。`skillify` 用 4 轮 AskUserQuestion 把一段 session 蒸馏成 SKILL.md，是「agent 自己产 skill」最完整的闭环。
+1. **skill 机制边界清楚**：内置 17 个 skill 加 `skillify` 元 skill。`skillify` 用 4 轮 AskUserQuestion 把一段 session 整理成 SKILL.md，问题与退出条件都写得明确。
 2. **多入口共用一份代码**：4 种入口走同一个 turn loop，只在 `entrypoints/` 层做协议适配。
 3. **autoMode classifier**：让 LLM 审用户写的 auto allow、soft_deny、env 分类规则，从 clarity、completeness、conflicts 三个角度评。
 4. **`/security-review` 当 senior security engineer**：LLM 跑 PR diff，5 类漏洞加 80% 置信度门槛，主动排除 DOS 和磁盘密钥这类问题。
 5. **MEMORY_DRIFT_CAVEAT 显式承认 stale**：prompt 里直接告诉模型记忆可能过时，要求先 grep 验证再用。
 
-## §4 · 短板
+## 闭源与隔离能力的限制
 
 1. **闭源**：所有结论基于 npm 包反编译，部分行为只能推断。
 2. **没有跨平台原生 sandbox**：依赖宿主 IDE 自己提供执行隔离。纯 CLI 模式下 sandbox 弱。
 3. **memory drift 靠 prompt 兜底**：相比 OpenClaw 的 temporal decay 加 retrieval，少了一层机制兜底。
 4. **trace 较弱**：没有 Codex 风格的 rollout-trace.jsonl 全 session 回放。
 
-## §5 · 5 件最值得借鉴的工程动作
+## 五段值得带走的设计
 
 1. **skillify 4 轮 AskUserQuestion 流程**（`src/skills/bundled/skillify.ts`）：R1 收 name 和 description，R2 收 step 和 arg，R3 拆解步骤，R4 抽 trigger。把「agent 自产 skill」拆成 4 个有边界的问题。
 2. **`/security-review` 命令的 prompt 设计**（`src/commands/security-review.ts`）：senior security engineer 角色加 5 类漏洞加排除清单。
@@ -52,7 +52,7 @@ Anthropic 出品的 agentic coding tool，以 npm 包 `@anthropic-ai/claude-code
 4. **autoMode classifier 让 LLM 审用户规则**（`src/cli/handlers/autoMode.ts`）：规则审计也变成 LLM 任务。
 5. **17 个 bundled skill 的边界感**：`loop`、`stuck`、`remember`、`verify` 都有明确退出条件，可以直接借鉴设计模式。
 
-## §6 · 源码地图
+## 解包材料从这里读
 
 <SourceTrail
   entries={[

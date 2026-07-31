@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## Execution state must be visible
 
 <Verdict tldr="The Todo List chapter already covers the current execution checklist. This chapter covers the routing layer around execution state. Mature harnesses do not keep one checklist and call it done. Codex keeps separate surfaces for natural-language progress updates, `update_plan`, Plan Mode `PlanDelta`, MCP tool progress notifications, and TUI terminal-title progress. Claude Code adds `hook_progress`, `tool_progress`, `task_started`, `task_progress`, OSC 9;4 terminal progress, and away summary on top of `TodoWrite` and Tasks V2. OpenClaw projects runtime events: `tool_call` / `tool_call_update`, child-session progress relay, and hidden-boundary summaries. Hermes treats `tool_progress` as display policy across CLI, gateway, and SSE with off / new / all / verbose modes. A serious agent needs an execution-state router: each update records its source, audience, lifetime, context-injection rule, dedupe rule, and no-progress detector." />
 
-## §2 · Surface Map
+## The execution-state surface map
 
-:::tip[Key takeaways · 30-second read]
+<details>
+<summary>Before reading (optional)</summary>
+
 - **One checklist is not enough**: mature harnesses route execution state through separate surfaces instead of one overloaded global plan.
 - **Four routing styles**: Codex separates `update_plan`, Plan Mode `PlanDelta`, MCP progress notifications, and terminal-title progress; Claude Code adds `hook_progress`, `task_progress`, and OSC 9;4 on top of `TodoWrite` and Tasks V2; OpenClaw projects `tool_call` / `tool_call_update` runtime events; Hermes treats `tool_progress` as display policy with off / new / all / verbose modes.
 - **Audience determines the route**: the same progress fact needs different handling for UI streams, prompt context, and resume hints.
 - **Build an execution-state router first**: each update must record its source, audience, lifetime, context-injection rule, dedupe rule, and a no-progress detector.
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/22-execution-state-surfaces-base.svg"
@@ -47,11 +50,13 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="Surface"
 />
 
-## §3 · Source-Grounded Implementation
+## How four systems project execution state
 
 ### Codex · prompt discipline, protocol events, terminal title
 
-Codex separates two kinds of progress in its base instructions. The first is a natural-language update for long tasks: briefly tell the user what has been explored and what comes next. The second is `update_plan`: a renderable checklist with one active step. These are related, but not interchangeable.
+Codex separates two kinds of progress in its base instructions. The first is a natural-language update for long tasks: briefly tell the user what has been explored and what comes next.
+
+The second is `update_plan`: a renderable checklist with one active step. These are related, but not interchangeable.
 
 <SourceBlock path="REF/codex/codex-rs/protocol/src/prompts/base_instructions/default.md" lines="52-60, 173-175, 267-275" system="codex" summary="Codex defines both natural-language progress updates and update_plan checklist discipline.">
 
@@ -65,7 +70,9 @@ There should always be exactly one `in_progress` step
 
 </SourceBlock>
 
-Codex also has a third progress channel: MCP tool progress. App-server v2 defines `McpToolCallProgressNotification` with `thread_id`, `turn_id`, `item_id`, and `message`, and maps it to `item/mcpToolCall/progress`. External MCP tools can report intermediate progress without waiting for the final tool result.
+Codex also has a third progress channel: MCP tool progress. App-server v2 defines `McpToolCallProgressNotification` with `thread_id`, `turn_id`, `item_id`, and `message`, and maps it to `item/mcpToolCall/progress`.
+
+External MCP tools can report intermediate progress without waiting for the final tool result.
 
 <SourceBlock path="REF/codex/codex-rs/app-server-protocol/src/protocol/v2/mcp.rs" lines="202-207" system="codex" summary="MCP tool progress is a first-class app-server v2 notification.">
 
@@ -99,23 +106,35 @@ subtype: z.literal('task_progress')
 
 The remote-session path treats these as background-task lifecycle messages: `task_started` registers remote work, `task_progress` can be skipped or folded by the UI, and `print.ts` flushes or drains those SDK events so background-agent progress is not lost behind final output.
 
-The terminal layer is separate again. `useTerminalNotification.ts` reports progress through OSC 9;4, `terminal.ts` checks terminal compatibility, and `supportedSettings.ts` exposes a user setting. That state belongs to terminal chrome, not transcript state.
+The terminal layer is separate again. `useTerminalNotification.ts` reports progress through OSC 9;4, `terminal.ts` checks terminal compatibility, and `supportedSettings.ts` exposes a user setting.
 
-The away summary is a different surface. After the terminal is blurred for five minutes, no turn is running, and no summary exists since the last user turn, Claude Code generates one to three short sentences from the recent conversation. It uses a small fast model, `querySource: 'away_summary'`, and `skipCacheWrite: true`, which makes it a UI resume card rather than long-term memory.
+That state belongs to terminal chrome, not transcript state.
+
+The away summary is a different surface. After the terminal is blurred for five minutes, no turn is running, and no summary exists since the last user turn, Claude Code generates one to three short sentences from the recent conversation.
+
+It uses a small fast model, `querySource: 'away_summary'`, and `skipCacheWrite: true`, which makes it a UI resume card rather than long-term memory.
 
 ### OpenClaw · event projection and hidden boundaries
 
-OpenClaw's progress layer is an ACP runtime event stream. The translator emits `tool_call` with `in_progress` when a tool starts and `tool_call_update` when it completes or fails. The auto-reply projector treats tool-call updates as hidden boundary tags by default and can edit a previous tool summary instead of flooding chat channels.
+OpenClaw's progress layer is an ACP runtime event stream. The translator emits `tool_call` with `in_progress` when a tool starts and `tool_call_update` when it completes or fails.
 
-Child-session relay is also an execution-state surface. A spawned child announces that progress will stream back to the parent session, then child snippets are emitted with a progress context prefix. This is fact propagation between sessions, not a model-maintained todo list.
+The auto-reply projector treats tool-call updates as hidden boundary tags by default and can edit a previous tool summary instead of flooding chat channels.
+
+Child-session relay is also an execution-state surface. A spawned child announces that progress will stream back to the parent session, then child snippets are emitted with a progress context prefix.
+
+This is fact propagation between sessions, not a model-maintained todo list.
 
 ### Hermes · display policy is per platform
 
-Hermes turns `tool_progress` into a product setting. CLI modes cycle through `off`, `new`, `all`, and `verbose`; `new` suppresses repeated adjacent tool names, while `verbose` shows full arguments and debugging detail. The gateway `/verbose` command cycles the same setting per platform and writes it to `display.platforms.<platform>.tool_progress`.
+Hermes turns `tool_progress` into a product setting. CLI modes cycle through `off`, `new`, `all`, and `verbose`; `new` suppresses repeated adjacent tool names, while `verbose` shows full arguments and debugging detail.
 
-Defaults differ by platform. CLI and API can tolerate more progress; chat platforms often need `new` or `off`; webhook defaults to quiet. API server streams tagged `("__tool_progress__", payload)` tuples into SSE queues. Progress density is a channel policy, not a global default.
+The gateway `/verbose` command cycles the same setting per platform and writes it to `display.platforms.<platform>.tool_progress`.
 
-## §4 · Shared Principles
+Defaults differ by platform. CLI and API can tolerate more progress; chat platforms often need `new` or `off`; webhook defaults to quiet. API server streams tagged `("__tool_progress__", payload)` tuples into SSE queues.
+
+Progress density is a channel policy, not a global default.
+
+## What state surfaces already agree on
 
 Every progress event needs a **source**. Model-authored todo, runtime tool fact, background task lifecycle, terminal chrome, and resume summary are not the same kind of truth.
 
@@ -123,9 +142,11 @@ Every surface needs an **audience**. Model context wants short and stable state;
 
 Every surface needs a **lifetime**. Approval plans expire after approval; todos expire after completion; tool progress belongs in event logs; task progress may persist across processes; away summaries expire on the next user turn.
 
-Progress display needs **dedupe and no-progress detection**. Hermes has `new` mode, OpenClaw can edit tool updates, and OpenClaw also detects tool loops and child sessions with no output. Without that layer, a progress UI can simply make a stuck system look busy.
+Progress display needs **dedupe and no-progress detection**. Hermes has `new` mode, OpenClaw can edit tool updates, and OpenClaw also detects tool loops and child sessions with no output.
 
-## §5 · Key Differences
+Without that layer, a progress UI can simply make a stuck system look busy.
+
+## Trade transparency against noise
 
 <TradeOff
   title="How to split execution state"
@@ -139,7 +160,7 @@ Progress display needs **dedupe and no-progress detection**. Hermes has `new` mo
   caption="Split surfaces by responsibility; give each one a source, audience, and expiration rule."
 />
 
-## §6 · Review
+## My take: show information the user can act on
 
 <ScoreCard
   rows={[
@@ -151,7 +172,7 @@ Progress display needs **dedupe and no-progress detection**. Hermes has `new` mo
   caption="Borrow Codex's boundaries first, then Hermes's display-density controls. Add Claude Code-style background task events when IDE or durable work requires them."
 />
 
-## §7 · Build Recipe
+## Start with a minimal state surface
 
 <BuildRecipe
   title="Execution State Router"
@@ -178,7 +199,7 @@ Progress display needs **dedupe and no-progress detection**. Hermes has `new` mo
   ]}
 />
 
-## §8 · Architecture Diagram
+## From event stream to interface
 
 <Diagram
   src="/diagrams/22-tradeoff.svg"
@@ -187,7 +208,7 @@ Progress display needs **dedupe and no-progress detection**. Hermes has `new` mo
   wide
 />
 
-## §9 · Source Index
+## Follow state events through source
 
 <SourceTrail
   entries={[
@@ -213,7 +234,12 @@ Progress display needs **dedupe and no-progress detection**. Hermes has `new` mo
   ]}
 />
 
-## §10 · Exercises
+## Appendix: exercises and review
+
+<details id="interview-drill">
+<summary>Open the exercises and ten review questions</summary>
+
+### Exercises
 
 1. Draw six state surfaces for an existing agent: approval plan, execution todo, tool progress, task progress, terminal/status, resume summary.
 2. Write a projection policy table: visible to user, log-only, model-context summary, expiration rule.
@@ -221,14 +247,16 @@ Progress display needs **dedupe and no-progress detection**. Hermes has `new` mo
 4. Simulate a user returning after five minutes away and generate a one-to-three sentence away summary.
 5. Add progress notification support to one external MCP tool and ensure the model sees only a summary, not raw progress spam.
 
-## §11 · Interview Drill: 10 Questions With Worked Answers
+### Review questions
 
 <details>
 <summary>**Q1 · Concept**: How is an execution-state surface different from a todo list?</summary>
 
 A todo list is one execution-state surface: the current execution focus. Execution-state surfaces also include approval plans, tool progress, background task progress, MCP progress, terminal status, and away summaries.
 
-The distinction is source and audience. A todo is usually model-maintained and may re-enter context. Tool progress comes from runtime facts and is primarily for UI or operators. Away summary helps a returning user, not the agent's task truth.
+The distinction is source and audience. A todo is usually model-maintained and may re-enter context. Tool progress comes from runtime facts and is primarily for UI or operators.
+
+Away summary helps a returning user, not the agent's task truth.
 </details>
 
 <details>
@@ -301,4 +329,6 @@ The prompt should carry stable continuation state, not UI noise.
 Start with `source`, `surface`, `audience`, `lifetime`, `thread_id`, `turn_id`, `item_id`, `message`, `status`, and optional `parent_id`.
 
 That is enough for UI projection, resume filtering, source-based audit, and parent/child task aggregation.
+</details>
+
 </details>

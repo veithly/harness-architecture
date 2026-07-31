@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## 写文件不是字符串替换
 
 <Verdict tldr="文件编辑是 coding agent 里唯一无法靠重试解决的副作用：代码改坏了「坏」状态已经写在磁盘上，不能像 shell 命令失败那样直接重跑。要回答四个问题：用什么格式表达改动、原子性怎么保证、写盘前做哪些校验、副作用怎么传播给 IDE 和 reviewer。四家分两大流派。Codex 自造 V4A patch DSL：让模型在 assistant message 里 inline 输出整段 patch（不走 function call 参数），Rust 端用 Lark 语法解析（5 类 marker：Begin Patch、End Patch、Update File、Add File、Delete File、Move File），一段 patch 可同时包含多文件多操作，全部成功或全部回滚。这种设计避开 function call 的 JSON token 限制，一次提交几千行 diff 是常态。Claude Code 走相反路线，FileEditTool 只接受 3 个参数（file_path、old_string、new_string、加一个 replace_all 布尔），每次只改一个字符串，模型必须先 Read 文件再 Edit（拿到唯一匹配的 old_string），写前比对 mtime 防 race（其他进程刚改过的文件会触发 FILE_UNEXPECTEDLY_MODIFIED_ERROR）。reviewer 体验最好，但模型做大改动得连发好几个 Edit 调用，token 烧得快。OpenClaw 不为 coding 造 DSL：它是 agent 控制面 coding 只是众多 workload 之一，fs 类目只挂常规 read、write 工具，约束全靠 tool-fs-policy 一个 workspaceOnly 布尔。代价是没有原子多文件语义。Hermes 复用 Codex V4A 做跨生态兼容：在 tools/patch_parser.py 里用 Python 重新实现一遍，docstring 坦白写明跟 codex、cline 兼容，跟 Codex 的差异是把整段 patch 当 function call 参数传（不是 inline DSL），简化协议但撞回 token 上限。选型决定模型一轮能改多大、出错怎么回滚、外部 reviewer 能不能审。" />
 
-## §2 · 文件编辑 4 件套对照
+## 文件编辑需要的四个部件
 
-:::tip[本章重点 · 30 秒速读]
+<details>
+<summary>读前提示（按需展开）</summary>
+
 - **文件编辑是唯一无法靠重试解决的副作用**：改坏了「坏」状态已经写在磁盘上，不能像 shell 失败那样直接重跑。
 - **两大流派分歧最大**：Codex 用 V4A 内嵌 patch DSL 一次原子提交几千行 diff，Claude Code 的 FileEditTool 三参数一次只改一处，Hermes 复用 V4A 但走 function call 参数撞回 token 上限。
 - **编辑格式决定一轮能改多大、出错怎么回滚、reviewer 能不能审**。
 - **自己动手第一优先**：先做写盘前校验——patch 解析失败全部 reject，mtime 变了抛 FILE_UNEXPECTEDLY_MODIFIED_ERROR 防 race。
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/06-file-edit-patch-base.svg"
@@ -47,13 +50,17 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## §3 · 四家怎么实现文件编辑
+## 四套系统怎样修改文件
 
 ### Codex · 设计专用 patch DSL V4A，模型 inline 输出整段 patch
 
-Codex 在文件编辑这件事上的核心判断是：模型擅长生成 unified diff（GitHub、GitLab 上的 PR diff 就是这种格式，模型训练时见过几百万个），但 git 标准的 unified diff 有几个跟 agent 场景不太搭的特性。它需要精确的行号加行数（context 前 5 行、后 5 行），模型生成时容易算错。它没法在一个 diff 里表达「移动文件」这种语义（要拆成 Delete 加 Add）。它假设 reviewer 跟 patch 作者在同一个 git 版本（要 fuzz match 处理偏移）。所以 Codex 决定自己造一套专门为 agent 优化的 patch DSL，叫 V4A（V 是 version，A 可能是 apply 或 agent），保留 unified diff 的可读性但去掉那些 agent 容易写错的地方，同时加上文件级语义（添加、删除、移动）。
+Codex 在文件编辑这件事上的出发点是：模型擅长生成 unified diff（GitHub、GitLab 上的 PR diff 就是这种格式，模型训练时见过几百万个），但 git 标准的 unified diff 有几个跟 agent 场景不太搭的特性。它需要精确的行号加行数（context 前 5 行、后 5 行），模型生成时容易算错。它没法在一个 diff 里表达「移动文件」这种语义（要拆成 Delete 加 Add）。
 
-V4A 不走 function call JSON 参数，而是让模型在 assistant message 里直接 inline 输出整段 patch（用特殊的 marker 标记 patch 开始结束），Codex 的 message parser 看到 marker 就截取整段交给 apply-patch crate 处理。这种「让模型把 patch 写在对话里而不是参数里」的设计避开了 function call JSON 的 token 限制（function args 通常有 8K-16K 限制，inline 输出能到 100K 以上），所以一次提交几千行 diff 是常态。Rust 端的 apply-patch crate 用 Lark 语法（一种类似 EBNF 的 parser generator 语言）定义 V4A 的完整 grammar：
+它假设 reviewer 跟 patch 作者在同一个 git 版本（要 fuzz match 处理偏移）。所以 Codex 决定自己造一套专门为 agent 优化的 patch DSL，叫 V4A（V 是 version，A 可能是 apply 或 agent），保留 unified diff 的可读性但去掉那些 agent 容易写错的地方，同时加上文件级语义（添加、删除、移动）。
+
+V4A 不走 function call JSON 参数，而是让模型在 assistant message 里直接 inline 输出整段 patch（用特殊的 marker 标记 patch 开始结束），Codex 的 message parser 看到 marker 就截取整段交给 apply-patch crate 处理。
+
+这种「让模型把 patch 写在对话里而不是参数里」的设计避开了 function call JSON 的 token 限制（function args 通常有 8K-16K 限制，inline 输出能到 100K 以上），所以一次提交几千行 diff 是常态。Rust 端的 apply-patch crate 用 Lark 语法（一种类似 EBNF 的 parser generator 语言）定义 V4A 的完整 grammar：
 
 <SourceBlock path="REF/codex/codex-rs/apply-patch/src/parser.rs" lines="1-22" system="codex" summary="V4A 格式的 Lark 语法定义">
 
@@ -80,9 +87,17 @@ V4A 不走 function call JSON 参数，而是让模型在 assistant message 里�
 
 </SourceBlock>
 
-读这段 grammar 可以看出 V4A 的几个关键设计。整段 patch 用 `*** Begin Patch` 和 `*** End Patch` 包裹，这样 parser 可以从 assistant message 的任意位置截取整段（即使模型在 patch 前后写了解释文字也不影响解析）。hunk 分三类：add_hunk（创建新文件，每行加号开头）、delete_hunk（删除整个文件，只需要一行 `*** Delete File:`）、update_hunk（修改现有文件，可选 change_move 表示重命名加一个 change block 包含改动内容）。最关键的是 change block 的格式跟 unified diff 几乎一样（`+` 加号开头表示新增、`-` 减号开头表示删除、空格开头表示 context），但去掉了行号和行数（让 parser 自己根据 context 行去定位，不要模型算行号）。`change_context` 用 `@@ 函数名 @@` 这种锚点提示帮助 parser 在文件里定位（如果 context 行太短可能误匹配多处）。`eof_line` 是 `*** End of File` 标志，让 parser 知道改动延伸到文件末尾。
+读这段 grammar 可以看出 V4A 的几个关键设计。整段 patch 用 `*** Begin Patch` 和 `*** End Patch` 包裹，这样 parser 可以从 assistant message 的任意位置截取整段（即使模型在 patch 前后写了解释文字也不影响解析）。
 
-V4A 设计有三个工程上的重要好处。第一是避开 function arguments 大小限制：一次提交几千行 diff 是 coding agent 的常态（重构一个模块、升级依赖、批量重命名），如果走 function call 几行就撞 token 限制，模型只能分多次提交破坏原子性。inline 输出能写到对话上下文容量限制（几十万 token）。第二是多文件原子提交：一段 patch 可以同时包含 Update、Add、Delete、Move 任意组合，apply-patch crate 解析时如果任何一个 hunk 失败整段拒绝（不写盘），保证「要么全部改了要么一行都没改」的事务语义。第三是 patch 文本本身就是可读的 diff：rollout 落盘时直接存原 patch 文本，replay 时一字不改重放，审计 reviewer 可以像看 PR diff 一样审 agent 的所有改动。
+hunk 分三类：add_hunk（创建新文件，每行加号开头）、delete_hunk（删除整个文件，只需要一行 `*** Delete File:`）、update_hunk（修改现有文件，可选 change_move 表示重命名加一个 change block 包含改动内容）。
+
+最关键的是 change block 的格式跟 unified diff 几乎一样（`+` 加号开头表示新增、`-` 减号开头表示删除、空格开头表示 context），但去掉了行号和行数（让 parser 自己根据 context 行去定位，不要模型算行号）。`change_context` 用 `@@ 函数名 @@` 这种锚点提示帮助 parser 在文件里定位（如果 context 行太短可能误匹配多处）。
+
+`eof_line` 是 `*** End of File` 标志，让 parser 知道改动延伸到文件末尾。
+
+V4A 设计有三个工程上的重要好处。第一是避开 function arguments 大小限制：一次提交几千行 diff 是 coding agent 的常态（重构一个模块、升级依赖、批量重命名），如果走 function call 几行就撞 token 限制，模型只能分多次提交破坏原子性。inline 输出能写到对话上下文容量限制（几十万 token）。
+
+第二是多文件原子提交：一段 patch 可以同时包含 Update、Add、Delete、Move 任意组合，apply-patch crate 解析时如果任何一个 hunk 失败整段拒绝（不写盘），保证「要么全部改了要么一行都没改」的事务语义。第三是 patch 文本本身就是可读的 diff：rollout 落盘时直接存原 patch 文本，replay 时一字不改重放，审计 reviewer 可以像看 PR diff 一样审 agent 的所有改动。
 
 代价当然是模型必须学会这套 DSL。Codex 在 system prompt 里专门教 V4A 格式（给几个例子让模型 in-context learning），但即使如此 gpt-4.1 偶尔还是会写错格式（少打个空格、少打个 `@@` 锚点），所以 Codex 还在 parser 里加了 `ParseMode::Lenient` 容错模式（gpt-4.1 之外的模型用严格模式），常见的格式错误（多余空格、缺失锚点）会被 parser 主动修复。
 
@@ -109,9 +124,17 @@ inputSchema: z.object({
 
 </SourceBlock>
 
-这种「最少三个参数」的设计有几个细致的工程考虑。`old_string` 必须在文件中**唯一匹配**：如果文件中出现多次相同字符串而 replace_all 是 false，工具会拒绝执行让模型补充更多 context 让 old_string 唯一。这迫使模型在 Edit 前先 Read 文件、看清楚上下文（多个相同字符串通常意味着模型对文件结构理解不够）。如果用户想批量替换（比如重命名一个变量名 across the whole file），可以传 replace_all=true 一次替换所有出现。`new_string` 必须跟 `old_string` 不同（用 zod schema 在 describe 里明确说），否则操作没有意义。写盘前还有一个隐藏的关键校验：比对文件的 mtime（modification time），如果发现读取文件后 mtime 变了说明其他进程（用户在 IDE 里手动编辑、git pull、其他 agent）刚改过这个文件，FileEditTool 会拒绝写入并抛出 `FILE_UNEXPECTEDLY_MODIFIED_ERROR`，迫使模型重新 Read 文件再 Edit。这个机制防止「模型基于过期内容做改动覆盖别人刚写的东西」的灾难性 race condition。
+这种「最少三个参数」的设计有几个细致的工程考虑。`old_string` 必须在文件中**唯一匹配**：如果文件中出现多次相同字符串而 replace_all 是 false，工具会拒绝执行让模型补充更多 context 让 old_string 唯一。这迫使模型在 Edit 前先 Read 文件、看清楚上下文（多个相同字符串通常意味着模型对文件结构理解不够）。
 
-每次 FileEdit 调用还要穿过 Claude Code 整套副作用网络：LSP diagnostics 失效（`clearDeliveredDiagnosticsForFile()` 通知 LSP 重新分析这个文件的语法、类型、lint）。文件历史追踪（`fileHistoryTrackEdit()` 把每次改动写入 session 的历史记录里，用户可以用 `/diff` 命令查看所有 agent 改过什么）。VS Code SDK 通知（`notifyVscodeFileUpdated()` 让 VS Code 编辑器立刻刷新打开的 tab，用户看到最新内容）。权限校验（`checkWritePermissionForTool()` 走整套 permission mode 体系，acceptEdits、plan、bypassPermissions、default 各模式下行为不同）。这种每次 edit 都触发完整副作用网络让 IDE 体验很顺滑：agent 改了文件，VS Code 立刻刷新、LSP 立刻重新分析、错误提示立刻更新。代价是每次 edit 都有这些 overhead。
+如果用户想批量替换（比如重命名一个变量名 across the whole file），可以传 replace_all=true 一次替换所有出现。`new_string` 必须跟 `old_string` 不同（用 zod schema 在 describe 里明确说），否则操作没有意义。
+
+写盘前还有一个隐藏的关键校验：比对文件的 mtime（modification time），如果发现读取文件后 mtime 变了说明其他进程（用户在 IDE 里手动编辑、git pull、其他 agent）刚改过这个文件，FileEditTool 会拒绝写入并抛出 `FILE_UNEXPECTEDLY_MODIFIED_ERROR`，迫使模型重新 Read 文件再 Edit。这个机制防止「模型基于过期内容做改动覆盖别人刚写的东西」的灾难性 race condition。
+
+每次 FileEdit 调用还要穿过 Claude Code 整套副作用网络：LSP diagnostics 失效（`clearDeliveredDiagnosticsForFile()` 通知 LSP 重新分析这个文件的语法、类型、lint）。文件历史追踪（`fileHistoryTrackEdit()` 把每次改动写入 session 的历史记录里，用户可以用 `/diff` 命令查看所有 agent 改过什么）。
+
+VS Code SDK 通知（`notifyVscodeFileUpdated()` 让 VS Code 编辑器立刻刷新打开的 tab，用户看到最新内容）。权限校验（`checkWritePermissionForTool()` 走整套 permission mode 体系，acceptEdits、plan、bypassPermissions、default 各模式下行为不同）。
+
+这种每次 edit 都触发完整副作用网络让 IDE 体验很顺滑：agent 改了文件，VS Code 立刻刷新、LSP 立刻重新分析、错误提示立刻更新。代价是每次 edit 都有这些 overhead。
 
 代价当然是 token 烧得快：一次只能改一处，模型要做大改动得连发好几个 Edit 调用，每次 Edit 的工具调用上下文都重复传一遍（file_path、old_string、new_string）。Claude Code 2.1.88 这个版本里没看到 MultiEdit 工具，历史版本有过的批量 edit 工具被合并掉了。团队应该是判断 MultiEdit 容易让模型一次塞太多改动用户审不过来、reviewer 体验变差，宁愿要 Edit 多调几次。
 
@@ -144,13 +167,19 @@ export function resolveEffectiveToolFsWorkspaceOnly(params: {
 
 </SourceBlock>
 
-workspaceOnly: true 时，任何越出 session 工作区目录的路径都会被拒。这个策略由 plugin pipeline 在 before_tool_call 钩子里拦截执行（详见第 04 章 §3）：具体逻辑是把 args.path 跟 session.workspaceDir 做 resolve 后比对，如果不是 workspaceDir 的子路径就直接拒绝调用、把错误塞回 tool_result 让模型自己理解。这个一个布尔字段的设计极简但实用，企业部署时管理员只要把 workspaceOnly 设为 true 就锁死了 agent 的文件操作范围，不需要写复杂的策略文件。
+workspaceOnly: true 时，任何越出 session 工作区目录的路径都会被拒。这个策略由 plugin pipeline 在 before_tool_call 钩子里拦截执行（详见[工具系统](/patterns/04-tool-system/)）：具体逻辑是把 args.path 跟 session.workspaceDir 做 resolve 后比对，如果不是 workspaceDir 的子路径就直接拒绝调用、把错误塞回 tool_result 让模型自己理解。
 
-设计取舍上有几个值得讨论的点。OpenClaw 不绑定 coding 场景所以不为编辑造 DSL 是合理的，但代价是：没有原子多文件提交语义（模型要改多个文件得发多次 fs.write 调用，如果第 3 次失败前 2 次已经写盘了，需要 plugin 用户自己写补偿逻辑兜底）。没有 str_replace 那种「写前比对 mtime」的 race condition 防护（fs.write 永远直接覆盖，模型如果基于过期内容写文件可能覆盖别人刚改的内容）。没有 LSP 联动、文件历史、IDE 通知这些副作用网络（OpenClaw 不假设 agent 跑在 IDE 里，所以也不内建这些）。OpenClaw 用户如果要做 coding agent，要么自己写 V4A 风格的 patch 工具挂到 fs 类目下，要么用 OpenClaw 的 plugin 机制叠加 lint、format、atomic write 等 hook 来补足这些能力。
+这个一个布尔字段的设计极简但实用，企业部署时管理员只要把 workspaceOnly 设为 true 就锁死了 agent 的文件操作范围，不需要写复杂的策略文件。
+
+设计取舍上有几个值得讨论的点。OpenClaw 不绑定 coding 场景所以不为编辑造 DSL 是合理的，但代价是：没有原子多文件提交语义（模型要改多个文件得发多次 fs.write 调用，如果第 3 次失败前 2 次已经写盘了，需要 plugin 用户自己写补偿逻辑兜底）。没有 str_replace 那种「写前比对 mtime」的 race condition 防护（fs.write 永远直接覆盖，模型如果基于过期内容写文件可能覆盖别人刚改的内容）。
+
+没有 LSP 联动、文件历史、IDE 通知这些副作用网络（OpenClaw 不假设 agent 跑在 IDE 里，所以也不内建这些）。OpenClaw 用户如果要做 coding agent，要么自己写 V4A 风格的 patch 工具挂到 fs 类目下，要么用 OpenClaw 的 plugin 机制叠加 lint、format、atomic write 等 hook 来补足这些能力。
 
 ### Hermes · 复用 Codex V4A 做跨生态兼容，Python 端重写一遍
 
-Hermes 在文件编辑上做出了一个很务实的判断：既然 Codex 已经把 V4A 这套 patch DSL 做出来了、模型在 Codex 训练数据里已经见过这种格式、cline 等其他 coding agent 也开始用类似格式，那 Hermes 就没必要重新造一套 DSL，直接复用 V4A 让 Hermes 用户跟其他生态无缝迁移。Hermes 在 tools/patch_parser.py 里用 Python 重新实现一遍 V4A 解析（Hermes 是 Python 生态，不能直接调用 Codex 的 Rust crate），并在 docstring 里坦白写明这是个跨生态兼容的决定：
+Hermes 在文件编辑上做出了一个很务实的判断：既然 Codex 已经把 V4A 这套 patch DSL 做出来了、模型在 Codex 训练数据里已经见过这种格式、cline 等其他 coding agent 也开始用类似格式，那 Hermes 就没必要重新造一套 DSL，直接复用 V4A 让 Hermes 用户跟其他生态无缝迁移。
+
+Hermes 在 tools/patch_parser.py 里用 Python 重新实现一遍 V4A 解析（Hermes 是 Python 生态，不能直接调用 Codex 的 Rust crate），并在 docstring 里坦白写明这是个跨生态兼容的决定：
 
 <SourceBlock path="REF/hermes-agent/tools/patch_parser.py" lines="1-29" system="hermes" summary="patch_parser.py 明确说复用 V4A 跨生态格式">
 
@@ -178,13 +207,17 @@ V4A Format:
 
 </SourceBlock>
 
-这段 docstring 直接列出 V4A 格式的所有 marker（Begin Patch、End Patch、Update File、Add File、Delete File、Move File 等等），跟 Codex 完全一致。Hermes 选 V4A 而不是自己造一套有两个具体理由。第一是模型已经会：Claude、GPT 训练数据里见过这种 V4A diff（Codex 公开了不少例子），再加几行 system prompt 就能稳定输出，不用做大量 in-context learning 示例。第二是跨生态可移植：用户从 codex 或 cline 转到 Hermes 不用重新教 agent，从 Hermes 生成的 patch 也能贴回 codex 用，整个 coding agent 生态共享一套 patch 格式比每家造一套孤立的格式好得多。
+这段 docstring 直接列出 V4A 格式的所有 marker（Begin Patch、End Patch、Update File、Add File、Delete File、Move File 等等），跟 Codex 完全一致。Hermes 选 V4A 而不是自己造一套有两个具体理由。
 
-跟 Codex 的实现有一个关键差异：Hermes 的 patch tool 还是一个普通的 function call（patch 字符串作为参数 args 传入），不是 inline DSL。模型把整段 patch 当作字符串塞进 tool 参数。这种选择简化了 Python 端的协议处理（不需要做 inline 输出的 message parsing），但又撞回了 function call JSON token 上限的老问题：一次能传的 patch 大小受 function args 大小限制约束（OpenAI、Anthropic 的 function args 通常 8-16K token 上限），所以 Hermes 在「单次 tool call 改多大」上不如 Codex 灵活。
+第一是模型已经会：Claude、GPT 训练数据里见过这种 V4A diff（Codex 公开了不少例子），再加几行 system prompt 就能稳定输出，不用做大量 in-context learning 示例。第二是跨生态可移植：用户从 codex 或 cline 转到 Hermes 不用重新教 agent，从 Hermes 生成的 patch 也能贴回 codex 用，整个 coding agent 生态共享一套 patch 格式比每家造一套孤立的格式好得多。
+
+跟 Codex 的实现有一个关键差异：Hermes 的 patch tool 还是一个普通的 function call（patch 字符串作为参数 args 传入），不是 inline DSL。模型把整段 patch 当作字符串塞进 tool 参数。
+
+这种选择简化了 Python 端的协议处理（不需要做 inline 输出的 message parsing），但又撞回了 function call JSON token 上限的老问题：一次能传的 patch 大小受 function args 大小限制约束（OpenAI、Anthropic 的 function args 通常 8-16K token 上限），所以 Hermes 在「单次 tool call 改多大」上不如 Codex 灵活。
 
 跟 OpenClaw 也有一个关键差异：Hermes 把 V4A patch 当作 atomic tool 处理（解析整段 patch、要全部应用要全部失败），所以保留了多文件原子提交的语义。不像 OpenClaw 让 agent 自己用多次 fs.write 拼。这让 Hermes 在「文件编辑可靠性」上比 OpenClaw 更接近 Codex、Claude Code 的水平。
 
-## §4 · 四家共有的 4 条文件编辑工程底线
+## 文件编辑已经形成的共识
 
 虽然四家在文件编辑的工程深度上差距巨大（Codex 定制 DSL 对比 OpenClaw 没有专用编辑工具），但只要做文件编辑，四件事是共识。
 
@@ -196,7 +229,7 @@ V4A Format:
 
 **最后，diff 是反馈格式**：四家最终都把改动以 diff 形式回给模型跟用户看。Codex 在 tool_result 里返回 unified diff 让模型自己 verify 改对没。Claude Code 的 fileHistory 系统提供 /diff 命令让用户看 agent 改了什么。Hermes 跟 OpenClaw 也都在 tool_result 里返回 diff。这种 diff 作为公共反馈语言的设计让 reviewer（人类或另一个 agent）可以用统一格式审所有改动，不需要为不同 agent 学不同输出格式。
 
-## §5 · 关键分歧 · 按场景选型
+## Patch DSL 与原子编辑怎么选
 
 <Diagram
   src="/diagrams/06-tradeoff.svg"
@@ -214,7 +247,7 @@ V4A Format:
 
 **想做一个跟现有 coding agent 生态兼容的 agent**（用户可以无缝从 codex、cline、Hermes 之间迁移）：Hermes 的方案是参考。复用 V4A 标准（不要造新 DSL），把整段 patch 当 function call 参数传（简化协议处理）。代价是撞 token 限制（function args 容量有限）。
 
-## §6 · 我的点评
+## 我的判断：先保证能失败得干净
 
 <ScoreCard
   rows={[
@@ -227,7 +260,7 @@ V4A Format:
   headers={['系统', '评分', '亮点', '风险']}
 />
 
-## §7 · 自己实现文件编辑系统的最佳实践
+## 从最小编辑器开始
 
 下面是从四家提炼的自己写文件编辑工具配方。先把基础三件套打牢，再加生产级特性，最后避开四个常见死路。
 
@@ -253,7 +286,7 @@ V4A Format:
   ]}
 />
 
-## §8 · 两条路线流程图
+## 两条编辑路线怎样分叉
 
 <Diagram
   src="/diagrams/06-edit-roads.svg"
@@ -263,7 +296,7 @@ V4A Format:
 
 把这两条路线放一起看就知道：V4A 让模型一次说完所有改动，Lark parser 当门神。str_replace 让模型每次只改最小单元，唯一匹配加 mtime 当门神。两边都不让模型盲改，但路径完全不同。
 
-## §9 · 延伸阅读 · 源码入口
+## 沿着 patch 入口读源码
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -275,20 +308,25 @@ V4A Format:
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/tools/FileEditTool/types.ts', lines: '1-30', desc: 'inputSchema: old_string / new_string / replace_all' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/tools/FileEditTool/utils.ts', desc: 'findActualString + preserveQuoteStyle' },
     { system: 'OpenClaw', path: 'REF/openclaw/src/agents/tool-fs-policy.ts', lines: '1-32', desc: 'tool-fs-policy 全部代码（一个 boolean）' },
-    { system: 'OpenClaw', path: 'REF/openclaw/src/agents/tool-catalog.ts', desc: 'fs 类目下的工具枚举（详见 04 章 §3）' },
+    { system: 'OpenClaw', path: 'REF/openclaw/src/agents/tool-catalog.ts', desc: 'fs 类目下的工具枚举（工具系统章有完整上下文）' },
     { system: 'Hermes', path: 'REF/hermes-agent/tools/patch_parser.py', lines: '1-100', desc: 'V4A Python parser 实现 + 容错' },
     { system: 'Hermes', path: 'REF/hermes-agent/tools/file_tools.py', desc: 'read_file / write_file / patch 工具入口' },
   ]}
 />
 
-## §10 · 小练习
+## 附录：练习与复盘
+
+<details id="interview-drill">
+<summary>按需展开练习和十道复盘题</summary>
+
+### 练习
 
 1. **实现一个 str_replace 工具（简单）**：参数 `file_path`、`old_string`、`new_string`。强制 `old_string` 在文件里**唯一匹配**，否则报错。返回 diff。
 2. **V4A parser（中等）**：用你熟悉的语言实现 V4A patch 的最小子集（只支持 `*** Update File` 加 add、delete、context 行）。验证：你的 parser 能正确处理 `apply-patch/tests/suite/scenarios.rs` 里至少一条 case。
 3. **mtime 校验（中等）**：在 1 的基础上加 mtime 校验。模拟两个进程同时改一个文件，验证第二次能拿到 `FILE_UNEXPECTEDLY_MODIFIED_ERROR`。
 4. **跨系统兼容（高难）**：把你写的 V4A parser 拿去解析 Codex 的 test patch（`apply-patch/tests/`）和 Hermes 的 patch_parser 测试输入。哪些 case 行为不一致？
 
-## §11 · 面试题：10 道带答案的高频考点
+### 复盘题
 
 <details>
 <summary>**Q1 · 概念**：V4A 这种「内嵌 DSL」和普通 function call 形式的工具，本质区别是什么？</summary>
@@ -661,6 +699,8 @@ await editor.bulkPatch({ patch: '*** Begin Patch ...' });
 
 工程量：约 3-5 周一人完成加 1 周写 docs、tests。比从头写 Codex 全栈轻很多。
 
-**源码定位**：综合参考所有四家在 §3 的实现。
+**源码定位**：综合参考本章四套系统的实现。
 **追问**：「这个协议能跨语言吗？」能。core API 设计成 protocol-style（输入输出 JSON schema），Python、TS、Rust 各自实现一份。V4A 是文本，Lark grammar 跨语言可移植。
+</details>
+
 </details>

@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## 什么时候值得拆 Subagent
 
 <Verdict tldr="子 agent（subagent，由当前 agent 主动 spawn 出来跑另一段任务的进程级或 thread 级子 session）是 agent 工程里看似简单实则危险的功能：表面上「让一个 agent 派另一个 agent 干活」听起来很合理，但只要做过就知道几乎每一种灾难都会冒出来。子 agent 又调用自己变成无限递归把 token 烧光、子 agent 拿到父 agent 没有的工具权限造成提权、子 agent 走自己的 approval 流程让用户在多个弹窗里晕头转向、子 agent 把回复跨平台发出去造成消息重复、子 agent 写父 agent 的长期记忆造成状态污染。所以这一章真正要回答的是「面对这些危险，框架要做哪些硬性边界」。四家的做法差异极大。Codex 走的是「类型化每一种子 agent 用途」路线：它把所有 spawn 子 agent 的入口都强制带一个 SubAgentSource 枚举（Rust 的代数数据类型，调用时必须填一个具体的变体而不能省略），明确告诉系统这是什么用途的子 agent（用户主动触发的 Review、上下文压缩的 Compact、用户配置的 ThreadSpawn 模板、后台记忆固化的 MemoryConsolidation、插件实验性场景的 Other），不同 source 走不同的 prompt、权限、telemetry 路径。最关键的工程纪律是子 agent 必须继承父 session 的 7 类核心 service（exec_policy 权限策略、plugins 插件管理器、mcp_manager MCP 服务器管理器、skills_manager 技能管理器、environment_manager 环境变量管理器、agent_control agent 控制台等），永远不可能比父更宽松，没有「开子 agent 绕过 execpolicy」的逃生通道。approval 也强制路由回父 session，子 agent 永远不弹 UI。Claude Code 走的是「把子 agent 跟所有其他异步执行统一抽象」路线：它定义了一个叫 Task 的通用抽象（把所有「后台跑一段时间才出结果」的事情都归到这一个抽象下），TaskType 枚举有 7 种（local_bash 跑 shell 命令、local_agent 跑本地子 agent、remote_agent 跑远程 agent、in_process_teammate 跑同进程伙伴、local_workflow 跑工作流、monitor_mcp 监控 MCP、dream 后台预热），TaskStatus 是一个清晰的状态机（pending 排队、running 跑中、completed 正常完成、failed 失败、killed 被父杀掉），并且每个工具自报 isConcurrencySafe()（工具实例上的 boolean 方法，dispatch 层据此判断能否跟同一 turn 的其他工具并发跑）让 dispatch 层决定能不能跟同一 turn 的其他工具并发跑。OpenClaw 做了最完整的 subagent 平台：一个 subagent 子系统就有 6 个文件（spawn 负责创建、registry 负责注册、depth 负责追踪深度、announce 负责完成通知、attachments 负责附件传递、lifecycle-events 负责生命周期事件），SpawnSubagentParams 有 13 个配置字段（task、label、agentId、model、thinking、runTimeoutSeconds、mode、cleanup、sandbox、expectsCompletionMessage、attachments、attachMountPath、thread），最特别的是它把「不要 poll，等 push event」这条反模式硬写进了 spawn tool 的返回值文本里，让模型读到这段警告，工程上彻底解决子 agent 模式下模型疯狂 poll 浪费 token 的问题。Hermes 走的是「函数式加硬禁 5 工具」最克制路线：只有一个 delegate_task 函数（参数是 goal 任务目标、context 背景信息、toolset 子 agent 可用工具白名单、max_iterations 子 agent 最大迭代次数），但把核心安全约束全部写死：MAX_DEPTH=2 是硬编码常量（parent 0 走 child 1 走 grandchild 直接 reject）、5 个工具硬禁递归 spawn（delegate_task、clarify 反问用户、memory 写长期记忆、send_message 跨通道发消息、execute_code 跑代码这 5 个子 agent 永远拿不到），父进程用 ThreadPoolExecutor（Python 标准库的线程池执行器）同步阻塞等所有子完成，每 30 秒发一次 heartbeat（心跳事件，告诉外层观察者「我还活着」）让 UI 知道还在跑。要做编排框架参考 OpenClaw、要做 agent 类型已经清楚的产品参考 Codex、要把异步执行统一管参考 Claude Code、要做最简单可靠的派活机制参考 Hermes。" />
 
-## §2 · Subagent 4 档抽象对照
+## 四种委派抽象
 
-:::tip[本章重点 · 30 秒速读]
+<details>
+<summary>读前提示（按需展开）</summary>
+
 - **核心认知**：子 agent 看似简单实则危险：无限递归烧 token、工具提权、审批混乱、消息重复、状态污染，框架必须画硬性边界。
 - **分歧最大点**：Codex 用 SubAgentSource 枚举类型化 5 种用途、Claude Code 用 TaskType 7 种统一所有异步执行、OpenClaw 的 SpawnSubagentParams 有 13 个配置字段、Hermes 只有 delegate_task 一个函数加 MAX_DEPTH=2 硬编码。
 - **工程判断**：继承策略决定安全下限：子 agent 强制继承父 session 的 exec_policy 等 7 类 service，永远不能比父更宽松。
 - **动手要点**：第一优先是防递归：depth 限制加硬禁子 agent 拿 spawn 类工具（Hermes 硬禁 delegate_task、clarify、memory、send_message、execute_code 5 个）。
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/10-subagents-base.svg"
@@ -47,11 +50,13 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## §3 · 四家怎么实现 Subagents
+## 四套系统怎样派出子 Agent
 
 ### Codex · 把「开子 agent」拆成 5 种类型化来源，每种走不同的权限和 prompt 路径
 
-Codex 在子 agent 这件事上的核心判断是：「开子 agent」不应该是一个无差别的函数调用，而应该是一组带语义的具体行为。同样是 spawn 一个子 agent，用户主动 /review 让模型审查代码、上下文超长触发摘要压缩、用户调用自己配的 ThreadSpawn 模板、系统周期性触发记忆固化，这四种场景的 prompt 不同、可用工具不同、用户期待的输出形态不同、是否要展示在 UI 上不同、telemetry 维度也不同。如果把它们都塞进一个通用 spawn 函数，调用方就得在每次调用前把这些差异手动配齐，调用点散落各处必然走样。
+Codex 在子 agent 这件事上的出发点是：「开子 agent」不应该是一个无差别的函数调用，而应该是一组带语义的具体行为。同样是 spawn 一个子 agent，用户主动 /review 让模型审查代码、上下文超长触发摘要压缩、用户调用自己配的 ThreadSpawn 模板、系统周期性触发记忆固化，这四种场景的 prompt 不同、可用工具不同、用户期待的输出形态不同、是否要展示在 UI 上不同、telemetry 维度也不同。
+
+如果把它们都塞进一个通用 spawn 函数，调用方就得在每次调用前把这些差异手动配齐，调用点散落各处必然走样。
 
 所以 Codex 强制每次 spawn 必须带一个 SubAgentSource 枚举值，明确告诉系统这是什么用途的子 agent：
 
@@ -81,9 +86,15 @@ pub enum SubAgentSource {
 
 </SourceBlock>
 
-这 5 种来源各自的语义和约束完全不同。`Review` 对应用户在对话里输入 /review 让 agent 审查代码的场景，子 agent 走 review 专用 system prompt 并禁用一批 feature（详见第 09 章），输出是结构化的代码审查报告。`Compact` 对应上下文超出 token 限制时系统自动触发的压缩场景，子 agent 接收的是父对话的全部历史，输出是「保留语义但更短的摘要」，详见第 11 章会话生命周期。`ThreadSpawn` 是用户自己定义的子 agent 模板，可以通过 agent_role 和 agent_nickname 自由编排（比如「定义一个叫 testwriter 的 agent，专门负责给我的代码补测试」），并且这个变体里带了 depth 字段，让框架可以追踪「当前调用链已经多深了」并在超出配置限制时拒绝继续 spawn。`MemoryConsolidation` 是周期性触发的记忆固化任务，子 agent 在后台跑，把对话历史里值得长期保留的洞察提炼成 memory 条目（详见第 16 章）。`Other(String)` 是兜底，为插件和实验性场景留口子，但要求显式传字符串说明用途，「无名 spawn」是被禁止的。
+这 5 种来源各自的语义和约束完全不同。`Review` 对应用户在对话里输入 /review 让 agent 审查代码的场景，子 agent 走 review 专用 system prompt 并禁用一批 feature（详见第 09 章），输出是结构化的代码审查报告。`Compact` 对应上下文超出 token 限制时系统自动触发的压缩场景，子 agent 接收的是父对话的全部历史，输出是「保留语义但更短的摘要」，详见第 11 章会话生命周期。
 
-把这 5 种类型化的好处在哪？最直接的好处是 dispatch 层可以基于 source 做条件分支：Review 走 review prompt、Compact 走 summarize prompt、MemoryConsolidation 在后台不打扰用户、ThreadSpawn 显示给用户可监控、Other 走最严格的默认约束。如果没有这层类型化，dispatch 就只能靠 prompt 内容启发式判断，又脆弱又难维护。第二个好处是 telemetry 一致：每条 spawn 事件都自动带 source 标签，分析时可以问「过去一周有多少 Review？平均跑多久？失败率多少？」而不是从一堆 spawn 日志里手动挖。第三个好处是权限路径明确：不同 source 对应不同的 feature 约束（比如 Review 自动禁用 web_search 因为审查代码不需要联网，而 ThreadSpawn 默认允许），dispatch 时按 source 查表配置就行。
+`ThreadSpawn` 是用户自己定义的子 agent 模板，可以通过 agent_role 和 agent_nickname 自由编排（比如「定义一个叫 testwriter 的 agent，专门负责给我的代码补测试」），并且这个变体里带了 depth 字段，让框架可以追踪「当前调用链已经多深了」并在超出配置限制时拒绝继续 spawn。
+
+`MemoryConsolidation` 是周期性触发的记忆固化任务，子 agent 在后台跑，把对话历史里值得长期保留的洞察提炼成 memory 条目（详见第 16 章）。`Other(String)` 是兜底，为插件和实验性场景留口子，但要求显式传字符串说明用途，「无名 spawn」是被禁止的。
+
+把这 5 种类型化的好处在哪？最直接的好处是 dispatch 层可以基于 source 做条件分支：Review 走 review prompt、Compact 走 summarize prompt、MemoryConsolidation 在后台不打扰用户、ThreadSpawn 显示给用户可监控、Other 走最严格的默认约束。如果没有这层类型化，dispatch 就只能靠 prompt 内容启发式判断，又脆弱又难维护。
+
+第二个好处是 telemetry 一致：每条 spawn 事件都自动带 source 标签，分析时可以问「过去一周有多少 Review？平均跑多久？失败率多少？」而不是从一堆 spawn 日志里手动挖。第三个好处是权限路径明确：不同 source 对应不同的 feature 约束（比如 Review 自动禁用 web_search 因为审查代码不需要联网，而 ThreadSpawn 默认允许），dispatch 时按 source 查表配置就行。
 
 spawn 本身走一条统一的入口 `Codex::spawn(CodexSpawnArgs { ... })`，但传入的参数里有大量从父 session 继承的 service：
 
@@ -125,13 +136,19 @@ pub(crate) async fn run_codex_thread_interactive(
 
 </SourceBlock>
 
-注意 `inherited_exec_policy` 这一行：这是 Codex 子 agent 设计里最关键的安全边界。子 agent 不能比父更宽松，父 session 禁掉的 binary 子 agent 也禁，没有「开子 agent 绕过 execpolicy」的逃生通道。这一条约束直接堵死了一类很恶心的攻击模式：如果父子能权限分离，恶意 prompt 就可以诱导 agent 开一个子 agent「帮我跑这个工具」绕过父的限制，等于多了一道权限提升的攻击面。Codex 直接关闭这条路。同样的逻辑也适用于 plugins、mcp_manager、skills_manager、environment_manager、agent_control、models_manager、auth_manager 这些共享服务：它们全部是 Arc 引用从父继承，子 agent 看到的工具集就是父看到的（减去主动 disable 的几个），没有任何渠道让子 agent 拿到比父更多的能力。
+注意 `inherited_exec_policy` 这一行：这是 Codex 子 agent 设计里最关键的安全边界。子 agent 不能比父更宽松，父 session 禁掉的 binary 子 agent 也禁，没有「开子 agent 绕过 execpolicy」的逃生通道。这一条约束直接堵死了一类很恶心的攻击模式：如果父子能权限分离，恶意 prompt 就可以诱导 agent 开一个子 agent「帮我跑这个工具」绕过父的限制，等于多了一道权限提升的攻击面。
 
-approval 流程的处理也走同样的思路：子 agent 想跑危险命令时，不会自己弹 UI 让用户审批（如果允许，用户会看到一堆来自不同子 agent 的弹窗根本分不清在审批什么），而是把 approval event 推回父 session，由父 session 决定要不要弹给用户。所以从用户视角看，所有审批都来自父 agent，子 agent 是「父的一只手」，UI 一致性始终保持。这跟第 09 章讲到的 review sub-agent 用 `AskForApproval::Never` 是同一种思路在更广义场景下的应用：子 agent 永远不弹 UI，所有用户交互走父。
+Codex 直接关闭这条路。同样的逻辑也适用于 plugins、mcp_manager、skills_manager、environment_manager、agent_control、models_manager、auth_manager 这些共享服务：它们全部是 Arc 引用从父继承，子 agent 看到的工具集就是父看到的（减去主动 disable 的几个），没有任何渠道让子 agent 拿到比父更多的能力。
+
+approval 流程的处理也走同样的思路：子 agent 想跑危险命令时，不会自己弹 UI 让用户审批（如果允许，用户会看到一堆来自不同子 agent 的弹窗根本分不清在审批什么），而是把 approval event 推回父 session，由父 session 决定要不要弹给用户。所以从用户视角看，所有审批都来自父 agent，子 agent 是「父的一只手」，UI 一致性始终保持。
+
+这跟第 09 章讲到的 review sub-agent 用 `AskForApproval::Never` 是同一种思路在更广义场景下的应用：子 agent 永远不弹 UI，所有用户交互走父。
 
 ### Claude Code · 把子 agent 跟所有其他异步执行统一成一个 Task 抽象
 
-Claude Code 在子 agent 上的思路跟 Codex 完全不同。它发现一个事实：「派子 agent 干活」是「异步执行某件耗时事情」的一个特例，而 IDE 里需要异步执行的场景远不止子 agent：跑一个本地 bash 命令也是异步、调用远程 agent service 也是异步、跟同进程的另一个 teammate agent 协作也是异步、跑一个 workflow 也是异步。如果给每种异步执行单独写一套生命周期管理、状态机、并发控制、UI 展示，长期维护成本极高，并且行为会逐渐不一致（一个跑 bash 的取消机制和一个跑 agent 的取消机制差异巨大）。
+Claude Code 在子 agent 上的思路跟 Codex 完全不同。它发现一个事实：「派子 agent 干活」是「异步执行某件耗时事情」的一个特例，而 IDE 里需要异步执行的场景远不止子 agent：跑一个本地 bash 命令也是异步、调用远程 agent service 也是异步、跟同进程的另一个 teammate agent 协作也是异步、跑一个 workflow 也是异步。
+
+如果给每种异步执行单独写一套生命周期管理、状态机、并发控制、UI 展示，长期维护成本极高，并且行为会逐渐不一致（一个跑 bash 的取消机制和一个跑 agent 的取消机制差异巨大）。
 
 所以 Claude Code 把所有异步执行抽象成一个统一的 Task 概念，TaskType 枚举有 7 种变体：
 
@@ -166,17 +183,31 @@ export function isTerminalTaskStatus(status: TaskStatus): boolean {
 
 </SourceBlock>
 
-7 种 TaskType 各自对应一种异步执行场景。`local_bash` 是「本地跑一个 shell 命令」（cd 到某目录、跑测试、跑 lint），跟开子 agent 用同一套生命周期管理但不涉及 LLM 调用。`local_agent` 是「本地跑一个子 agent」（Codex 风格的子 agent），主要用于让模型把一个大任务拆给子 agent 去专注做。`remote_agent` 是「调用远程 agent service」（比如 Anthropic 部署的某个专门做某事的 agent endpoint）。`in_process_teammate` 是「跟同进程的另一个 teammate agent 协作」，typical 用法是同一个 IDE 里有多个 agent profile 各自负责一块（一个写代码、一个写文档、一个做 review），需要协作时互相 spawn。`local_workflow` 是「跑一个预定义的 workflow」（比如「上线流程」「review 流程」这种由多步组成的标准化操作）。`monitor_mcp` 是「跑一个常驻的 MCP 监控任务」（比如监控 GitHub PR 状态变化）。`dream` 是 Claude Code 2.1 引入的最特别的一种：「后台预热子任务」，用户主对话进行时 dream task 在后台准备可能用得到的资源（比如预先 grep 项目里可能相关的文件、预先加载相关文档），这是 7 类里唯一一个不是用户主动触发的 task，存在的理由是「让 agent 看起来更快」（用户问的时候资源已经准备好了）。
+7 种 TaskType 各自对应一种异步执行场景。`local_bash` 是「本地跑一个 shell 命令」（cd 到某目录、跑测试、跑 lint），跟开子 agent 用同一套生命周期管理但不涉及 LLM 调用。`local_agent` 是「本地跑一个子 agent」（Codex 风格的子 agent），主要用于让模型把一个大任务拆给子 agent 去专注做。
 
-TaskStatus 是一个清晰的状态机：pending（等待调度）、running（运行中）、completed（成功完成）、failed（失败）、killed（被取消）。`isTerminalTaskStatus(status)` 是个简单的函数判断「这个 task 是不是已经到终态了」：用来防止给已死的 teammate 注入消息、在终态时把 task 从 AppState 里 evict、清理 orphan 资源。这种「状态机终态」的抽象在异步执行系统里很基础但很重要：没有它就会有大量 race condition。
+`remote_agent` 是「调用远程 agent service」（比如 Anthropic 部署的某个专门做某事的 agent endpoint）。`in_process_teammate` 是「跟同进程的另一个 teammate agent 协作」，typical 用法是同一个 IDE 里有多个 agent profile 各自负责一块（一个写代码、一个写文档、一个做 review），需要协作时互相 spawn。
 
-每个 task 还自报「能不能并行」：每个工具实现 `isConcurrencySafe()` 接口返回 true 或 false，dispatch 层（详见第 04 章工具系统）会读这个值决定能不能让这个工具跟同一 turn 的其他工具并发跑。比如 read 文件操作是 concurrency safe（多个并行读不会有副作用），write 文件操作不是（两个并行写同一个文件会乱），spawn 子 agent 通常 safe（每个子 agent 自带独立状态空间），跑 bash 命令通常 not safe（命令之间可能有副作用依赖）。这种「工具自报能力」让 dispatch 层不需要硬编码每个工具的并发性。
+`local_workflow` 是「跑一个预定义的 workflow」（比如「上线流程」「review 流程」这种由多步组成的标准化操作）。`monitor_mcp` 是「跑一个常驻的 MCP 监控任务」（比如监控 GitHub PR 状态变化）。
 
-Claude Code 还提供了一组工具让模型主动管理任务列表：`TaskCreateTool` 创建新 task、`TaskListTool` 列出当前活动的 task、`TaskUpdateTool` 给 task 注入新信息、`TaskGetTool` 查 task 结果、`TaskStopTool` 终止某个 task。这 5 件套构成用户级 API，模型可以在 prompt 里主动决定「我要派 3 个子 agent 并行做三件事，然后等它们都完成再汇总」。每个 task 的输出会写到 outputFile 持久化到磁盘，避免大量子 agent 输出把主进程内存撑爆，这是工程上很务实的细节。
+`dream` 是 Claude Code 2.1 引入的最特别的一种：「后台预热子任务」，用户主对话进行时 dream task 在后台准备可能用得到的资源（比如预先 grep 项目里可能相关的文件、预先加载相关文档），这是 7 类里唯一一个不是用户主动触发的 task，存在的理由是「让 agent 看起来更快」（用户问的时候资源已经准备好了）。
+
+TaskStatus 是一个清晰的状态机：pending（等待调度）、running（运行中）、completed（成功完成）、failed（失败）、killed（被取消）。`isTerminalTaskStatus(status)` 是个简单的函数判断「这个 task 是不是已经到终态了」：用来防止给已死的 teammate 注入消息、在终态时把 task 从 AppState 里 evict、清理 orphan 资源。
+
+这种「状态机终态」的抽象在异步执行系统里很基础但很重要：没有它就会有大量 race condition。
+
+每个 task 还自报「能不能并行」：每个工具实现 `isConcurrencySafe()` 接口返回 true 或 false，dispatch 层（详见第 04 章工具系统）会读这个值决定能不能让这个工具跟同一 turn 的其他工具并发跑。
+
+比如 read 文件操作是 concurrency safe（多个并行读不会有副作用），write 文件操作不是（两个并行写同一个文件会乱），spawn 子 agent 通常 safe（每个子 agent 自带独立状态空间），跑 bash 命令通常 not safe（命令之间可能有副作用依赖）。这种「工具自报能力」让 dispatch 层不需要硬编码每个工具的并发性。
+
+Claude Code 还提供了一组工具让模型主动管理任务列表：`TaskCreateTool` 创建新 task、`TaskListTool` 列出当前活动的 task、`TaskUpdateTool` 给 task 注入新信息、`TaskGetTool` 查 task 结果、`TaskStopTool` 终止某个 task。这 5 件套构成用户级 API，模型可以在 prompt 里主动决定「我要派 3 个子 agent 并行做三件事，然后等它们都完成再汇总」。
+
+每个 task 的输出会写到 outputFile 持久化到磁盘，避免大量子 agent 输出把主进程内存撑爆，这是工程上很务实的细节。
 
 ### OpenClaw · 把子 agent 做成一个完整的子系统：6 模块加 13 字段加反 polling 警告
 
-OpenClaw 在子 agent 上做得最完整，把 subagent 做成一个独立的子系统而不只是一个工具调用。打开它的源码会看到一整组文件协同工作：`subagent-spawn.ts` 负责创建子 agent 实例、`subagent-registry.ts` 负责注册和追踪当前活跃的子 agent、`subagent-depth.ts` 负责跨进程持久化深度信息、`subagent-announce.ts` 负责子完成时把通知 push 给父、`subagent-attachments.ts` 负责子 agent 接收文件附件、`subagent-lifecycle-events.ts` 负责生命周期事件（启动、完成、失败、取消）。这种「6 个文件协作完成一件事」的拆法说明 OpenClaw 不把子 agent 当成轻量工具，而是当成一个跟主 agent 平级的运行时实体。
+OpenClaw 在子 agent 上做得最完整，把 subagent 做成一个独立的子系统而不只是一个工具调用。打开它的源码会看到一整组文件协同工作：`subagent-spawn.ts` 负责创建子 agent 实例、`subagent-registry.ts` 负责注册和追踪当前活跃的子 agent、`subagent-depth.ts` 负责跨进程持久化深度信息、`subagent-announce.ts` 负责子完成时把通知 push 给父、`subagent-attachments.ts` 负责子 agent 接收文件附件、`subagent-lifecycle-events.ts` 负责生命周期事件（启动、完成、失败、取消）。
+
+这种「6 个文件协作完成一件事」的拆法说明 OpenClaw 不把子 agent 当成轻量工具，而是当成一个跟主 agent 平级的运行时实体。
 
 最直接的体现是 `SpawnSubagentParams` 有 13 个配置字段：
 
@@ -207,7 +238,13 @@ export type SpawnSubagentParams = {
 
 </SourceBlock>
 
-这 13 个字段每个都解一类具体场景。`task` 是要派给子 agent 做的事情的描述。`label` 是给这个子 agent 的人类可读名字（让父 agent 在状态汇报里能说「review-agent 还在跑、test-writer 已完成」）。`agentId` 选用哪个 agent profile（OpenClaw 支持多个 agent 模板）。`model` 让子 agent 用跟父不同的模型（比如父用 sonnet 但子用 opus 做更复杂的推理）。`thinking` 指定推理深度（low、medium、high）。`runTimeoutSeconds` 是子 agent 最长执行时间（超了会被强杀）。`thread` 决定是新开 thread 还是接到父 thread。`mode` 是 `run` 或 `session` 二选一（run 跑完就结束，session 保留可继续追问）。`cleanup` 决定子 agent 完成后是把 session 数据 delete 还是 keep（keep 用于 debug，delete 用于减少磁盘占用）。`sandbox` 决定子用 inherit 父的沙箱还是 require 一个独立沙箱。`expectsCompletionMessage` 决定父是同步等待子完成消息还是 fire-and-forget。`attachments` 是要传给子 agent 的文件附件列表（每个有 name、content、encoding、mimeType）。`attachMountPath` 是附件在子沙箱里挂载到哪个路径。这种「13 维度可配」让 OpenClaw 可以服务多样的 agent 编排场景，但也意味着新手上手时容易在 mode、cleanup、sandbox 这种枚举字段上踩坑，需要清晰的文档和合理的默认值。
+这 13 个字段每个都解一类具体场景。`task` 是要派给子 agent 做的事情的描述。`label` 是给这个子 agent 的人类可读名字（让父 agent 在状态汇报里能说「review-agent 还在跑、test-writer 已完成」）。`agentId` 选用哪个 agent profile（OpenClaw 支持多个 agent 模板）。`model` 让子 agent 用跟父不同的模型（比如父用 sonnet 但子用 opus 做更复杂的推理）。
+
+`thinking` 指定推理深度（low、medium、high）。`runTimeoutSeconds` 是子 agent 最长执行时间（超了会被强杀）。`thread` 决定是新开 thread 还是接到父 thread。`mode` 是 `run` 或 `session` 二选一（run 跑完就结束，session 保留可继续追问）。
+
+`cleanup` 决定子 agent 完成后是把 session 数据 delete 还是 keep（keep 用于 debug，delete 用于减少磁盘占用）。`sandbox` 决定子用 inherit 父的沙箱还是 require 一个独立沙箱。`expectsCompletionMessage` 决定父是同步等待子完成消息还是 fire-and-forget。
+
+`attachments` 是要传给子 agent 的文件附件列表（每个有 name、content、encoding、mimeType）。`attachMountPath` 是附件在子沙箱里挂载到哪个路径。这种「13 维度可配」让 OpenClaw 可以服务多样的 agent 编排场景，但也意味着新手上手时容易在 mode、cleanup、sandbox 这种枚举字段上踩坑，需要清晰的文档和合理的默认值。
 
 OpenClaw 最特别的设计是 push-based 完成事件加把反 polling 的警告硬写进 spawn tool 的返回值文本里：
 
@@ -260,11 +297,15 @@ function normalizeSpawnDepth(value: unknown): number | undefined {
 
 </SourceBlock>
 
-这跟 OpenClaw 的整体定位一致：长期 agent 平台，session 跨进程能 resume，子 agent 的 depth 信息也得是持久化状态而不是进程内存里的瞬时变量。想象这个场景：父 agent spawn 了一个子 agent，进程被 IDE 重启了，重启后父 session resume 回来，子 agent 也 resume 回来。如果 depth 只在内存里，重启后大家都从 depth=0 开始，会破坏「最多 N 层递归」的限制（因为重启后理论上可以再 spawn N 层）。持久化到 session store 确保这种 corner case 也不会破窗。
+这跟 OpenClaw 的整体定位一致：长期 agent 平台，session 跨进程能 resume，子 agent 的 depth 信息也得是持久化状态而不是进程内存里的瞬时变量。想象这个场景：父 agent spawn 了一个子 agent，进程被 IDE 重启了，重启后父 session resume 回来，子 agent 也 resume 回来。
+
+如果 depth 只在内存里，重启后大家都从 depth=0 开始，会破坏「最多 N 层递归」的限制（因为重启后理论上可以再 spawn N 层）。持久化到 session store 确保这种 corner case 也不会破窗。
 
 ### Hermes · 最克制的子 agent 模型：一个函数加 5 工具硬禁加 MAX_DEPTH 写死
 
-Hermes 的子 agent 设计是这一章里最简洁的：只有一个 `delegate_task(goal, context, toolset, max_iterations)` 函数。看起来像「没做」的程度，但是「做了最重要的几件事，剩下的不做」的克制。理由是：Hermes 自己是一个聊天 agent（服务多平台 chat），不是 agent 编排框架，所以它对子 agent 的需求只有一个：「把一个明确的子任务派给一个临时 agent 干，干完拿结果」，不需要 OpenClaw 那种复杂的生命周期管理。
+Hermes 的子 agent 设计是这一章里最简洁的：只有一个 `delegate_task(goal, context, toolset, max_iterations)` 函数。看起来像「没做」的程度，但是「做了最重要的几件事，剩下的不做」的克制。
+
+理由是：Hermes 自己是一个聊天 agent（服务多平台 chat），不是 agent 编排框架，所以它对子 agent 的需求只有一个：「把一个明确的子任务派给一个临时 agent 干，干完拿结果」，不需要 OpenClaw 那种复杂的生命周期管理。
 
 但「简单」不等于「没设计」。Hermes 的关键安全约束都写死在常量里，让任何调用方都没法绕过：
 
@@ -298,11 +339,17 @@ MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 
 </SourceBlock>
 
-5 条硬禁的工具每条都对应一个 Hermes 在生产中真实遇到过的灾难。`delegate_task` 自递归如果不禁，子 agent 可以再 spawn 同样的工具调用自己，立刻变成无限套娃，每层多花一倍 token，几层下来上下文窗口爆炸、账单失控。`clarify` 是 Hermes 让 agent 跟用户回话澄清意图的工具，子 agent 不应该有这个能力：因为用户当前在跟父 agent 对话，子 agent 凭空往用户那里发问题会让用户根本分不清是谁在问什么，UI 上一片混乱。`memory` 是 Hermes 写 MEMORY.md 长期记忆的工具，子 agent 写进去会污染父 agent 的长期偏好：子 agent 是临时的，它学到的东西不应该影响父的永久状态。`send_message` 是给 Telegram、Slack、Discord 等平台发消息的工具，子 agent 拿到这个就会跨平台发副本消息（一个 Telegram 消息可能被父和子都发一遍）。`execute_code` 是跑 Python 沙箱执行代码的工具，子 agent 不应该用：子 agent 的定位是「专注用现有工具解决一个具体问题」，再 spawn 一层 Python 沙箱让推理链变得难以追踪。
+5 条硬禁的工具每条都对应一个 Hermes 在生产中真实遇到过的灾难。`delegate_task` 自递归如果不禁，子 agent 可以再 spawn 同样的工具调用自己，立刻变成无限套娃，每层多花一倍 token，几层下来上下文窗口爆炸、账单失控。
+
+`clarify` 是 Hermes 让 agent 跟用户回话澄清意图的工具，子 agent 不应该有这个能力：因为用户当前在跟父 agent 对话，子 agent 凭空往用户那里发问题会让用户根本分不清是谁在问什么，UI 上一片混乱。`memory` 是 Hermes 写 MEMORY.md 长期记忆的工具，子 agent 写进去会污染父 agent 的长期偏好：子 agent 是临时的，它学到的东西不应该影响父的永久状态。
+
+`send_message` 是给 Telegram、Slack、Discord 等平台发消息的工具，子 agent 拿到这个就会跨平台发副本消息（一个 Telegram 消息可能被父和子都发一遍）。`execute_code` 是跑 Python 沙箱执行代码的工具，子 agent 不应该用：子 agent 的定位是「专注用现有工具解决一个具体问题」，再 spawn 一层 Python 沙箱让推理链变得难以追踪。
 
 这 5 条限制还有一个共同点：它们都不是「子 agent 可能滥用所以禁」，而是「子 agent 在概念上就不应该有」。这是个值得学习的设计原则：限制不是怕模型乱来，而是从概念上理清楚「这种角色就不该有这种能力」。
 
-MAX_DEPTH 写死成 2 的语义是：根 agent（用户在跟它对话）算 depth 0、它可以 spawn 子 agent 到 depth 1、depth 1 的子 agent 试图再 spawn 时会被直接拒绝（因为没有 delegate_task 工具）。为什么是 2 不是 3 不是 5？Hermes 团队的经验是：实际有用的子 agent 任务几乎都是「一层就够」（父 agent 想专注做一件事，把另一件辅助任务派出去），到第二层往往是模型陷入了无效的拆分循环（每个子任务都被进一步拆给孙子 agent 但本身并不必要）。允许超过 2 层在 99% 的场景下都是浪费 token 而不是需要更深的层级。
+MAX_DEPTH 写死成 2 的语义是：根 agent（用户在跟它对话）算 depth 0、它可以 spawn 子 agent 到 depth 1、depth 1 的子 agent 试图再 spawn 时会被直接拒绝（因为没有 delegate_task 工具）。为什么是 2 不是 3 不是 5？
+
+Hermes 团队的经验是：实际有用的子 agent 任务几乎都是「一层就够」（父 agent 想专注做一件事，把另一件辅助任务派出去），到第二层往往是模型陷入了无效的拆分循环（每个子任务都被进一步拆给孙子 agent 但本身并不必要）。允许超过 2 层在 99% 的场景下都是浪费 token 而不是需要更深的层级。
 
 并发模型走 `ThreadPoolExecutor`：
 
@@ -339,9 +386,11 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 
 </SourceBlock>
 
-父进程同步阻塞在 `as_completed()` 上等所有 children 都完成。执行过程中每 30 秒发一次 heartbeat 让上层 UI 知道父 agent 还在等（而不是卡死了）。这是典型的同步并发模型，跟 OpenClaw 的 push-based 异步模型刚好相反：同步阻塞的优点是父 agent 的逻辑很清晰（spawn 完所有子，等齐，汇总），代价是父 agent 在等待期间不能做别的事，对长时间任务来说会影响 UI 响应。Hermes 选同步是因为它的子 agent 任务通常是短的（一两分钟内完成），同步等的 UX 损失很小，换来代码逻辑的极致简洁。
+父进程同步阻塞在 `as_completed()` 上等所有 children 都完成。执行过程中每 30 秒发一次 heartbeat 让上层 UI 知道父 agent 还在等（而不是卡死了）。这是典型的同步并发模型，跟 OpenClaw 的 push-based 异步模型刚好相反：同步阻塞的优点是父 agent 的逻辑很清晰（spawn 完所有子，等齐，汇总），代价是父 agent 在等待期间不能做别的事，对长时间任务来说会影响 UI 响应。
 
-## §4 · 四家在子 agent 上的共同认知
+Hermes 选同步是因为它的子 agent 任务通常是短的（一两分钟内完成），同步等的 UX 损失很小，换来代码逻辑的极致简洁。
+
+## Subagent 已经形成的共识
 
 虽然四家在 subagent 实现深度差异巨大，但有 4 件事是所有家都一致同意的：这些共识反映了子 agent 工程里不能绕过的硬约束。
 
@@ -353,7 +402,7 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 
 **第四件是子 agent 完成的通知机制必须避免 polling，要么 push event 要么 await future**。Codex 通过 receiver/sender 推 `EventMsg::TurnComplete` 给父、OpenClaw 通过 subagent-announce 主动 push 通知给父并明确警告「不要 poll」、Hermes 用 `as_completed()` await future、Claude Code 通过 TaskStatus 状态机变迁触发回调。没有一家用「父循环查询子状态」的 polling 模型。理由很现实：polling 模式下模型会反复调用 sessions_list、sessions_history 浪费大量 token 在「问还没完吗」上，而 push 模式让模型只需要等待，token 效率高几个数量级。
 
-## §5 · 四家在子 agent 上的关键分歧
+## 类型化、通用任务与完整平台怎么选
 
 <Diagram
   src="/diagrams/10-tradeoff.svg"
@@ -371,7 +420,7 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 
 **如果你在做一个简单的对话 agent，只需要「派活给一个临时子 agent」这一个功能，那 Hermes 的 delegate_task 函数式加 5 工具硬禁是正确选择**。这种场景下整个子 agent 模块就一个函数加几个常量，新人 5 分钟就能看懂，每条限制都有清晰的失败案例对应。代价是缺乏 attachments、mode、cleanup 这种高级特性、同步阻塞模型在长任务上会卡 UI，但对简单聊天 agent 这些都不是问题。
 
-## §6 · 我的点评
+## 我的判断：先算交接成本
 
 <ScoreCard
   rows={[
@@ -384,7 +433,7 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
   headers={['系统', '评分', '亮点', '风险']}
 />
 
-## §7 · 自己实现 Subagent 系统的最佳实践
+## 从一次受限委派开始
 
 下面是从四家提炼的「自己写 sub-agent」配方。先用函数式起步，再加生产级特性，最后避开五个常见死路。
 
@@ -414,7 +463,7 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
   ]}
 />
 
-## §8 · 四种 subagent 流程并列
+## 四条 Subagent 流程并列
 
 <Diagram
   src="/diagrams/10-subagent-flows.svg"
@@ -424,7 +473,7 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 
 把 4 种放一起，抽象厚度的 spectrum 一眼可见：函数式（Hermes）走 类型化（Codex）走 任务抽象（Claude Code）走 完整平台（OpenClaw）。
 
-## §9 · 延伸阅读 / 源码入口
+## 沿着 spawn 入口读源码
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -444,14 +493,19 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
   ]}
 />
 
-## §10 · 小练习
+## 附录：练习与复盘
+
+<details id="interview-drill">
+<summary>按需展开练习和十道复盘题</summary>
+
+### 练习
 
 1. **🟢 写一个 `delegate_task` 函数**：参数 `goal、context、toolset、max_iterations`。在子 agent 工具集里硬禁递归 delegate。
 2. **🟠 加深度限制**：在 session 里记 `spawn_depth`，超过 2 直接 reject。验证：试图 spawn 三层时第三层失败，错误信息包含 depth。
 3. **🟠 push-based 完成**：父 agent 不能 poll 子 agent。子完成时通过 user message 形式回到父 turn。验证：父 spawn 后只能等 message，不能再发 `sessions_list`。
 4. **🔴 子 agent 来源类型化**：定义 `SubAgentSource` 枚举（至少 Review、Compact、ThreadSpawn）。不同来源走不同的 system prompt 加不同的 feature 约束。验证：Review source 自动 disable web_search，ThreadSpawn source 允许 web_search。
 
-## §11 · 面试题：10 道带答案的高频考点
+### 复盘题
 
 <details>
 <summary>**Q1 · 概念**：为什么 Codex 要把子 agent 的来源类型化成 `SubAgentSource` 枚举？一个 `spawn(prompt)` 函数不行？</summary>
@@ -460,7 +514,9 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 
 **1. dispatch 路径不同**
 
-5 种 source 走完全不同的代码路径。Review 要加载 review prompt + disable 一批 feature；Compact 要切到摘要专用 prompt 但允许部分工具；MemoryConsolidation 要走 memory 子系统不能用 file edit；ThreadSpawn 是用户自定义模板，feature set 看 config。如果是单一 `spawn(prompt)`，所有 dispatch 逻辑塞进调用方，每次新增类型都要改所有 caller。enum 让 dispatch 在中心点做。
+5 种 source 走完全不同的代码路径。Review 要加载 review prompt + disable 一批 feature；Compact 要切到摘要专用 prompt 但允许部分工具；MemoryConsolidation 要走 memory 子系统不能用 file edit；ThreadSpawn 是用户自定义模板，feature set 看 config。
+
+如果是单一 `spawn(prompt)`，所有 dispatch 逻辑塞进调用方，每次新增类型都要改所有 caller。enum 让 dispatch 在中心点做。
 
 **2. telemetry / metrics 能聚合**
 
@@ -1223,4 +1279,6 @@ console.log(result.summary);
 3. **拒绝 polling**：第一天就把 anti-polling warning 加上
 
 **追问**：「这个框架怎么测试？」三层测试：(1) 单元测试 spawn / depth / blocked_tools；(2) 集成测试 push event flow；(3) chaos 测试 spawn 100 个子 / kill 一半 / 看资源回收。前两层 CI 跑，第三层每周跑一次。
+</details>
+
 </details>

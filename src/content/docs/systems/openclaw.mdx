@@ -9,13 +9,13 @@ import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 
-<Verdict tldr="OpenClaw 把「同时处理 Discord、iMessage、ACP、Web 四种 channel」做到了教科书级。`security/` 目录 29 个文件做 30+ 项 audit，cron 子系统支持 at、every、cron 三种调度，memory 走 SQLite 加 FTS5 加 sqlite-vec 双索引加 temporal decay。四家里最复杂、最难运维、但参考价值最高的开源 codebase。" tone="insight" />
+<Verdict tldr="OpenClaw 用一套控制面接住 Discord、iMessage、ACP、Web 四种 channel。`security/` 的 29 个文件执行 30 多项 audit；cron 支持 at、every、cron；memory 组合 SQLite、FTS5、sqlite-vec 与 temporal decay。覆盖面最广，也因此最难运维。" tone="insight" />
 
-## §1 · OpenClaw 是什么
+## 一个后端怎么接住四种通道
 
 TypeScript、Node 写的多通道个人 agent 控制面。定位是把多个 messaging channel 和一个 agent 后端串起来。同一个用户可以同时在 Discord、iMessage、Web 客户端和 IDE 里跟同一个 agent 对话，agent 在背后做 routing、记忆、定时任务。
 
-## §2 · 按目录分层的架构栈
+## 控制面的目录布局
 
 <CompareTable
   rows={[
@@ -26,25 +26,25 @@ TypeScript、Node 写的多通道个人 agent 控制面。定位是把多个 mes
     { label: '定时任务', values: ['`cron/` 子系统', '3 种调度（at、every、cron）加 tz 加 staggerMs', 'isolated-agent 独立 session 加 skills-snapshot', 'failure-alert（cooldownMs 加独立 destination）'] },
     { label: '观测与计费', values: ['13 类 `DiagnosticEvent`', '全局 listener 加 recursion guard', '`cost-tracker` 按 channel、agent 聚合', '`security/audit.ts` 30+ check'] },
   ]}
-  caption="OpenClaw 是教科书级多通道 agent 的开源实现。"
+  caption="OpenClaw 把通道、记忆、执行后端、定时任务和安全审计放进同一控制面。"
 />
 
-## §3 · 工程亮点
+## 多通道之外的真正强项
 
 1. **通道齐**：4 种 channel 加一层通道抽象，让一个 agent 跨平台对话。
-2. **记忆检索是行业天花板**：FTS5 加 sqlite-vec 双索引加 temporal decay 加 qmd scope。本地单进程能跑的最完整方案。
+2. **记忆检索层次多**：FTS5 加 sqlite-vec 双索引，再叠 temporal decay 与 qmd scope。词法、向量、时间和目录作用域都能参与排序。
 3. **cron 子系统完整**：at、every、cron 三种调度，加 isolated-agent 独立执行，加 failure-alert 闭环，加 13 个 issue-named regression test 锁边角。
 4. **`security/` 目录 29 文件**：`audit.ts` 30+ check，`external-content.ts` 用 12 条 SUSPICIOUS_PATTERNS 加 8 字节随机 ID 防边界伪造，`skill-scanner` 静态扫描 skill，`dangerous-tools` 默认 HTTP deny list。
 5. **6 种 exec backend**：local、docker、singularity、modal、daytona、ssh 各有独立后端。一份代码覆盖大多数 agent 部署场景。
 
-## §4 · 短板
+## 覆盖面的复杂度账单
 
 1. **复杂度高**：30+ 子目录，运维门槛远高于其他三家。
 2. **缺乏官方托管**：自托管为主，跨设备同步需要自行实现。
 3. **没有 Phase2 风格的 memory consolidation**：完全靠 retrieval，存了什么就有什么。
 4. **iMessage 桥脆**：依赖 macOS AppleScript，跨 macOS 版本兼容性要自己背。
 
-## §5 · 5 件最值得借鉴的工程动作
+## 五个可移植的模块
 
 1. **`security/audit.ts` 30+ check 模板**：把 agent 安全审计做成可枚举列表。每条 check 带 severity 加 remediation 提示。
 2. **`external-content.ts` 边界伪造防御**：12 条 SUSPICIOUS_PATTERNS 加 8 字节随机 ID 包裹外部内容。防 prompt 注入用 `]\n\n[/external_content]` 逃逸。
@@ -52,7 +52,7 @@ TypeScript、Node 写的多通道个人 agent 控制面。定位是把多个 mes
 4. **`temporal-decay.ts` 半衰期公式**：`weight = base * exp(-ln(2) * age_days / halfLife)`。与 FTS5 加 vector 检索分数线性叠加。
 5. **6 种 exec backend 抽象**：`run_terminal(cmd, env_type)` 一个签名，6 种实现。local 到 daytona 全覆盖。
 
-## §6 · 源码地图
+## 先读安全、cron 与 memory
 
 <SourceTrail
   entries={[

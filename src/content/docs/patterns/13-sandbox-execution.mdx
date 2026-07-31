@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## 沙箱限制的是副作用
 
 <Verdict tldr="沙箱这件事是 agent 工程里最容易被低估的复杂度：它不是一个能用安全两个字概括的单一技术，而是一组分层叠加的能力：限制文件系统读写、限制网络出站、限制提权、限制系统调用、限制子进程能继承的特权。任何一层失守整个隔离就垮，所以做沙箱要么自己把每一层都写一遍（高门槛但能控制每一层的行为），要么把整件事外包给已有的隔离基础设施（低门槛但要相信基础设施真的隔离了）。四家在这个根本取舍上走出了四条完全不同的路。Codex 选了自己写每一层的最重路线：Linux 上把三种独立的内核能力组合使用（bubblewrap 用户态沙箱命令行工具，基于 Linux namespace 做文件系统挂载隔离、seccomp Secure Computing 模式，内核级 syscall 过滤器，这里用来拦截网络相关的系统调用、landlock 新版 Linux 内核引入的进程级 FS 访问控制，作为 bubblewrap 失效时的 FS 备用方案），macOS 上用 seatbelt（也叫 sandbox-exec，macOS 自带的沙箱机制）配 .sb 策略文件（Scheme 语法写的沙箱策略），Windows 上专门写了一个独立的 crate。最关键的工程细节是隔离策略只应用到当前线程（用 PR_SET_NO_NEW_PRIVS 把策略绑到调用线程而非整个进程），让子进程精确继承隔离边界、不会污染整个 CLI 进程。Claude Code 选了把沙箱当配置面路线：它把沙箱的所有维度都建模成 JSON schema 让 IT、管理员能在 settings.json 里精确配置，分成 network 和 filesystem 两组独立的 schema，并且非常坦诚地预留了几个减弱安全的口子（比如 enableWeakerNetworkIsolation 是为了让 Go 生态工具能走 MITM 代理 中间人代理，便于本地 HTTPS 抓包调试）。最有意思的是代码注释里直接写了这个 undocumented 配置是为了 NVIDIA 企业部署引入的，他们想在 macOS 启用 autoAllowBashIfSandboxed（在已经进沙箱的前提下，自动放行 bash 调用，不再二次弹审批）但暂时不在 Linux 启用，这种把真实企业部署遇到的兼容性问题刻在代码注释里的做法少见。OpenClaw 选了沙箱是抽象不是技术路线：它通过一个叫 ExecHost 的枚举把执行环境分成三档（sandbox 跑在隔离容器、gateway 跑在网关进程、node 跑在主进程节点），具体怎么 enforce 由部署方决定（你可以接 Docker、Firecracker AWS 开发的微 VM、Lambda，OpenClaw 自己不规定）。好处是 agent 逻辑跟隔离技术彻底解耦，坏处是 OpenClaw 自己不提供开箱即用的沙箱实现。Hermes 走得最远：干脆完全不做应用层沙箱，所有隔离都通过一个叫 TERMINAL_ENV 的环境变量委托给 6 种容器化方案中的任意一种（local 不隔离、docker 本地容器、singularity HPC 高性能计算集群常用的容器、modal 云端 serverless 容器服务、daytona dev-as-a-service 开发环境云服务、ssh 远程机器），每种后端还有 image 镜像名、CPU、内存、磁盘、是否持久化等独立配置维度。要做严肃的桌面级安全 agent，Codex 的三层自管是底线。要做企业 IDE 部署，Claude Code 的 schema 化是参考。要做 SaaS，OpenClaw、Hermes 把沙箱外包给容器或远程基础设施是更工程化的选择。" />
 
-## §2 · 沙箱 4 档对照
+## 四种隔离模型
 
-:::tip[本章重点 · 30 秒速读]
+<details>
+<summary>读前提示（按需展开）</summary>
+
 - **核心认知**：沙箱不是单一技术，是分层叠加：FS 读写、网络出站、提权、syscall、子进程特权继承，任何一层失守整个隔离就垮。
 - **分歧最大点**：Codex 自写每一层（bubblewrap 加 seccomp 加 landlock 加 seatbelt）、Claude Code 把沙箱做成 JSON schema 配置面（含 enableWeakerNetworkIsolation 这类减弱口子）、OpenClaw 用 ExecHost 3 档抽象不规定实现、Hermes 用 TERMINAL_ENV 委托 6 种容器后端。
 - **工程判断**：部署形态决定路线：桌面级安全 agent 自管三层是底线，SaaS 把沙箱外包给容器或远程基础设施更工程化。
 - **动手要点**：隔离策略只应用到当前线程（PR_SET_NO_NEW_PRIVS 绑线程不绑进程），让子进程精确继承边界、不污染整个 CLI 进程。
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/13-sandbox-execution-base.svg"
@@ -40,14 +43,14 @@ import SourceBlock from '@components/SourceBlock.astro';
     { label: '沙箱基础设施', values: ['Linux：bubblewrap 加 seccomp 加 landlock。macOS：seatbelt。Windows：独立 crate', 'macOS：seatbelt。Linux：新增（NVIDIA enterprise rollout 引入）。可选 `enabledPlatforms` 限制只在某平台启用', '`ExecHost` 3 backend：sandbox、gateway、node。sandbox 走外部容器', '6 后端：local、docker、singularity、modal、daytona、ssh。TERMINAL_ENV 切换'] },
     { label: '文件系统隔离', values: ['`PermissionProfile.file_system`：writable_roots、read_only、full。bubblewrap 实际 enforce', '`SandboxFilesystemConfig`：allowWrite、denyWrite、denyRead、allowRead、allowManagedReadPathsOnly', '由 backend 进程决定（sandbox host 等于容器隔离）', '容器化天然隔离 host fs。可选 `TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE` 映射 cwd 到 /workspace'] },
     { label: '网络隔离', values: ['seccomp filter 拦截 connect()、sendto()。可走 managed proxy 例外', '`SandboxNetworkConfig`：allowedDomains、allowUnixSockets、httpProxyPort、socksProxyPort。macOS only allowUnixSockets', '由 backend、network policy 决定', '容器 network mode 控制。ssh 走真实远程网络'] },
-    { label: '权限模型', values: ['`PR_SET_NO_NEW_PRIVS` 加 seccomp BPF。apply 到当前线程，子进程继承', 'allowedDomains 跟 permission rules 合并。managed-only 模式忽略用户层规则', '逐 binary `SafeBinProfile`（07 章 §3）加 ExecHost 隔离', '靠后端隔离（container、VM、SSH），无应用层 seccomp、landlock'] },
+    { label: '权限模型', values: ['`PR_SET_NO_NEW_PRIVS` 加 seccomp BPF。apply 到当前线程，子进程继承', 'allowedDomains 跟 permission rules 合并。managed-only 模式忽略用户层规则', '逐 binary `SafeBinProfile`（Shell 执行章详解）加 ExecHost 隔离', '靠后端隔离（container、VM、SSH），无应用层 seccomp、landlock'] },
     { label: '失败处理', values: ['沙箱失败走 SandboxErr 错误码。上层可决定 fail_open、fail_closed', '`failIfUnavailable: true` 走启动 fail。false 走退化为无沙箱加警告', 'backend spawn 失败走 approval 流程兜底', 'backend 不可用走提示用户切换 TERMINAL_ENV'] },
   ]}
   caption="沙箱这件事的工程化程度"
   dimensionLabel="维度"
 />
 
-## §3 · 四家怎么实现沙箱
+## 四套系统怎样实现沙箱
 
 ### Codex · 在 Linux 上把三种独立的内核隔离能力按各自最擅长的事拼起来
 
@@ -112,7 +115,9 @@ pub(crate) fn apply_permission_profile_to_current_thread(
 
 **landlock** 是 Linux 5.13+ 引入的内核 LSM（Linux Security Module），同样做文件系统访问控制，跟 bubblewrap 比是更新的内核机制。Codex 把它当 legacy/backup 用，主路径还是 bubblewrap，原因主要是 bubblewrap 在老内核也能跑，兼容性更广。
 
-代码注释里有一段关于 trade-off 的决定特别值得看：`PR_SET_NO_NEW_PRIVS` 这个 prctl 调用是启用 seccomp 的硬性前提（内核要求「如果你要装系统调用过滤器，必须先承诺这个进程及其子进程永远不能通过 setuid 获得新特权」），但这个承诺同时也会让 setuid 提权失效：而很多 bubblewrap 的部署方式正好依赖 setuid 来让普通用户能创建命名空间。Codex 的处理是：只在需要 seccomp 或者需要 landlock 文件系统隔离时才设这个 flag，其他情况下不设，让 bwrap 那边的 setuid 路径能用。这是一段经典的「安全性对比兼容性」的工程平衡，做得很克制。
+代码注释里有一段关于 trade-off 的决定特别值得看：`PR_SET_NO_NEW_PRIVS` 这个 prctl 调用是启用 seccomp 的硬性前提（内核要求「如果你要装系统调用过滤器，必须先承诺这个进程及其子进程永远不能通过 setuid 获得新特权」），但这个承诺同时也会让 setuid 提权失效：而很多 bubblewrap 的部署方式正好依赖 setuid 来让普通用户能创建命名空间。
+
+Codex 的处理是：只在需要 seccomp 或者需要 landlock 文件系统隔离时才设这个 flag，其他情况下不设，让 bwrap 那边的 setuid 路径能用。这是一段经典的「安全性对比兼容性」的工程平衡，做得很克制。
 
 跨平台分工方面：Linux 走 `linux-sandbox/` crate 加 bubblewrap 二进制；macOS 用 `sandbox-exec`（业界叫"seatbelt"）配 `.sb` 策略文件，这是苹果系统自带的沙箱机制；Windows 走一个独立的 `windows-sandbox-rs/` crate，搭配 setuid 用户管理。
 
@@ -180,7 +185,9 @@ export const SandboxSettingsSchema = lazySchema(() =>
 
 network 和 filesystem 各自有独立的 schema 子集，因为网络隔离和文件系统隔离本来就是两件独立的事。network 维度的配置项有：允许访问的域名列表、是否只信管理面下发的域名、是否允许 Unix socket、是否允许本地 binding、HTTP/SOCKS 代理端口；filesystem 维度的配置项有：允许写的路径、显式拒绝写的路径、显式拒绝读的路径、允许读的路径、是否只信管理面下发的读路径。
 
-特别值得讲的是两个带 `Managed` 前缀的配置，`allowManagedDomainsOnly` 和 `allowManagedReadPathsOnly`。它们的语义是："开了这个之后忽略所有用户层配置，只信 policySettings"。这是企业 IT 管理员的"我说了算"心态：管理员开了之后，无论用户在 `userSettings`、`projectSettings`、`localSettings`、`cliArg` 里怎么放行，都不生效；只有管理员在 `policySettings` 里下发的规则才算数。这种"管理面凌驾用户面"的设计是企业部署的基本盘。
+特别值得讲的是两个带 `Managed` 前缀的配置，`allowManagedDomainsOnly` 和 `allowManagedReadPathsOnly`。它们的语义是："开了这个之后忽略所有用户层配置，只信 policySettings"。这是企业 IT 管理员的"我说了算"心态：管理员开了之后，无论用户在 `userSettings`、`projectSettings`、`localSettings`、`cliArg` 里怎么放行，都不生效；
+
+只有管理员在 `policySettings` 里下发的规则才算数。这种"管理面凌驾用户面"的设计是企业部署的基本盘。
 
 ### OpenClaw · 把沙箱看成"选哪个后端的问题"而不是"自己实现哪些隔离能力的问题"
 
@@ -192,7 +199,9 @@ export type ExecHost = "sandbox" | "gateway" | "node";
 
 这三档的含义是：选 `sandbox` 表示这个命令要在隔离的执行环境里跑（具体怎么隔离由部署方决定，可以是 Docker、Firecracker microVM、AWS Lambda、Kubernetes Job 等任何东西），选 `gateway` 表示在 gateway 进程内跑（不开新进程，主要用于轻量级文件操作），选 `node` 表示直接在宿主 Node.js 进程里跑（用于已经被严格 allowlist 的可信命令，比如 `git status` 这种）。
 
-这种设计的工程哲学是把"沙箱实现"跟"agent 逻辑"彻底解耦。OpenClaw 自己的代码只关心"这个命令应该走哪个 backend"，至于 sandbox backend 内部到底用了什么技术做隔离，是部署方的事。好处是 agent 代码不需要维护 Linux/macOS/Windows 三套独立的沙箱代码，部署方爱用 Docker 用 Docker、爱用 Firecracker 用 Firecracker；坏处是 OpenClaw 自己不提供"开箱即用"的沙箱实现，部署方必须自己接一套容器或者隔离技术，不接就等于没沙箱。
+这种设计的工程哲学是把"沙箱实现"跟"agent 逻辑"彻底解耦。OpenClaw 自己的代码只关心"这个命令应该走哪个 backend"，至于 sandbox backend 内部到底用了什么技术做隔离，是部署方的事。好处是 agent 代码不需要维护 Linux/macOS/Windows 三套独立的沙箱代码，部署方爱用 Docker 用 Docker、爱用 Firecracker 用 Firecracker；
+
+坏处是 OpenClaw 自己不提供"开箱即用"的沙箱实现，部署方必须自己接一套容器或者隔离技术，不接就等于没沙箱。
 
 ### Hermes · 把整件事委托给 6 种容器化方案，让用户用一个环境变量选
 
@@ -251,7 +260,7 @@ def _get_env_config() -> Dict[str, Any]:
 
 还有一个重要的安全细节叫 `mount_docker_cwd`：它的默认值是关闭，意思是默认不会把宿主机的当前工作目录挂载到容器里。只有用户显式设置 `TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true` 之后，宿主机的 `/Users/xxx/repo` 才会被映射到容器内的 `/workspace`。这种「默认安全加可选便利」是合理的工程取舍：避免了「用户没意识到自己挂载了整个 home 目录到容器里」这种事故。
 
-## §4 · 共同点
+## 隔离层已经形成的共识
 
 虽然四家在「自己写还是外包」这条主轴上分布在两个极端，但它们在三件最基础的事情上有共识：这三件事可以理解为做沙箱不能省的基本功。
 
@@ -261,7 +270,7 @@ def _get_env_config() -> Dict[str, Any]:
 
 **第三件事是必须 explicit 处理平台差异**。沙箱技术在 Linux、macOS、Windows 上完全是不同的：Linux 有 bubblewrap、seccomp、landlock 这套生态，macOS 有 sandbox-exec，Windows 有自己的 Windows Sandbox 机制。四家都不假装「一份代码跨所有平台」：Codex 给三个平台写三套独立代码、Claude Code 用 `enabledPlatforms` 让管理员精确控制每个平台的启用情况、Hermes 的 6 个后端本身就是不同平台抽象、OpenClaw 把「具体怎么实现」完全交给 host 部署方。这种「explicit 处理平台差异」比「假装统一抽象」在长期维护上更可靠。
 
-## §5 · 差异点
+## 内核能力、配置与后端选择怎么取舍
 
 <Diagram
   src="/diagrams/13-tradeoff.svg"
@@ -276,7 +285,7 @@ def _get_env_config() -> Dict[str, Any]:
 - **要做 SaaS / 跨平台部署**：参考 Hermes 6 后端，让用户选 docker / modal / daytona / ssh。
 - **想把沙箱外包给基础设施**：参考 OpenClaw ExecHost 3 backend，把"具体怎么隔离"交给 host 实现。
 
-## §6 · 我的点评
+## 我的判断：默认隔离，按证据放开
 
 <ScoreCard
   rows={[
@@ -289,7 +298,7 @@ def _get_env_config() -> Dict[str, Any]:
   headers={['系统', '评分', '亮点', '风险']}
 />
 
-## §7 · 自己实现 Sandbox 系统的最佳实践
+## 从最小执行沙箱开始
 
 下面是从四家提炼的「自己写沙箱执行」配方。先把基础四件套打牢，再加生产级特性，最后避开五个常见死路。
 
@@ -321,7 +330,7 @@ def _get_env_config() -> Dict[str, Any]:
   ]}
 />
 
-## §8 · 四种沙箱方案并列
+## 四种沙箱路径并列
 
 <Diagram
   src="/diagrams/13-sandbox-flows.svg"
@@ -331,7 +340,7 @@ def _get_env_config() -> Dict[str, Any]:
 
 把 4 种放一起，"沙箱归谁实现"的差异一眼可见：Codex 自己写，Claude Code 让 IT 配置，OpenClaw 让 host 决定，Hermes 让容器 / 远程后端做。
 
-## §9 · 延伸阅读 / 源码入口
+## 沿着隔离边界读源码
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -351,14 +360,19 @@ def _get_env_config() -> Dict[str, Any]:
   ]}
 />
 
-## §10 · 小练习
+## 附录：练习与复盘
+
+<details id="interview-drill">
+<summary>按需展开练习和十道复盘题</summary>
+
+### 练习
 
 1. **🟢 用 bubblewrap 跑 echo**：写一个脚本，用 `bwrap --ro-bind /usr /usr --tmpfs /tmp -- echo hi` 验证基本隔离工作。
 2. **🟠 seccomp 拦 connect**：写一个 Python 程序，用 [`prctl`](https://pypi.org/project/python-prctl/) + seccomp filter 拦截 `connect(2)`。验证：`curl example.com` 失败，`ls /tmp` 成功。
 3. **🟠 多后端切换**：实现 `run_terminal(cmd, env_type)`，env_type ∈ `{local, docker, ssh}`。docker 走 `docker run`，ssh 走 `ssh user@host`。验证：env_type=docker 时 `pwd` 输出容器内路径。
 4. **🔴 enabledPlatforms 限制**：实现 `should_enable_sandbox(settings)`，sandbox 只在 settings.enabledPlatforms 包含当前 platform 时启用。验证：enabledPlatforms=["macos"] 在 Linux 上返回 false。
 
-## §11 · 面试题：10 道带答案的高频考点
+### 复盘题
 
 <details>
 <summary>**Q1 · 概念**：bubblewrap、seccomp、landlock 这三个工具各自的边界是什么？</summary>
@@ -880,4 +894,6 @@ function runSandboxed(cmd: string[], config: SandboxConfig): Result {
 **追问**：「跨语言怎么共享？」schema 用 JSON Schema 定义，codegen 类型；具体 backend 实现各语言独立（Rust 写 Codex bubblewrap wrapper，Python 写 Hermes docker wrapper）。协议跨语言共享，实现各管各。
 
 **源码组合**：Codex `linux-sandbox/` → Claude Code `entrypoints/sandboxTypes.ts` → OpenClaw `infra/exec-host.ts` → Hermes `tools/terminal_tool.py`。四家代码拼一起 = 沙箱框架 v0.1。
+</details>
+
 </details>

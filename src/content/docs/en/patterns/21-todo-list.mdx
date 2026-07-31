@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## A todo keeps the goal in view
 
 <Verdict tldr="A todo list is not Plan Mode, not long-term memory, and not prose in the final answer. It is the runtime progress surface for complex work: split the user goal into a small set of visible tasks, track each task with a tiny status machine, update it as facts change, and preserve unfinished work across compaction, resume, and UI surfaces. Codex has the cleanest split: `update_plan` is explicitly a TODO/checklist tool, disallowed in Plan Mode, and emits `PlanUpdate` events rendered by the TUI and app server. Claude Code has the richest task surface: `TodoWrite` manages session-local todos with `content`, `status`, and `activeForm`, while Tasks V2 adds file-backed tasks with owner, blockers, claim logic, and reminders. Hermes has the lightest version: an in-memory `todo` tool per session, with replace or merge writes, and only pending / in_progress items re-injected after compaction. OpenClaw does not have a model-owned todo list; it projects real runtime progress from tool calls, tool updates, child sessions, and compaction continuity. The rule for your own agent: keep approval plan, execution todo, and durable background task separate." />
 
-## §2 · Four Progress Surfaces
+## Four progress surfaces
 
-:::tip[Key takeaways · 30-second read]
+<details>
+<summary>Before reading (optional)</summary>
+
 - **A todo list is not Plan Mode, memory, or prose**: it is the runtime progress surface — visible tasks, a tiny status machine, updated as facts change.
 - **Four shapes**: Codex's `update_plan` is a pure checklist tool disallowed in Plan Mode; Claude Code layers `TodoWrite` with file-backed Tasks V2 (owner, blockers, claim logic); Hermes keeps an in-memory `todo` tool per session; OpenClaw has no model-owned todo and projects progress from runtime events.
 - **Structured state determines survivability**: only structured todos can be preserved across compaction, resume, and UI surfaces — Hermes re-injects only pending / in_progress items after compaction.
 - **Keep three things separate**: approval plan, execution todo, and durable background task; fusing them is the trap.
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/21-todo-list-base.svg"
@@ -47,7 +50,7 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="Dimension"
 />
 
-## §3 · Source-Grounded Implementation
+## How four systems implement task state
 
 ### Codex · checklist, not Plan Mode
 
@@ -87,7 +90,9 @@ session.send_event(turn.as_ref(), EventMsg::PlanUpdate(args)).await;
 
 The TUI then counts completed / total, updates status surfaces, and renders an Updated Plan history cell. That makes progress a protocol event and UI state, not only model narration.
 
-Codex has another easy-to-miss path: proposed plans emitted in Plan Mode are parsed into `PlanDelta` and streamed through the app-server v2 `item/plan/delta` notification, while successful `update_plan` calls become `turn/plan/updated`. That is two protocol channels: streaming proposal text and tool-submitted execution checklist.
+Codex has another easy-to-miss path: proposed plans emitted in Plan Mode are parsed into `PlanDelta` and streamed through the app-server v2 `item/plan/delta` notification, while successful `update_plan` calls become `turn/plan/updated`.
+
+That is two protocol channels: streaming proposal text and tool-submitted execution checklist.
 
 ### Claude Code · TodoWrite for session focus, Tasks V2 for durable work
 
@@ -105,13 +110,19 @@ Claude Code makes the behavior explicit in the `TodoWrite` prompt: use it for co
 
 </SourceBlock>
 
-The legacy `TodoWrite` path stores todos in AppState by `agentId` or `sessionId`, clears the list when all tasks are done, and can nudge verification when many tasks are closed without a verification item. Tasks V2 is a different layer: file-backed tasks with ids, subjects, descriptions, owner fields, blockers, claim checks, and metadata. That belongs to IDE and team workflows rather than the minimal current-focus checklist.
+The legacy `TodoWrite` path stores todos in AppState by `agentId` or `sessionId`, clears the list when all tasks are done, and can nudge verification when many tasks are closed without a verification item.
 
-Tasks V2 is not just a bigger TodoWrite. `TaskUpdateTool` is enabled only when Todo V2 is enabled, and its schema can change status, owner, activeForm, blocks, blockedBy, and metadata. `attachments.ts` also maintains separate stale-update reminders for TodoWrite and for TaskCreate / TaskUpdate. Session focus and team task boards have different reminder loops.
+Tasks V2 is a different layer: file-backed tasks with ids, subjects, descriptions, owner fields, blockers, claim checks, and metadata. That belongs to IDE and team workflows rather than the minimal current-focus checklist.
+
+Tasks V2 is not just a bigger TodoWrite. `TaskUpdateTool` is enabled only when Todo V2 is enabled, and its schema can change status, owner, activeForm, blocks, blockedBy, and metadata. `attachments.ts` also maintains separate stale-update reminders for TodoWrite and for TaskCreate / TaskUpdate.
+
+Session focus and team task boards have different reminder loops.
 
 ### Hermes · tiny state, compaction-aware injection
 
-Hermes keeps a single in-memory `TodoStore` per agent/session. It supports replace and merge writes, adds a `cancelled` state, and exposes everything through one `todo` tool. Its best idea is compaction behavior: only unfinished items return to active context.
+Hermes keeps a single in-memory `TodoStore` per agent/session. It supports replace and merge writes, adds a `cancelled` state, and exposes everything through one `todo` tool.
+
+Its best idea is compaction behavior: only unfinished items return to active context.
 
 <SourceBlock path="REF/hermes-agent/tools/todo_tool.py" lines="90-118" system="hermes" summary="Hermes only injects pending and in_progress todos after compaction.">
 
@@ -128,19 +139,27 @@ if not visible:
 
 The runtime can hydrate the store from the latest todo tool response in history. That keeps todo state session-scoped without promoting it into long-term memory.
 
-Hermes also adds runtime progress through its ACP adapter. `make_tool_progress_cb()` maps `tool.started` to ACP `ToolCallStart` and tracks duplicate same-name tool calls with a FIFO queue; `make_step_cb()` consumes completed tools from `prev_tools` and emits completion updates. This is tool-fact progress, not model-authored todo state.
+Hermes also adds runtime progress through its ACP adapter. `make_tool_progress_cb()` maps `tool.started` to ACP `ToolCallStart` and tracks duplicate same-name tool calls with a FIFO queue; `make_step_cb()` consumes completed tools from `prev_tools` and emits completion updates.
+
+This is tool-fact progress, not model-authored todo state.
 
 ### OpenClaw · runtime progress events instead of a model-owned checklist
 
-OpenClaw focuses on progress projection. Its ACP translator emits `tool_call` with `in_progress` when a tool starts, and `tool_call_update` with `completed` or `failed` when a tool ends. The auto-reply projector turns those events into visible tool summaries. The parent-stream relay forwards child-agent progress back to the parent session.
+OpenClaw focuses on progress projection. Its ACP translator emits `tool_call` with `in_progress` when a tool starts, and `tool_call_update` with `completed` or `failed` when a tool ends.
+
+The auto-reply projector turns those events into visible tool summaries. The parent-stream relay forwards child-agent progress back to the parent session.
 
 This is the right choice for a multi-channel operator surface: the most reliable progress source is often the runtime event stream, not a model-authored checklist.
 
-OpenClaw also shows the guardrail this design needs: no-progress detection. `tool-loop-detection.ts` distinguishes unchanged polling loops, ping-pong loops, and global repeat circuit breakers; the parent-stream relay has a no-output watcher that emits a stall notice when a child session stops producing output. Without those detectors, a progress UI can faithfully display that the system is stuck.
+OpenClaw also shows the guardrail this design needs: no-progress detection. `tool-loop-detection.ts` distinguishes unchanged polling loops, ping-pong loops, and global repeat circuit breakers; the parent-stream relay has a no-output watcher that emits a stall notice when a child session stops producing output.
 
-## §4 · Shared Principles
+Without those detectors, a progress UI can faithfully display that the system is stuck.
 
-The shared move is to pull progress out of free-form prose. Codex uses protocol events, Claude Code uses tool state and task files, Hermes uses tool JSON, and OpenClaw uses runtime events. A final answer that says what the agent will do next is not task management because UI, resume, reminders, and compaction cannot reliably consume it.
+## What todo systems already agree on
+
+The shared move is to pull progress out of free-form prose. Codex uses protocol events, Claude Code uses tool state and task files, Hermes uses tool JSON, and OpenClaw uses runtime events.
+
+A final answer that says what the agent will do next is not task management because UI, resume, reminders, and compaction cannot reliably consume it.
 
 The state machine stays small. `pending` / `in_progress` / `completed` is enough for the current execution surface. Add `failed`, `cancelled`, owner, or blockers only when the runtime really needs them.
 
@@ -148,7 +167,7 @@ There must be one current focus. Codex requires at most one `in_progress`; Claud
 
 Completion should lower attention. Claude Code only completes fully accomplished items, Codex crosses completed items out, Hermes does not re-inject completed items after compaction, and TodoWrite clears all-done lists.
 
-## §5 · Key Differences
+## Choose checklists, team tasks, or event projection
 
 <TradeOff
   title="Four implementation paths"
@@ -163,7 +182,7 @@ Completion should lower attention. Claude Code only completes fully accomplished
 
 The core split is three layers: approval plan, execution todo, and durable task. Plans are for user approval. Todos are for current execution focus. Durable tasks are for background or team work with owners, blockers, locks, and retries.
 
-## §6 · Score
+## My take: keep only what changes the next action
 
 <ScoreCard
   rows={[
@@ -175,7 +194,7 @@ The core split is three layers: approval plan, execution todo, and durable task.
   caption="Copy Codex for a CLI, Claude Code for IDE/team workflows, OpenClaw for operator progress, and Hermes for long-context recovery."
 />
 
-## §7 · Build Recipe
+## Start with minimal task state
 
 <BuildRecipe
   title="Todo List / Progress Surface"
@@ -203,7 +222,7 @@ The core split is three layers: approval plan, execution todo, and durable task.
   ]}
 />
 
-## §8 · Architecture Diagram
+## How task state enters the architecture
 
 <Diagram
   src="/diagrams/21-tradeoff.svg"
@@ -212,7 +231,7 @@ The core split is three layers: approval plan, execution todo, and durable task.
   wide
 />
 
-## §9 · Source Index
+## Follow task state through source
 
 <SourceTrail
   entries={[
@@ -240,7 +259,12 @@ The core split is three layers: approval plan, execution todo, and durable task.
   ]}
 />
 
-## §10 · Exercises
+## Appendix: exercises and review
+
+<details id="interview-drill">
+<summary>Open the exercises and ten review questions</summary>
+
+### Exercises
 
 1. Add an `update_task_progress` tool with `content`, `status`, and optional `activeForm`; reject multiple `in_progress` items.
 2. Emit todo updates as events and render completed / total in a CLI or Web UI.
@@ -248,7 +272,7 @@ The core split is three layers: approval plan, execution todo, and durable task.
 4. Simulate approval-only Plan Mode followed by execution and verify they use different state.
 5. Add an internal reminder after 10 assistant turns without a todo update, and ensure the reminder is not shown to the user.
 
-## §11 · Interview Drill: 10 Questions With Worked Answers
+### Review questions
 
 <details>
 <summary>**Q1 · Concept**: Why is a todo list not Plan Mode?</summary>
@@ -295,7 +319,9 @@ In a multi-channel runtime, the most reliable progress facts come from tools, ch
 <details>
 <summary>**Q8 · API**: Replace or merge?</summary>
 
-Replace is simpler and safer for a short current checklist because the model submits the whole truth each time. Merge is useful for long-running lists where partial updates and discovered branches matter, but it requires stable ids and cleanup.
+Replace is simpler and safer for a short current checklist because the model submits the whole truth each time.
+
+Merge is useful for long-running lists where partial updates and discovered branches matter, but it requires stable ids and cleanup.
 </details>
 
 <details>
@@ -307,5 +333,9 @@ Agents often treat code written as work completed. A verification nudge forces c
 <details>
 <summary>**Q10 · Checklist**: What is the minimum production progress surface?</summary>
 
-Use a tiny schema, enforce one active focus, event updates to UI and transcript, restore unfinished work after compaction or resume, and require evidence before completion. Add reminders, durable tasks, and runtime progress events only when the product shape needs them.
+Use a tiny schema, enforce one active focus, event updates to UI and transcript, restore unfinished work after compaction or resume, and require evidence before completion.
+
+Add reminders, durable tasks, and runtime progress events only when the product shape needs them.
+</details>
+
 </details>

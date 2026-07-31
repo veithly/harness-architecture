@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## When a subagent is worth the handoff
 
 <Verdict tldr="Subagents (subagent: a thread- or process-level child session the current agent spawns for a separate task) look simple on paper but turn into a minefield in production. Anyone who has actually shipped subagents has watched every failure type appear: a subagent calls itself recursively and burns tokens, a subagent ends up with tools the parent did not have (privilege escalation), a subagent runs its own approval flow and confuses the user with parallel popups, a subagent posts replies cross-platform and creates duplicates, a subagent writes to the parent's long-term memory and poisons it. So the real question this chapter answers is «in the face of those failure modes, what hard boundaries must the framework enforce». And the four systems give wildly different answers. Codex takes the «type every subagent use case» route: every spawn entry must carry a `SubAgentSource` enum (Rust algebraic data type: the caller picks one concrete variant and cannot omit the field) declaring the purpose (`Review` for user-triggered code review, `Compact` for context compression, `ThreadSpawn` for user-configured templates, `MemoryConsolidation` for periodic memory promotion, `Other` for plugin / experimental escape hatches), and each source routes to a different prompt / permission / telemetry path. The critical engineering discipline is that subagents must inherit 7 core services from the parent session (`exec_policy`, `plugins`, `mcp_manager`, `skills_manager`, `environment_manager`, `agent_control`, …) and can never be more permissive than the parent. There is no «spawn a subagent to bypass execpolicy» escape route. Approvals are forced back to the parent session, and subagents never own UI. Claude Code goes the opposite way and unifies subagents with every other async execution: a generic `Task` abstraction covers everything «runs in the background and returns later», with 7 `TaskType` variants (`local_bash` for shell commands, `local_agent` for local subagents, `remote_agent` for remote endpoints, `in_process_teammate` for same-process teammates, `local_workflow`, `monitor_mcp` for long-running MCP monitors, `dream` for background prefetch) and a clean `TaskStatus` state machine (`pending` / `running` / `completed` / `failed` / `killed`). Every tool self-reports `isConcurrencySafe()` (a boolean method on the tool instance) so the dispatcher decides whether to parallelise with the rest of the turn's tool calls. OpenClaw built the most complete subagent platform, one subsystem split across 6 files (`spawn`, `registry`, `depth` for cross-process depth persistence, `announce` for completion push, `attachments` for file passing, `lifecycle-events`), and `SpawnSubagentParams` carries 13 configuration fields (task, label, agentId, model, timeout, mode, cleanup, sandbox, attachments, …). The most distinctive bit: the anti-pattern warning «do not poll, wait for the push event» is literally written into the spawn tool's return-value text so the model reads it as it decides what to do next. This is an engineering fix for the «subagent mode burns tokens polling» failure mode. Hermes takes the most restrained route: a single `delegate_task` function (parameters: `goal`, `context`, `toolset` whitelist, `max_iterations`), with the critical safety constraints baked into constants. `MAX_DEPTH=2` is a hard-coded ceiling (parent 0 → child 1 → grandchild rejected); 5 tools are hard-blocked from recursive spawning (`delegate_task` / `clarify` / `memory` / `send_message` / `execute_code`, removed from any subagent's toolset); the parent uses `ThreadPoolExecutor` (Python stdlib thread-pool) to synchronously block on all children; a heartbeat fires every 30 seconds so the UI knows the run is alive. Building an orchestration framework? Borrow from OpenClaw. Building an agent product where subagent use cases are clear? Borrow from Codex. Unifying async execution? Borrow from Claude Code. Want the simplest reliable delegation? Borrow from Hermes." />
 
-## §2 · Reference architecture
+## Four delegation abstractions
 
-:::tip[Key takeaways · 30-second read]
+<details>
+<summary>Before reading (optional)</summary>
+
 - **A production minefield**: recursive self-spawns, privilege escalation, parallel approval popups, cross-platform duplicates, and memory poisoning all happen; the real question is what hard boundaries the framework must enforce.
 - **Four spawn models**: Codex types every spawn with a `SubAgentSource` enum and forces children to inherit 7 core services from the parent; Claude Code unifies async work under 7 `TaskType` variants with `isConcurrencySafe()`; OpenClaw ships a 6-file platform with 13-field `SpawnSubagentParams`; Hermes exposes one `delegate_task` with `MAX_DEPTH=2` and 5 hard-blocked tools.
 - **Inheritance beats configuration**: children inheriting the parent's `exec_policy` / `plugins` / `mcp_manager` determines whether "spawn a subagent to bypass execpolicy" is even possible.
 - **Kill the polling habit**: OpenClaw writes "do not poll, wait for the push event" into the spawn tool's return text—polling subagents is the token-burning failure mode to design against.
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/10-subagents-base.svg"
@@ -47,11 +50,15 @@ How the four systems cover the five concurrency-critical concerns:
   dimensionLabel="Dimension"
 />
 
-## §3 · How each system does it
+## How four systems spawn child agents
 
 ### Codex · Split "spawn subagent" into 5 typed sources, each routing to a different permission and prompt path
 
-Codex's core judgement on subagents is this: "spawn a subagent" should not be an undifferentiated function call but a set of semantically distinct behaviours. Even though "user manually triggers /review for code review", "context exceeded so trigger summarisation", "user invokes their own ThreadSpawn template", and "system periodically consolidates memory" are all 'spawn a subagent', they use different prompts, allow different tools, expect different output shapes, may or may not show in the UI, and emit different telemetry. If they all funnel through one generic spawn function, every caller has to manually configure these differences themselves, and the configuration will drift as call sites multiply.
+Codex's starting point on subagents is this: "spawn a subagent" should not be an undifferentiated function call but a set of semantically distinct behaviours.
+
+Even though "user manually triggers /review for code review", "context exceeded so trigger summarisation", "user invokes their own ThreadSpawn template", and "system periodically consolidates memory" are all 'spawn a subagent', they use different prompts, allow different tools, expect different output shapes, may or may not show in the UI, and emit different telemetry.
+
+If they all funnel through one generic spawn function, every caller has to manually configure these differences themselves, and the configuration will drift as call sites multiply.
 
 So Codex forces every spawn to carry a SubAgentSource enum value that explicitly tells the system what kind of subagent this is:
 
@@ -81,9 +88,21 @@ pub enum SubAgentSource {
 
 </SourceBlock>
 
-These 5 sources carry very different semantics and constraints. `Review` corresponds to the user typing /review for code review: the subagent runs the review-specific system prompt and disables a set of features (see chapter 09), output is a structured code review report. `Compact` corresponds to system-triggered context compression when token limit is hit. The subagent receives the entire parent conversation history and outputs a "semantically preserved but shorter summary" (see chapter 11 on session lifecycle). `ThreadSpawn` is the user-configured subagent template, freely composable via agent_role and agent_nickname (e.g. "define a testwriter agent specifically for adding tests to my code"); critically, this variant carries a depth field so the framework can track "how deep is the current call chain" and reject further spawns past a configured limit. `MemoryConsolidation` is periodic memory consolidation: the subagent runs in background to distill long-term-worthy insights from conversation history into memory entries (see chapter 16). `Other(String)` is an escape hatch for plugins and experimental scenarios, but the string must be explicit. "Anonymous spawn" is forbidden.
+These 5 sources carry very different semantics and constraints. `Review` corresponds to the user typing /review for code review: the subagent runs the review-specific system prompt and disables a set of features (see chapter 09), output is a structured code review report. `Compact` corresponds to system-triggered context compression when token limit is hit.
 
-The benefits of this typing are immediate. First, dispatch can branch on source: Review goes through review prompt, Compact goes through summarise prompt, MemoryConsolidation runs silently in background, ThreadSpawn shows up in the user's UI, Other gets the strictest default constraints. Without this typing, dispatch would have to heuristically infer from prompt content, fragile and unmaintainable. Second, telemetry is consistent: every spawn event automatically carries a source label, and analysis can ask "how many Reviews last week, average duration, failure rate?" rather than manually mining a pile of spawn logs. Third, the permission path is explicit: each source maps to its own feature constraints (Review automatically disables web_search because reviewing code doesn't need network, while ThreadSpawn allows it by default), and dispatch just looks up the table by source.
+The subagent receives the entire parent conversation history and outputs a "semantically preserved but shorter summary" (see chapter 11 on session lifecycle). `ThreadSpawn` is the user-configured subagent template, freely composable via agent_role and agent_nickname (e.g.
+
+"define a testwriter agent specifically for adding tests to my code"); critically, this variant carries a depth field so the framework can track "how deep is the current call chain" and reject further spawns past a configured limit. `MemoryConsolidation` is periodic memory consolidation: the subagent runs in background to distill long-term-worthy insights from conversation history into memory entries (see chapter 16). `Other(String)` is an escape hatch for plugins and experimental scenarios, but the string must be explicit.
+
+"Anonymous spawn" is forbidden.
+
+The benefits of this typing are immediate. First, dispatch can branch on source: Review goes through review prompt, Compact goes through summarise prompt, MemoryConsolidation runs silently in background, ThreadSpawn shows up in the user's UI, Other gets the strictest default constraints.
+
+Without this typing, dispatch would have to heuristically infer from prompt content, fragile and unmaintainable.
+
+Second, telemetry is consistent: every spawn event automatically carries a source label, and analysis can ask "how many Reviews last week, average duration, failure rate?" rather than manually mining a pile of spawn logs.
+
+Third, the permission path is explicit: each source maps to its own feature constraints (Review automatically disables web_search because reviewing code doesn't need network, while ThreadSpawn allows it by default), and dispatch just looks up the table by source.
 
 Spawning itself goes through one entry point `Codex::spawn(CodexSpawnArgs { ... })`, but the args carry many services inherited from the parent session:
 
@@ -125,13 +144,27 @@ pub(crate) async fn run_codex_thread_interactive(
 
 </SourceBlock>
 
-Look at `inherited_exec_policy`: this is the most critical safety boundary in Codex's subagent design. A child cannot be more permissive than its parent: a binary the parent forbids is also forbidden for the child, no "spawn a subagent to bypass execpolicy" escape route. This single constraint shuts down a particularly nasty attack pattern. If parent and child could have separate permissions, a malicious prompt could induce the agent to spawn a subagent "to help me run this tool" and bypass the parent's restrictions, effectively adding a privilege escalation attack surface. Codex closes that path directly. The same logic applies to plugins / mcp_manager / skills_manager / environment_manager / agent_control / models_manager / auth_manager: they are all Arc references inherited from the parent, the child sees exactly the parent's toolset (minus any explicitly disabled features), with no path to gaining capabilities the parent lacks.
+Look at `inherited_exec_policy`: this is the most critical safety boundary in Codex's subagent design.
 
-Approval handling follows the same logic: when a subagent wants to run a risky command, it does not pop its own UI dialog for user approval (if it did, the user would see a flurry of popups from different subagents with no way to make sense of them); instead, the approval event is pushed back to the parent session, which decides whether to surface a prompt. So from the user's perspective, every approval comes from the parent agent; subagents are "an extension of the parent's hand", UI consistency stays intact. This is the same idea as the review sub-agent's `AskForApproval::Never` in chapter 09 applied generally: subagents never own the UI, all user interaction goes through the parent.
+A child cannot be more permissive than its parent: a binary the parent forbids is also forbidden for the child, no "spawn a subagent to bypass execpolicy" escape route. This single constraint shuts down a particularly nasty attack pattern.
+
+If parent and child could have separate permissions, a malicious prompt could induce the agent to spawn a subagent "to help me run this tool" and bypass the parent's restrictions, effectively adding a privilege escalation attack surface.
+
+Codex closes that path directly. The same logic applies to plugins / mcp_manager / skills_manager / environment_manager / agent_control / models_manager / auth_manager: they are all Arc references inherited from the parent, the child sees exactly the parent's toolset (minus any explicitly disabled features), with no path to gaining capabilities the parent lacks.
+
+Approval handling follows the same logic: when a subagent wants to run a risky command, it does not pop its own UI dialog for user approval (if it did, the user would see a flurry of popups from different subagents with no way to make sense of them); instead, the approval event is pushed back to the parent session, which decides whether to surface a prompt.
+
+So from the user's perspective, every approval comes from the parent agent; subagents are "an extension of the parent's hand", UI consistency stays intact.
+
+This is the same idea as the review sub-agent's `AskForApproval::Never` in chapter 09 applied generally: subagents never own the UI, all user interaction goes through the parent.
 
 ### Claude Code · Unify subagents with every other async execution into one Task abstraction
 
-Claude Code thinks about subagents very differently from Codex. It observes a fact: "spawn a subagent to do work" is really a special case of "asynchronously execute something that takes time", and the IDE scenario has many more async-execution cases than just subagents. Running a local bash command is async, calling a remote agent service is async, collaborating with another teammate agent in the same process is async, running a workflow is async. Writing separate lifecycle managers, state machines, concurrency controls, and UI displays for each async execution type incurs high long-term maintenance cost, and behaviour drifts apart (a bash-task cancel mechanism diverging from a subagent cancel mechanism, etc.).
+Claude Code thinks about subagents very differently from Codex. It observes a fact: "spawn a subagent to do work" is really a special case of "asynchronously execute something that takes time", and the IDE scenario has many more async-execution cases than just subagents.
+
+Running a local bash command is async, calling a remote agent service is async, collaborating with another teammate agent in the same process is async, running a workflow is async.
+
+Writing separate lifecycle managers, state machines, concurrency controls, and UI displays for each async execution type incurs high long-term maintenance cost, and behaviour drifts apart (a bash-task cancel mechanism diverging from a subagent cancel mechanism, etc.).
 
 So Claude Code abstracts all async executions into one unified Task concept, with TaskType being an enum of 7 variants:
 
@@ -166,17 +199,35 @@ export function isTerminalTaskStatus(status: TaskStatus): boolean {
 
 </SourceBlock>
 
-The 7 TaskTypes each cover a specific async-execution scenario. `local_bash` is "run a shell command locally" (cd to a directory, run tests, run lint); it shares the same lifecycle management as spawning a subagent but does not involve LLM calls. `local_agent` is "run a subagent locally" (Codex-style subagent), primarily for letting the model split a big task off to a focused subagent. `remote_agent` is "call a remote agent service" (e.g. an Anthropic-deployed endpoint specialised for one task). `in_process_teammate` is "collaborate with another teammate agent in the same process". Typical use is an IDE with multiple agent profiles each handling a slice (one writes code, one writes docs, one does review), spawning each other when needed. `local_workflow` is "run a predefined workflow" (e.g. a "release process" or "review process" composed of multiple standardised steps). `monitor_mcp` is "run a long-running MCP monitor task" (e.g. monitoring GitHub PR status changes). `dream` is the most distinctive new one introduced in Claude Code 2.1, a "background prefetch subagent". While the user is having their main conversation, a dream task in the background prepares resources that might be needed (e.g. pre-greps relevant project files, pre-loads relevant docs); this is the only TaskType not directly user-triggered, the reason it exists is "make the agent feel faster" (resources are already prepared by the time the user asks).
+The 7 TaskTypes each cover a specific async-execution scenario. `local_bash` is "run a shell command locally" (cd to a directory, run tests, run lint); it shares the same lifecycle management as spawning a subagent but does not involve LLM calls. `local_agent` is "run a subagent locally" (Codex-style subagent), primarily for letting the model split a big task off to a focused subagent. `remote_agent` is "call a remote agent service" (e.g. an Anthropic-deployed endpoint specialised for one task). `in_process_teammate` is "collaborate with another teammate agent in the same process".
 
-TaskStatus is a clean state machine: pending (waiting to schedule), running (executing), completed (succeeded), failed (errored), killed (cancelled). `isTerminalTaskStatus(status)` is a simple helper for "has this task reached a terminal state", used to prevent injecting messages into dead teammates, evicting tasks from AppState when terminal, and orphan resource cleanup. The "state machine terminal state" abstraction is foundational but critical in async execution systems. Without it, you get a flood of race conditions.
+Typical use is an IDE with multiple agent profiles each handling a slice (one writes code, one writes docs, one does review), spawning each other when needed. `local_workflow` is "run a predefined workflow" (e.g. a "release process" or "review process" composed of multiple standardised steps). `monitor_mcp` is "run a long-running MCP monitor task" (e.g. monitoring GitHub PR status changes). `dream` is the most distinctive new one introduced in Claude Code 2.1, a "background prefetch subagent".
 
-Every task also self-reports whether it is "concurrency-safe": every tool implements an `isConcurrencySafe()` interface returning true or false, and the dispatcher (chapter 04 on tool system) reads this value to decide whether to run this tool in parallel with the rest of the turn's tool calls. For instance, reading a file is concurrency-safe (multiple parallel reads have no side effect), writing to a file is not (two parallel writes to the same file produce chaos), spawning a subagent is usually safe (each subagent carries independent state), running a bash command is usually not safe (commands may have side-effect dependencies on each other). This "tool self-declared capability" frees the dispatcher from hard-coding concurrency rules per tool.
+While the user is having their main conversation, a dream task in the background prepares resources that might be needed (e.g. pre-greps relevant project files, pre-loads relevant docs); this is the only TaskType not directly user-triggered, the reason it exists is "make the agent feel faster" (resources are already prepared by the time the user asks).
 
-Claude Code also provides a set of tools the model uses to manage the task list itself: `TaskCreateTool` creates a new task, `TaskListTool` lists currently active tasks, `TaskUpdateTool` injects new info into a task, `TaskGetTool` retrieves task results, `TaskStopTool` terminates a task. These 5 tools form a user-level API, and the model can decide in its prompt "I will spawn 3 subagents to do these three things in parallel, then wait for all to complete before consolidating". Every task writes its output to disk via outputFile, keeping the main process from running out of memory from many subagent outputs. This is a very pragmatic engineering detail.
+TaskStatus is a clean state machine: pending (waiting to schedule), running (executing), completed (succeeded), failed (errored), killed (cancelled). `isTerminalTaskStatus(status)` is a simple helper for "has this task reached a terminal state", used to prevent injecting messages into dead teammates, evicting tasks from AppState when terminal, and orphan resource cleanup.
+
+The "state machine terminal state" abstraction is foundational but critical in async execution systems. Without it, you get a flood of race conditions.
+
+Every task also self-reports whether it is "concurrency-safe": every tool implements an `isConcurrencySafe()` interface returning true or false, and the dispatcher (chapter 04 on tool system) reads this value to decide whether to run this tool in parallel with the rest of the turn's tool calls.
+
+For instance, reading a file is concurrency-safe (multiple parallel reads have no side effect), writing to a file is not (two parallel writes to the same file produce chaos), spawning a subagent is usually safe (each subagent carries independent state), running a bash command is usually not safe (commands may have side-effect dependencies on each other).
+
+This "tool self-declared capability" frees the dispatcher from hard-coding concurrency rules per tool.
+
+Claude Code also provides a set of tools the model uses to manage the task list itself: `TaskCreateTool` creates a new task, `TaskListTool` lists currently active tasks, `TaskUpdateTool` injects new info into a task, `TaskGetTool` retrieves task results, `TaskStopTool` terminates a task.
+
+These 5 tools form a user-level API, and the model can decide in its prompt "I will spawn 3 subagents to do these three things in parallel, then wait for all to complete before consolidating".
+
+Every task writes its output to disk via outputFile, keeping the main process from running out of memory from many subagent outputs. This is a very pragmatic engineering detail.
 
 ### OpenClaw · Build subagents as a complete subsystem: 6 modules + 13 fields + anti-polling warning
 
-OpenClaw does the most on subagents, building it as an independent subsystem rather than just a tool call. Open the source and you see a coordinated set of files: `subagent-spawn.ts` handles creation, `subagent-registry.ts` handles tracking active subagents, `subagent-depth.ts` handles cross-process depth persistence, `subagent-announce.ts` handles completion push, `subagent-attachments.ts` handles file attachments to subagents, `subagent-lifecycle-events.ts` handles lifecycle events (start / complete / fail / cancel). This "6-file coordination" decomposition shows OpenClaw does not treat subagents as a lightweight tool but as a first-class runtime entity peer to the main agent.
+OpenClaw does the most on subagents, building it as an independent subsystem rather than just a tool call.
+
+Open the source and you see a coordinated set of files: `subagent-spawn.ts` handles creation, `subagent-registry.ts` handles tracking active subagents, `subagent-depth.ts` handles cross-process depth persistence, `subagent-announce.ts` handles completion push, `subagent-attachments.ts` handles file attachments to subagents, `subagent-lifecycle-events.ts` handles lifecycle events (start / complete / fail / cancel).
+
+This "6-file coordination" decomposition shows OpenClaw does not treat subagents as a lightweight tool but as a first-class runtime entity peer to the main agent.
 
 The most direct illustration: `SpawnSubagentParams` has 13 configuration fields:
 
@@ -207,7 +258,9 @@ export type SpawnSubagentParams = {
 
 </SourceBlock>
 
-Each of these 13 fields solves a specific scenario. `task` is the description of what the subagent should do. `label` is the human-readable name (so the parent can say in status updates "review-agent still running, test-writer completed"). `agentId` chooses which agent profile to use (OpenClaw supports multiple agent templates). `model` lets the subagent use a different model from the parent (e.g. parent uses sonnet but the child uses opus for harder reasoning). `thinking` specifies reasoning depth (low / medium / high). `runTimeoutSeconds` is the subagent's maximum execution time (it gets killed past this). `thread` decides whether to start a new thread or extend the parent's. `mode` is "run" or "session": run ends after completion, session stays alive for follow-up. `cleanup` decides whether to delete or keep the subagent's session data after completion (keep for debugging, delete to save disk). `sandbox` decides whether to inherit the parent's sandbox or require an independent one. `expectsCompletionMessage` decides whether the parent waits synchronously or fire-and-forget. `attachments` is a list of file attachments to pass to the subagent (each with name / content / encoding / mimeType). `attachMountPath` is where the attachments mount inside the subagent's sandbox. This "13 dimensions configurable" makes OpenClaw able to serve very diverse agent orchestration scenarios, but it also means new users will trip over mode / cleanup / sandbox enum fields. Sensible defaults and clear docs are critical.
+Each of these 13 fields solves a specific scenario. `task` is the description of what the subagent should do. `label` is the human-readable name (so the parent can say in status updates "review-agent still running, test-writer completed"). `agentId` chooses which agent profile to use (OpenClaw supports multiple agent templates). `model` lets the subagent use a different model from the parent (e.g. parent uses sonnet but the child uses opus for harder reasoning). `thinking` specifies reasoning depth (low / medium / high). `runTimeoutSeconds` is the subagent's maximum execution time (it gets killed past this). `thread` decides whether to start a new thread or extend the parent's. `mode` is "run" or "session": run ends after completion, session stays alive for follow-up. `cleanup` decides whether to delete or keep the subagent's session data after completion (keep for debugging, delete to save disk). `sandbox` decides whether to inherit the parent's sandbox or require an independent one. `expectsCompletionMessage` decides whether the parent waits synchronously or fire-and-forget. `attachments` is a list of file attachments to pass to the subagent (each with name / content / encoding / mimeType). `attachMountPath` is where the attachments mount inside the subagent's sandbox.
+
+This "13 dimensions configurable" makes OpenClaw able to serve very diverse agent orchestration scenarios, but it also means new users will trip over mode / cleanup / sandbox enum fields. Sensible defaults and clear docs are critical.
 
 OpenClaw's most distinctive design is push-based completion + writing the anti-polling warning literally into the spawn tool's return value text:
 
@@ -222,7 +275,9 @@ export const SUBAGENT_SPAWN_ACCEPTED_NOTE =
 
 That string is literally the spawn tool's return value. After spawning a subagent, the model reads this and is explicitly told four things: "do not poll" (do not call sessions_list, sessions_history, exec sleep, or any other tool that tries to actively query subagent state), "wait for push events" (the subagent's completion arrives as a user message automatically delivered into the parent's conversation), "track the expected child session keys" (remember the session keys you got at spawn time; only give a final answer once all expected keys have completed), "if a completion arrives after your final answer, reply NO_REPLY" (do not respond again, avoid duplicating content).
 
-This "write engineering discipline directly into tool output text" looks simple-minded but is extremely effective: the model reads the spawn return value while deciding what to do next, and telling it "do not poll" in the spawn output is far more visible and actionable than burying it in the system prompt. This is an engineering fix for the "subagent mode burns tokens polling" anti-pattern, reflecting the OpenClaw team having observed the same issue recurring in real use and deciding to use the tool return text as an in-context warning.
+This "write engineering discipline directly into tool output text" looks simple-minded but is extremely effective: the model reads the spawn return value while deciding what to do next, and telling it "do not poll" in the spawn output is far more visible and actionable than burying it in the system prompt.
+
+This is an engineering fix for the "subagent mode burns tokens polling" anti-pattern, reflecting the OpenClaw team having observed the same issue recurring in real use and deciding to use the tool return text as an in-context warning.
 
 Depth information is persisted to the session store rather than kept in memory:
 
@@ -260,11 +315,21 @@ function normalizeSpawnDepth(value: unknown): number | undefined {
 
 </SourceBlock>
 
-This matches OpenClaw's overall positioning, a long-lived agent platform where sessions resume across processes, so subagent depth has to be persistent state, not an in-memory variable scoped to the process. Imagine the scenario: parent agent spawns a subagent, then the process is restarted by the IDE; after restart, the parent session resumes and the subagent resumes too. If depth lived only in memory, both would restart from depth=0 after restart, breaking the "max N levels of recursion" guarantee (because in principle after restart you could spawn another N levels). Persisting to the session store prevents that corner case.
+This matches OpenClaw's overall positioning, a long-lived agent platform where sessions resume across processes, so subagent depth has to be persistent state, not an in-memory variable scoped to the process.
+
+Imagine the scenario: parent agent spawns a subagent, then the process is restarted by the IDE; after restart, the parent session resumes and the subagent resumes too.
+
+If depth lived only in memory, both would restart from depth=0 after restart, breaking the "max N levels of recursion" guarantee (because in principle after restart you could spawn another N levels).
+
+Persisting to the session store prevents that corner case.
 
 ### Hermes · The most restrained subagent model: one function + 5 hard-blocked tools + MAX_DEPTH baked in
 
-Hermes's subagent design is the simplest in this chapter: just one `delegate_task(goal, context, toolset, max_iterations)` function. It looks like "didn't do it" levels of minimalism, but it is actually "did the most important things, declined to do the rest" restraint. The reason: Hermes itself is a chat agent (multi-platform chat), not an agent orchestration framework, so its subagent needs come down to one thing, "give a clearly defined sub-task to a temporary agent, get the result", and it does not need OpenClaw's level of complex lifecycle management.
+Hermes's subagent design is the simplest in this chapter: just one `delegate_task(goal, context, toolset, max_iterations)` function.
+
+It looks like "didn't do it" levels of minimalism, but it is actually "did the most important things, declined to do the rest" restraint.
+
+The reason: Hermes itself is a chat agent (multi-platform chat), not an agent orchestration framework, so its subagent needs come down to one thing, "give a clearly defined sub-task to a temporary agent, get the result", and it does not need OpenClaw's level of complex lifecycle management.
 
 But "simple" is not "undesigned". Hermes's critical safety constraints are all baked into constants so no caller can bypass them:
 
@@ -298,11 +363,25 @@ MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 
 </SourceBlock>
 
-Each of these 5 hard-blocked tools corresponds to a real disaster Hermes actually hit in production. If `delegate_task` self-recursion were not blocked, the subagent could spawn the same tool calling itself. It instantly turns into infinite nesting: every level doubles the tokens, in a few levels the context window blows up and the bill goes wild. `clarify` is Hermes's tool for the agent to ask the user for clarification. Subagents should not have it because the user is currently in conversation with the parent agent, and a subagent unilaterally questioning the user creates UI chaos where nobody can tell who is asking what. `memory` is Hermes's tool for writing to long-term MEMORY.md; letting a subagent write would pollute the parent's long-term preferences. Subagents are temporary, what they learn shouldn't affect the parent's permanent state. `send_message` is the tool for sending to Telegram / Slack / Discord; letting a subagent use it would cause cross-platform duplicate messages (one Telegram message gets sent by parent and child both). `execute_code` is the tool for running a Python sandbox. Subagents shouldn't use it because they are scoped to "use existing tools to solve one focused problem"; spawning another Python sandbox makes the reasoning chain hard to trace.
+Each of these 5 hard-blocked tools corresponds to a real disaster Hermes actually hit in production. If `delegate_task` self-recursion were not blocked, the subagent could spawn the same tool calling itself.
 
-These 5 restrictions share one property: they are not "subagents might abuse them so block", they are "this role conceptually should not have this capability". That is a design principle worth learning: restrictions are not about distrusting the model but about cleanly defining "this role does not have this capability".
+It instantly turns into infinite nesting: every level doubles the tokens, in a few levels the context window blows up and the bill goes wild. `clarify` is Hermes's tool for the agent to ask the user for clarification.
 
-The meaning of MAX_DEPTH = 2 is: the root agent (the one the user is talking to) is depth 0, it can spawn subagents at depth 1, depth 1 subagents trying to spawn further are rejected (because they don't have the delegate_task tool). Why 2 and not 3 or 5? The Hermes team's experience: practically useful subagent tasks almost always fit in one layer (parent focuses on one thing and delegates a helper task out); going to the second layer typically reflects the model falling into a useless decomposition loop (every sub-task gets further decomposed to grandchildren that don't actually need it). Allowing more than 2 levels wastes tokens in 99% of scenarios rather than truly needing more depth.
+Subagents should not have it because the user is currently in conversation with the parent agent, and a subagent unilaterally questioning the user creates UI chaos where nobody can tell who is asking what. `memory` is Hermes's tool for writing to long-term MEMORY.md; letting a subagent write would pollute the parent's long-term preferences.
+
+Subagents are temporary, what they learn shouldn't affect the parent's permanent state. `send_message` is the tool for sending to Telegram / Slack / Discord; letting a subagent use it would cause cross-platform duplicate messages (one Telegram message gets sent by parent and child both). `execute_code` is the tool for running a Python sandbox.
+
+Subagents shouldn't use it because they are scoped to "use existing tools to solve one focused problem"; spawning another Python sandbox makes the reasoning chain hard to trace.
+
+These 5 restrictions share one property: they are not "subagents might abuse them so block", they are "this role conceptually should not have this capability".
+
+That is a design principle worth learning: restrictions are not about distrusting the model but about cleanly defining "this role does not have this capability".
+
+The meaning of MAX_DEPTH = 2 is: the root agent (the one the user is talking to) is depth 0, it can spawn subagents at depth 1, depth 1 subagents trying to spawn further are rejected (because they don't have the delegate_task tool).
+
+Why 2 and not 3 or 5? The Hermes team's experience: practically useful subagent tasks almost always fit in one layer (parent focuses on one thing and delegates a helper task out); going to the second layer typically reflects the model falling into a useless decomposition loop (every sub-task gets further decomposed to grandchildren that don't actually need it).
+
+Allowing more than 2 levels wastes tokens in 99% of scenarios rather than truly needing more depth.
 
 Concurrency goes through `ThreadPoolExecutor`:
 
@@ -339,9 +418,15 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 
 </SourceBlock>
 
-The parent synchronously blocks on `as_completed()` waiting for all children to complete; during execution a heartbeat fires every 30 seconds so the upper UI knows the parent is still waiting (not deadlocked). This is the classic synchronous concurrency model, the opposite of OpenClaw's push-based async. The upside of synchronous-blocking is the parent's logic is dead simple (spawn all children, wait for all, consolidate); the downside is the parent cannot do anything else while waiting, which hurts UI responsiveness for long tasks. Hermes chooses synchronous because its subagent tasks are typically short (completing in 1-2 minutes), the UX loss of synchronous wait is small, and it buys extreme code simplicity.
+The parent synchronously blocks on `as_completed()` waiting for all children to complete; during execution a heartbeat fires every 30 seconds so the upper UI knows the parent is still waiting (not deadlocked).
 
-## §4 · What the four systems agree on at the subagent layer
+This is the classic synchronous concurrency model, the opposite of OpenClaw's push-based async.
+
+The upside of synchronous-blocking is the parent's logic is dead simple (spawn all children, wait for all, consolidate); the downside is the parent cannot do anything else while waiting, which hurts UI responsiveness for long tasks.
+
+Hermes chooses synchronous because its subagent tasks are typically short (completing in 1-2 minutes), the UX loss of synchronous wait is small, and it buys extreme code simplicity.
+
+## What subagent systems already agree on
 
 Despite wildly different implementation depth, four things are universally agreed. These consensus points reflect inescapable hard constraints of subagent engineering.
 
@@ -353,7 +438,7 @@ Despite wildly different implementation depth, four things are universally agree
 
 **The fourth is that subagent completion notification must avoid polling: either push events or await futures.** Codex pushes `EventMsg::TurnComplete` to the parent via receiver/sender, OpenClaw actively pushes notifications to the parent via subagent-announce with an explicit "do not poll" warning, Hermes uses `as_completed()` to await futures, Claude Code triggers callbacks via TaskStatus state machine transitions. None uses "parent loops querying child status" polling. The reason is very practical: under polling, the model repeatedly calls sessions_list / sessions_history wasting massive tokens on "is it done yet", while push lets the model just wait, token efficiency orders of magnitude better.
 
-## §5 · Where the four diverge most sharply on subagents
+## Choose typed delegation, generic tasks, or a platform
 
 <Diagram
   src="/diagrams/10-tradeoff.svg"
@@ -361,7 +446,9 @@ Despite wildly different implementation depth, four things are universally agree
   caption="Hermes function-style is the lightest; Codex typed enum sits in the middle; Claude Code Task gives the most concurrency freedom; OpenClaw is the heaviest, full-platform abstraction."
 />
 
-While the agreements above are the floor, the divergence on "how heavy should the subagent abstraction be" is what really decides which approach suits which product. Viewed through "what kind of agent are you building", the four trade-offs each map to one best-fit scenario.
+While the agreements above are the floor, the divergence on "how heavy should the subagent abstraction be" is what really decides which approach suits which product.
+
+Viewed through "what kind of agent are you building", the four trade-offs each map to one best-fit scenario.
 
 **If you are building an agent orchestration framework hoping users write all sorts of subagent workflows, then OpenClaw's full subagent platform is the right choice.** In this scenario, capabilities like "cleanly managing dozens of concurrent subagents", "persisting subagent state across processes", "passing attachments to subagents" are all required, and OpenClaw's 6-module split + 13-field config + push-based completion + depth persistence covers these needs. The cost is high new-user ramp-up (every one of 13 fields must be understood, every one of 6 submodules must be maintained), but for a framework-positioned product this is unavoidable complexity.
 
@@ -371,7 +458,7 @@ While the agreements above are the floor, the divergence on "how heavy should th
 
 **If you are building a simple conversational agent and only need the "delegate a task to a throwaway subagent" capability, then Hermes's delegate_task function + 5 hard-blocked tools is the right choice.** In this scenario, the entire subagent module is one function plus a few constants, a new engineer can fully understand it in 5 minutes, and every restriction has a clear failure case it prevents. The cost is missing advanced features like attachments / mode / cleanup, and the synchronous blocking model freezes the UI on long tasks, but for simple chat agents none of these matter.
 
-## §6 · My takeaway
+## My take: price the handoff first
 
 <ScoreCard
   rows={[
@@ -384,7 +471,7 @@ While the agreements above are the floor, the divergence on "how heavy should th
   headers={['System', 'Score', 'Strengths', 'Risks']}
 />
 
-## §7 · Build recipe
+## Start with one constrained delegation
 
 Below is the recipe distilled from the four systems for writing your own sub-agent. Start functional, then add production-grade features, finally avoid five common dead ends.
 
@@ -414,7 +501,7 @@ Below is the recipe distilled from the four systems for writing your own sub-age
   ]}
 />
 
-## §8 · Four subagent flows side by side
+## Four subagent flows side by side
 
 <Diagram
   src="/diagrams/10-subagent-flows.svg"
@@ -424,7 +511,7 @@ Below is the recipe distilled from the four systems for writing your own sub-age
 
 Lined up, the abstraction-depth spectrum is one glance: function (Hermes) -> typed enum (Codex) -> task abstraction (Claude Code) -> full platform (OpenClaw).
 
-## §9 · Further reading / source entry points
+## Follow spawn entry points through source
 
 <SourceTrail
   title="Further reading / source entry points"
@@ -444,14 +531,19 @@ Lined up, the abstraction-depth spectrum is one glance: function (Hermes) -> typ
   ]}
 />
 
-## §10 · Exercises
+## Appendix: exercises and review
+
+<details id="interview-drill">
+<summary>Open the exercises and ten review questions</summary>
+
+### Exercises
 
 1. **Easy**: write a `delegate_task` function with args `goal / context / toolset / max_iterations`. The child toolset hard-blocks recursive delegate.
 2. **Medium**: add a depth limit. Record `spawn_depth` in the session and reject spawns beyond 2. Verify: a three-level spawn fails at level 3 with an error containing the depth.
 3. **Medium**: push-based completion. The parent must not poll for child status. The child's completion arrives as a user message in the parent's next turn. Verify: after spawning, the parent can only wait for the message, not call `sessions_list`.
 4. **Hard**: type the source. Define a `SubAgentSource` enum with at least Review / Compact / ThreadSpawn. Each source uses a different system prompt and a different feature constraint. Verify: Review disables web_search automatically; ThreadSpawn allows web_search.
 
-## §11 · Interview drill: 10 questions with worked answers
+### Review questions
 
 <details>
 <summary>**Q1 · Concept**: Why does Codex type the subagent source as a `SubAgentSource` enum? Wouldn't a single `spawn(prompt)` function do?</summary>
@@ -460,19 +552,29 @@ Typing solves three concrete problems:
 
 **1. Dispatch paths diverge.**
 
-The five sources take genuinely different code paths. Review loads the review prompt and disables a batch of features; Compact switches to the summarization prompt while allowing some tools; MemoryConsolidation goes through the memory subsystem and cannot use file edit; ThreadSpawn is a user template whose feature set is config-driven. With a generic `spawn(prompt)`, all that logic moves to the caller; every new type forces every caller to be updated. The enum keeps dispatch centralized.
+The five sources take genuinely different code paths. Review loads the review prompt and disables a batch of features; Compact switches to the summarization prompt while allowing some tools;
+
+MemoryConsolidation goes through the memory subsystem and cannot use file edit; ThreadSpawn is a user template whose feature set is config-driven.
+
+With a generic `spawn(prompt)`, all that logic moves to the caller; every new type forces every caller to be updated. The enum keeps dispatch centralized.
 
 **2. Telemetry can aggregate.**
 
-Codex cares about "average review subagent duration", "compact failure rate", and "memory consolidation trigger frequency". These metrics only make sense grouped by source. If source were a free-form string, each caller would invent its own (review / Review / "code review" / "/review") and the metrics would be unusable. The enum forces alignment.
+Codex cares about "average review subagent duration", "compact failure rate", and "memory consolidation trigger frequency". These metrics only make sense grouped by source.
+
+If source were a free-form string, each caller would invent its own (review / Review / "code review" / "/review") and the metrics would be unusable. The enum forces alignment.
 
 **3. Permission / sandbox configuration lives in one place.**
 
-Each source corresponds to a reasonable "tightening": Review wants `AskForApproval::Never`; Compact wants `web_search=Disabled`; MemoryConsolidation does not need BashTool. The enum puts these definitions in one file (`subagent_source.rs`) instead of scattering them across five callers.
+Each source corresponds to a reasonable "tightening": Review wants `AskForApproval::Never`; Compact wants `web_search=Disabled`; MemoryConsolidation does not need BashTool.
+
+The enum puts these definitions in one file (`subagent_source.rs`) instead of scattering them across five callers.
 
 **Why not a trait + dynamic dispatch?**
 
-Rust traits would also work. But the enum serializes more directly (it already implements `Serialize + Deserialize + JsonSchema + TS`), which matters because the protocol must travel to the TUI, the log, and the subagent itself. Enum + serde gives one consistent shape.
+Rust traits would also work. But the enum serializes more directly (it already implements `Serialize + Deserialize + JsonSchema + TS`), which matters because the protocol must travel to the TUI, the log, and the subagent itself.
+
+Enum + serde gives one consistent shape.
 
 **Counter-example**: Claude Code's `TaskType` is a string union, no strong type. Adding a new variant relies on TypeScript exhaustiveness checks; you might miss a switch case. Codex's Rust enum forces every `match` to be updated by the compiler.
 
@@ -494,7 +596,9 @@ But three concrete scenarios bite back:
 
 **Scenario 1 · Concurrent mutation of mcp_manager state.**
 
-mcp_manager keeps an "active MCP servers" list. Parent enables git server at turn 1; child also enables it mid-turn (refcount = 2). Parent disables at turn 2 (refcount = 1, server stays up). Child finishes without an explicit disable (it inherited from parent). Now the git server lives forever: process leak.
+mcp_manager keeps an "active MCP servers" list. Parent enables git server at turn 1; child also enables it mid-turn (refcount = 2). Parent disables at turn 2 (refcount = 1, server stays up).
+
+Child finishes without an explicit disable (it inherited from parent). Now the git server lives forever: process leak.
 
 Codex's fix: `mcp_manager` is shared via `Arc`, but enable/disable is parent-exclusive; the child can only read. The dispatch layer in `codex_delegate` enforces this.
 
@@ -526,11 +630,15 @@ Each of the five maps to a real incident, not dogma:
 
 **`delegate_task` · Self-recursive nesting**
 
-Children are also LLM-driven. If a child has `delegate_task`, it will think "this task is too big, let me spawn my own child". Parent → child → grandchild → great-grandchild; every level burns tokens. Hermes once hit a four-level recursive spawn that drained 60K of context. After that, `MAX_DEPTH = 2` was added as a fallback, plus the tool-level block as belt-and-suspenders.
+Children are also LLM-driven. If a child has `delegate_task`, it will think "this task is too big, let me spawn my own child". Parent → child → grandchild → great-grandchild; every level burns tokens.
+
+Hermes once hit a four-level recursive spawn that drained 60K of context. After that, `MAX_DEPTH = 2` was added as a fallback, plus the tool-level block as belt-and-suspenders.
 
 **`clarify` · Child cannot talk to the user**
 
-The user is talking to the parent. A child popping a `clarify("which algorithm do you want?")` confuses the routing: either the UI shows multiple stacked clarify dialogs, or the message vanishes silently. Hermes hit a deadlock when an analysis subagent fired `clarify` and the TUI did not know where to route it. From then on, children must never ask; if they do not know something they put it in the result and let the parent decide.
+The user is talking to the parent. A child popping a `clarify("which algorithm do you want?")` confuses the routing: either the UI shows multiple stacked clarify dialogs, or the message vanishes silently.
+
+Hermes hit a deadlock when an analysis subagent fired `clarify` and the TUI did not know where to route it. From then on, children must never ask; if they do not know something they put it in the result and let the parent decide.
 
 **`memory` · Shared MEMORY.md pollution**
 
@@ -553,7 +661,9 @@ User pinged twice. Hermes had this happen: a user got two identical "Build broke
 
 **`execute_code` · Child should reason with tools, not spawn another Python**
 
-`execute_code` is Hermes's Python sandbox. Children given access tend to "write a Python script". But child tasks are usually "analyze this log" or "summarize this file"; they should reason and use read_file / grep, not spawn another Python process. Once children also use execute_code:
+`execute_code` is Hermes's Python sandbox. Children given access tend to "write a Python script".
+
+But child tasks are usually "analyze this log" or "summarize this file"; they should reason and use read_file / grep, not spawn another Python process. Once children also use execute_code:
 
 - Extra process per child, resource use 2×.
 - Python errors don't propagate cleanly back to the parent.
@@ -573,7 +683,9 @@ It solves a classic LLM-as-orchestrator failure: **the model will not wait; it p
 
 **The failure**
 
-Parent spawns a child and the model thinks "I should check on this task". It starts calling `sessions_list`, `sessions_history`, `exec sleep`, etc. Every poll is another LLM call plus tool call, burning tokens, while the UI looks like the parent is "thinking".
+Parent spawns a child and the model thinks "I should check on this task". It starts calling `sessions_list`, `sessions_history`, `exec sleep`, etc.
+
+Every poll is another LLM call plus tool call, burning tokens, while the UI looks like the parent is "thinking".
 
 GPT-4 / Claude 3 / Sonnet have all been observed doing this. Even if the system prompt says "do not poll", the model forgets after a few turns.
 
@@ -615,7 +727,9 @@ Codex children also push (`EventMsg::TurnComplete`), but the parent is Rust code
 
 **Which is better?**
 
-Codex is more reliable (code enforces it) but limits flexibility (the parent must be code). OpenClaw is more flexible (LLM can do complex decisions) but needs prompt enforcement. Both are valid; pick based on whether your orchestrator is code or model.
+Codex is more reliable (code enforces it) but limits flexibility (the parent must be code). OpenClaw is more flexible (LLM can do complex decisions) but needs prompt enforcement.
+
+Both are valid; pick based on whether your orchestrator is code or model.
 
 **Source**: [`openclaw/src/agents/subagent-spawn.ts:81-84`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/subagent-spawn.ts#L81-L84) + `subagent-announce.ts`.
 
@@ -631,7 +745,9 @@ The task list UI needs one renderer, not four (bash / subagent / remote / teamma
 
 **Benefit 2 · Concurrency dispatch lives in one place**
 
-`isConcurrencySafe()` is an interface method, each task self-reports. The dispatcher does not branch `if task_type === 'bash' then ... else if task_type === 'subagent' then ...`. Adding a task type just means implementing the interface; the dispatcher stays untouched. Open-closed.
+`isConcurrencySafe()` is an interface method, each task self-reports. The dispatcher does not branch `if task_type === 'bash' then ... else if task_type === 'subagent' then ...`.
+
+Adding a task type just means implementing the interface; the dispatcher stays untouched. Open-closed.
 
 **Benefit 3 · State machine consistency**
 
@@ -655,7 +771,9 @@ Each type-specific concern either bloats the `Task` interface or leaks into type
 
 **Cost 2 · New task types are not free**
 
-Even with no dispatcher change, you must implement `isConcurrencySafe()` / `outputFile` / status transitions / signal handling, etc. When `dream` was added, a pile of corner cases appeared (what if the user switches conversations while dream runs? Who sees the dream result?).
+Even with no dispatcher change, you must implement `isConcurrencySafe()` / `outputFile` / status transitions / signal handling, etc.
+
+When `dream` was added, a pile of corner cases appeared (what if the user switches conversations while dream runs? Who sees the dream result?).
 
 **Cost 3 · Debugging is harder**
 
@@ -781,7 +899,9 @@ These are "framework features" you do not need in a single-user agent.
 
 **Default-tight is the safe default**
 
-The child's prompt is decided by the parent. The parent may be prompt-injected, deceived, or maliciously controlled. If the child could exceed the parent's limits, an attacker could "have the parent spawn a more powerful child" to bypass the sandbox.
+The child's prompt is decided by the parent. The parent may be prompt-injected, deceived, or maliciously controlled.
+
+If the child could exceed the parent's limits, an attacker could "have the parent spawn a more powerful child" to bypass the sandbox.
 
 Classic attack pattern: user input "write a script that deletes /etc/passwd" → parent's `exec_policy` blocks `rm -rf` → but the child does not inherit → child runs → boom.
 
@@ -797,7 +917,9 @@ User opens Claude Code in `--restricted` mode (read-only analysis), no file writ
 
 **How to handle it?**
 
-Do not let the child override the parent. Instead, the user explicitly grants the child extra capability at the parent layer: "review subagent is allowed to use network". The parent grants the privilege at spawn time, knowing it is for review, and may attach further constraints (only `gh` commands, only GitHub domains).
+Do not let the child override the parent. Instead, the user explicitly grants the child extra capability at the parent layer: "review subagent is allowed to use network".
+
+The parent grants the privilege at spawn time, knowing it is for review, and may attach further constraints (only `gh` commands, only GitHub domains).
 
 Codex actually does this: when `subagent_source = Review`, the spawn explicitly sets `web_access = AllowedFor(["github.com"])`, bypassing the parent's `web_access = Disabled`. But only for `Review`; other sources do not benefit.
 
@@ -815,7 +937,9 @@ Mark the spawn "this is a build task; subprocess is allowed". The child's args c
 
 **How to handle it?**
 
-Treat the fix subagent as a fresh user request whose permissions are re-evaluated, not inherited from the parent. The "child" is nominally a child but the permission slate is reset. Or, route the fix subagent through the parent's entry (user re-prompts).
+Treat the fix subagent as a fresh user request whose permissions are re-evaluated, not inherited from the parent. The "child" is nominally a child but the permission slate is reset.
+
+Or, route the fix subagent through the parent's entry (user re-prompts).
 
 **General pattern**
 
@@ -828,7 +952,9 @@ Treat the fix subagent as a fresh user request whose permissions are re-evaluate
 
 **Anti-pattern**
 
-Letting the child request more permissions from the parent *during runtime*. The child says "I need rm permission" in its prompt; the parent LLM decides whether to grant. That outsources the permission decision to the LLM, too large a security surface. Attackers can write a prompt that convinces the parent "this is fine" and break the model.
+Letting the child request more permissions from the parent *during runtime*. The child says "I need rm permission" in its prompt; the parent LLM decides whether to grant.
+
+That outsources the permission decision to the LLM, too large a security surface. Attackers can write a prompt that convinces the parent "this is fine" and break the model.
 
 **Source**: [`codex/codex-rs/core/src/codex_delegate.rs:117`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/codex_delegate.rs#L117) (`inherited_exec_policy = Some(Arc::clone(...))`) + Review-specific overrides in `tasks/review.rs`.
 
@@ -1210,4 +1336,6 @@ Simple one-liner. Enable layers as scenarios get richer.
 3. **Reject polling**: anti-polling warning baked in on day one
 
 **Follow-up**: "How do you test such a framework?" Three layers: (1) unit-test spawn / depth / blocked_tools; (2) integration-test push event flow; (3) chaos-test 100 child spawns + kill half + verify resource cleanup. The first two run in CI; the third runs weekly.
+</details>
+
 </details>

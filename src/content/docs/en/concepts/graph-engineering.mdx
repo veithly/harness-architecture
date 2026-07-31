@@ -145,7 +145,12 @@ Then work in order: write each edge's five elements (goal, context, permissions,
 
 **One model for every node.** Anthropic's recipe is heterogeneous by design: Opus orchestrates, Sonnet works. Per-node model selection is a direct dividend of splitting — use it.
 
-## Interview questions: 6 high-frequency ones
+## Appendix: open when you want to review
+
+<details>
+<summary>Six checks and three exercises</summary>
+
+### Check questions
 
 <details>
 <summary>**Q1 · Basics**: How does graph engineering relate to graph frameworks like LangGraph? One sentence on what graph engineering governs.</summary>
@@ -225,11 +230,13 @@ Only one node in this design is an agent — and that's correct. Graph-engineeri
 **Follow-up**: "What if the dispute agent's verdict quality is unstable?" Add a review loop: a second, cheaper model audits against a checklist before release, round cap 2. Cheaper than upgrading the main model.
 </details>
 
-## Exercises
+### Exercises
 
 1. **Read source**: open `research/crewAI/lib/crewai/src/crewai/crew.py`, find the `check_manager_llm` validator, and answer: why does hierarchical mode require a manager while sequential doesn't?
 2. **Extend the design**: give the human node in the refund system (Q6) a full definition: trigger condition, inputs/outputs, timeout, fallback path. Write it as a tool's JSON schema.
 3. **Audit**: pick a multi-agent framework you've used (or your own delegation code) and check its delegation edge against the five elements: which is missing? Are the guardrails in the prompt or in code?
+
+</details>
 
 ## Research notes
 

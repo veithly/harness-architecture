@@ -3,136 +3,114 @@ title: Harness Architecture
 description: "Two things you can't avoid when building agents — loop engineering and graph engineering — answered with the source code of four real systems: Codex, Claude Code, OpenClaw, Hermes"
 template: splash
 hero:
-  tagline: "Building an agent comes down to two problems: keeping one loop alive (Loop Engineering), and organizing work across many nodes (Graph Engineering). This site answers both with the source code of Codex, Claude Code, OpenClaw, and Hermes — no toy examples."
-  image:
-    alt: Side-by-side comparison of the Codex, Claude Code, OpenClaw, and Hermes agent harnesses
-    file: ../../../assets/homepage-editorial-proofwall.png
+  tagline: "Don't start by choosing a framework. First answer: how does the loop stop, how does failure recover, and how do multiple nodes divide work? The source code of Codex, Claude Code, OpenClaw, and Hermes supplies the answers."
   actions:
-    - text: Read 01 overview
-      link: /en/patterns/01-overview/
+    - text: Start with Loop Engineering
+      link: /en/concepts/loop-engineering/
       icon: right-arrow
       variant: primary
-    - text: 23 · Loop Engineering
-      link: /en/concepts/loop-engineering/
-      variant: minimal
-    - text: 24 · Graph Engineering
+    - text: Then Graph Engineering
       link: /en/concepts/graph-engineering/
       variant: minimal
 ---
 
-import LandingKinetics from '@components/LandingKinetics.astro';
+import Diagram from '@components/Diagram.astro';
 
-<div className="aap-landing" data-world="editorial-interference">
-  <div className="aap-lens" aria-hidden="true">
-    <span data-home-theme>paper</span>
-  </div>
-
-  <section className="aap-home-strip" aria-label="Homepage status">
-    <span>loop / graph / four systems</span>
-    <span data-home-theme>paper mode</span>
-    <span data-home-frame>frame 0000</span>
-    <span>scroll <b data-home-scroll>0%</b></span>
+<div className="aap-landing" data-world="field-notes">
+  <section className="aap-opening-note" aria-labelledby="aap-opening-title">
+    <div>
+      <p className="aap-kicker">Start with failure</p>
+      <h2 id="aap-opening-title">The agent loop takes ten lines. The hard part is making turn eleven trustworthy.</h2>
+      <p className="aap-lede">
+        Models claim they're done and retry the same error twenty times. A production harness earns its keep by turning stopping, recovery, verification, permissions, and state ownership into engineering facts you can inspect.
+      </p>
+    </div>
+    <aside className="aap-thesis" aria-label="The three questions this site answers">
+      <span>Three questions only</span>
+      <ol>
+        <li><strong>How does it stop?</strong>Who decides the task is done, and what happens when budget runs out?</li>
+        <li><strong>How does it resume?</strong>Which state can be replayed after the process dies?</li>
+        <li><strong>How does it split?</strong>Which work belongs to the model, code, and a human?</li>
+      </ol>
+      <a className="aap-text-link" href="/en/patterns/01-overview/">See the full map in 10 minutes →</a>
+    </aside>
   </section>
 
-  <section className="aap-signal-section" aria-labelledby="aap-signal-title">
-    <div className="aap-signal-copy">
-      <p className="aap-kicker">what this site is</p>
-      <h2 id="aap-signal-title">The agent loop is ten lines. Everything else is engineering.</h2>
-      <div className="aap-copy-line">
-        A working agent takes half an hour to write. Keeping one alive in production means answering concrete questions: when does the loop stop, what goes back into context after an error, how does a run resume after a crash, how does work split across nodes, where does a human step in to approve. This site doesn't hand out best-practice lists. It hands out the raw answers four real systems gave — source code, constants, and the production incident data left behind in code comments.
-      </div>
-    </div>
-    <div className="aap-proof-card" aria-label="Homepage design rules">
-      <span className="aap-proof-mark">02</span>
-      <p>The method chapters rest on first-hand research: cloned repos with commit hashes, papers with arXiv IDs.</p>
-      <p>Every claim links back to its source: a line number, a paper, or a code comment.</p>
-    </div>
-  </section>
-
-  <section className="aap-proof-section" aria-labelledby="aap-proof-title">
+  <section className="aap-route-section" aria-labelledby="aap-route-title">
     <div className="aap-section-head">
-      <p className="aap-kicker">reading route</p>
-      <h2 id="aap-proof-title">Two concepts, one map, four bodies of evidence.</h2>
+      <p className="aap-kicker">Enter by problem</p>
+      <h2 id="aap-route-title">You don't have to read in order.</h2>
+      <p>Choose the wall you're hitting. The method chapters give you a decision model, the overview gives you the map, and 22 focused chapters stay available for lookup.</p>
     </div>
-    <ol className="aap-magazine-contents">
-      <li>
-        <span className="aap-row-num">01</span>
-        <div>
-          <h3><a href="/en/patterns/01-overview/">The 22 chapters</a></h3>
-          <p>Start with the overview, then agent engineering split into 22 concrete questions: when loops stop, how patches apply, how shells get isolated, how permissions layer. Four systems compared in every chapter.</p>
-        </div>
-        <i></i>
-        <strong data-count="22">00</strong>
-      </li>
-      <li>
-        <span className="aap-row-num">02</span>
-        <div>
-          <h3><a href="/en/concepts/loop-engineering/">23 · Loop Engineering</a></h3>
-          <p>Inside one agent: stop conditions, budgets, error compaction, event logs, verifiers. Four ways a bare loop dies, and the five components that save it.</p>
-        </div>
-        <i></i>
-        <strong data-count="23">00</strong>
-      </li>
-      <li>
-        <span className="aap-row-num">03</span>
-        <div>
-          <h3><a href="/en/concepts/graph-engineering/">24 · Graph Engineering</a></h3>
-          <p>Between nodes: which work goes to a model, which to code, which to a human. What edges carry, who owns state, how runaways get stopped. About organizing work — not about any graph framework.</p>
-        </div>
-        <i></i>
-        <strong data-count="24">00</strong>
-      </li>
-      <li>
-        <span className="aap-row-num">04</span>
-        <div>
-          <h3><a href="/en/skill/">Take the Skill with you</a></h3>
-          <p>The conclusions compressed into a loadable working manual: hard rules, a selection matrix, a scaffold, diagnostic scripts. Use it next time you build — no need to come back and re-read.</p>
-        </div>
-        <i></i>
-        <strong data-count="10">00</strong>
-      </li>
-    </ol>
+    <div className="aap-route-grid">
+      <a className="aap-route-card" href="/en/concepts/loop-engineering/">
+        <span>23 / One agent</span>
+        <h3>Loop Engineering</h3>
+        <p>Stopping, budgets, error compaction, event logs, and verifiers. For “why won't this run stay reliable?”</p>
+      </a>
+      <a className="aap-route-card" href="/en/concepts/graph-engineering/">
+        <span>24 / Many nodes</span>
+        <h3>Graph Engineering</h3>
+        <p>Nodes, edges, state ownership, and human approval. For “why does multi-agent coordination run away?”</p>
+      </a>
+      <a className="aap-route-card" href="/en/patterns/01-overview/">
+        <span>01 / The map</span>
+        <h3>Four-system overview</h3>
+        <p>The roles, boundaries, and use cases of Codex, Claude Code, OpenClaw, and Hermes.</p>
+      </a>
+    </div>
   </section>
 
-  <section className="aap-system-section" aria-labelledby="aap-system-title">
+  <section className="aap-evidence-section" aria-labelledby="aap-evidence-title">
     <div className="aap-section-head">
-      <p className="aap-kicker">evidence</p>
-      <h2 id="aap-system-title">Four real systems, four answers.</h2>
+      <p className="aap-kicker">One diagram, one decision</p>
+      <h2 id="aap-evidence-title">Decide whether you need control or autonomy.</h2>
+      <p>This isn't a leaderboard. The systems sit on one trade-off axis: toward the left, every step is auditable; toward the right, cross-session memory buys long-term autonomy.</p>
     </div>
-    <div className="aap-system-grid">
-      <a className="aap-system-tile aap-system-codex aap-magnetic" href="/en/systems/codex/">
+    <Diagram
+      src="/diagrams/01-overview-base.svg"
+      alt="Four agent systems distributed on an axis from short-term control to long-term autonomy"
+      caption="One axis, four product judgments. There is no overall winner — only a match for your cost of failure."
+      wide={true}
+      minWidth={720}
+    />
+  </section>
+
+  <section className="aap-systems-section" aria-labelledby="aap-systems-title">
+    <div className="aap-section-head">
+      <p className="aap-kicker">Four source-code bodies</p>
+      <h2 id="aap-systems-title">Don't copy their shape. Copy their judgment.</h2>
+    </div>
+    <div className="aap-system-list">
+      <a className="aap-system-row" href="/en/systems/codex/">
         <span>Codex</span>
-        <strong>Loop as an event machine, every step on disk, replayable</strong>
-        <em>Rust workspace / local + cloud agent</em>
+        <strong>Distrust model self-evaluation; make the loop replayable</strong>
+        <small>For coding work that tests and patches can verify</small>
       </a>
-      <a className="aap-system-tile aap-system-claude aap-magnetic" href="/en/systems/claude-code/">
+      <a className="aap-system-row" href="/en/systems/claude-code/">
         <span>Claude Code</span>
-        <strong>A reason label on every continuation, compression in four stages</strong>
-        <em>TypeScript / Node developer tool</em>
+        <strong>Label every continuation reason; turn the black box into a state machine</strong>
+        <small>For IDE agents needing careful compaction and observability</small>
       </a>
-      <a className="aap-system-tile aap-system-openclaw aap-magnetic" href="/en/systems/openclaw/">
+      <a className="aap-system-row" href="/en/systems/openclaw/">
         <span>OpenClaw</span>
-        <strong>The most complete subagent platform and session routing</strong>
-        <em>personal agent control plane</em>
+        <strong>Treat the agent as a session control plane; make routing and hooks first-class</strong>
+        <small>For multi-channel, multi-user, plugin-driven runtimes</small>
       </a>
-      <a className="aap-system-tile aap-system-hermes aap-magnetic" href="/en/systems/hermes/">
+      <a className="aap-system-row" href="/en/systems/hermes/">
         <span>Hermes</span>
-        <strong>Budgets, depth caps, hard-blocked tools — all in code, not prompts</strong>
-        <em>long-running Python agent</em>
+        <strong>Spread verification across time; trade memory and reflection for convergence</strong>
+        <small>For long-running assistants that learn across sessions</small>
       </a>
     </div>
   </section>
 
   <section className="aap-skill-section" aria-labelledby="aap-skill-title">
     <div>
-      <p className="aap-kicker">after reading</p>
-      <h2 id="aap-skill-title">Conclusions shouldn't sit in a bookmarks folder.</h2>
-      <div className="aap-copy-line">
-        <a href="/en/skill/">build-your-own-agent</a> compresses the whole site into a loadable Skill: 10 hard rules, an 8-dimension selection matrix, a Python scaffold, diagnostic scripts, and a security checklist. It assumes you're writing your own harness tomorrow.
-      </div>
+      <p className="aap-kicker">Use it directly</p>
+      <h2 id="aap-skill-title">Turn the judgment you read into constraints for the next build.</h2>
+      <p className="aap-lede"><a href="/en/skill/">build-your-own-agent</a> compresses the conclusions into 10 hard rules, an 8-dimension selection matrix, a Python scaffold, diagnostics, and a security checklist.</p>
     </div>
-    <a className="aap-final-cta aap-magnetic" href="/en/skill/">Open the companion Skill</a>
+    <a className="aap-final-cta" href="/en/skill/">Open the companion Skill →</a>
   </section>
 </div>
-
-<LandingKinetics />

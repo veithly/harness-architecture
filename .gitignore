@@ -30,3 +30,6 @@ pagefind/
 
 # Excalidraw cache
 *.excalidraw.bak
+
+# Local semantic index
+.codegraph/

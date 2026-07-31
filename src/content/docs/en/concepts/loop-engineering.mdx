@@ -166,7 +166,12 @@ Trade-off notes:
 
 **Verifying only at the end.** Verification sits inside the loop, firing every time the model claims completion. Finding out at the finish line that step 3 was wrong wastes every step in between.
 
-## Interview questions: 6 high-frequency ones
+## Appendix: open when you want to review
+
+<details>
+<summary>Six checks and three exercises</summary>
+
+### Check questions
 
 <details>
 <summary>**Q1 · Basics**: The agent loop is ten lines — why do production loops run to thousands? What's the extra code?</summary>
@@ -248,11 +253,13 @@ The verifier goes last not because it matters least but because it's the most do
 **Follow-up**: "When does context compression get added?" When long tasks appear. mini-swe-agent contains zero compression — adding it for short tasks is premature optimization plus a new class of information-loss bugs.
 </details>
 
-## Exercises
+### Exercises
 
 1. **Read source**: open `research/mini-swe-agent/src/minisweagent/agents/default.py` and mark the lines for each of the five components. Which component uses the fewest lines? (Hint: one is a single `finally`.)
 2. **Modify code**: add a fourth budget dimension to this chapter's skeleton — a per-step token cap (truncate and flag any tool result over N tokens). Decide: does the truncation notice go into the trajectory?
 3. **Design**: your agent is a long-running "compile the team's weekly report" task with no tests to run. Design its stop conditions and verifier: at least two stop signals, one soft-verification scheme, and whether max_turns should be large or small.
+
+</details>
 
 ## Research notes
 

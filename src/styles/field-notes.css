@@ -1,0 +1,431 @@
+/**
+ * Field Notes — the restrained public-facing layer.
+ * One visual signature (the source diagrams), one accent, no decorative HUD.
+ */
+
+/* Keep long chapters readable without turning every paragraph into a full-width wall. */
+.sl-markdown-content > :is(p, ul, ol, blockquote) {
+  max-width: 72ch;
+}
+
+.sl-markdown-content > h2 {
+  margin-top: clamp(3.5rem, 8vw, 5.5rem);
+  scroll-margin-top: 5rem;
+}
+
+.sl-markdown-content > h3 {
+  scroll-margin-top: 5rem;
+}
+
+/* Starlight callouts should belong to the same field-note system as custom cards. */
+.starlight-aside {
+  border: 1px solid var(--aap-paper-line) !important;
+  border-inline-start-width: 3px !important;
+  border-radius: var(--aap-radius-md) !important;
+  background: var(--aap-paper-soft) !important;
+  box-shadow: none !important;
+}
+
+/* Homepage hero: one typographic statement, with no poster or telemetry layer. */
+[data-has-hero] .hero {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-height: auto;
+  max-width: 76rem;
+  margin-inline: auto;
+  padding: clamp(5rem, 11vw, 9rem) clamp(1.25rem, 5vw, 4rem) clamp(4rem, 8vw, 7rem);
+  overflow: hidden;
+  color: var(--aap-ink);
+  background: var(--aap-paper);
+  border-bottom: 1px solid var(--aap-paper-line);
+}
+
+[data-has-hero] .hero::before {
+  content: none;
+}
+
+[data-has-hero] .hero::after {
+  content: '';
+  position: absolute;
+  left: clamp(1.25rem, 5vw, 4rem);
+  top: clamp(2.5rem, 7vw, 5rem);
+  width: 3.5rem;
+  height: 4px;
+  background: var(--aap-color-tradeoff);
+}
+
+[data-has-hero] .hero > div {
+  max-width: 62rem;
+  animation: aap-field-rise 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+[data-has-hero] .hero h1 {
+  max-width: none;
+  margin: 0;
+  color: var(--aap-ink);
+  font-family: var(--aap-font-display);
+  font-size: clamp(3.8rem, 10vw, 8rem);
+  font-weight: 600;
+  line-height: 0.92;
+  letter-spacing: -0.055em;
+  text-transform: none;
+  word-break: normal;
+}
+
+[data-has-hero] .hero .tagline {
+  max-width: 64ch;
+  margin-top: clamp(1.5rem, 4vw, 2.5rem);
+  color: var(--aap-ink-soft);
+  font-family: var(--aap-font-body);
+  font-size: clamp(1.05rem, 2vw, 1.35rem);
+  font-weight: 400;
+  line-height: 1.72;
+}
+
+[data-has-hero] .hero .tagline::first-letter {
+  float: none;
+  margin: 0;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+}
+
+[data-has-hero] .hero .actions {
+  align-items: center;
+  margin-top: 2rem;
+  gap: 0.75rem;
+}
+
+[data-has-hero] .hero :is(.action, .sl-link-button) {
+  min-height: 2.8rem;
+  padding: 0.72rem 1rem !important;
+  border: 1px solid var(--aap-ink) !important;
+  border-radius: var(--aap-radius-sm) !important;
+  color: var(--aap-ink) !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  font-family: var(--aap-font-mono);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-transform: none;
+  transition: color 160ms ease, background 160ms ease, border-color 160ms ease;
+}
+
+[data-has-hero] .hero :is(.action.primary, .sl-link-button.primary) {
+  color: var(--aap-paper) !important;
+  background: var(--aap-ink) !important;
+}
+
+[data-has-hero] .hero :is(.action, .sl-link-button):hover {
+  transform: none;
+  color: var(--aap-paper) !important;
+  background: var(--aap-color-tradeoff) !important;
+  border-color: var(--aap-color-tradeoff) !important;
+}
+
+[data-has-hero] .sl-container {
+  max-width: 100% !important;
+  margin-inline: 0 !important;
+}
+
+.aap-landing[data-world='field-notes'] {
+  width: min(100%, 76rem);
+  margin-inline: auto;
+  padding: 0 clamp(1.25rem, 5vw, 4rem) clamp(4rem, 9vw, 8rem);
+  color: var(--aap-ink);
+  font-family: var(--aap-font-body);
+}
+
+.aap-landing[data-world='field-notes'] :is(h2, h3, p, ol) {
+  margin: 0;
+}
+
+.aap-landing[data-world='field-notes'] a {
+  color: inherit;
+}
+
+.aap-opening-note,
+.aap-route-section,
+.aap-evidence-section,
+.aap-systems-section,
+.aap-skill-section {
+  padding-block: clamp(3.5rem, 8vw, 6.5rem);
+  border-top: 1px solid var(--aap-paper-line);
+}
+
+.aap-opening-note {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(17rem, 0.65fr);
+  gap: clamp(2.5rem, 8vw, 7rem);
+  align-items: start;
+  border-top: 0;
+}
+
+.aap-kicker {
+  margin-bottom: 1rem !important;
+  color: var(--aap-color-tradeoff) !important;
+  font-family: var(--aap-font-mono);
+  font-size: 0.73rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sl-markdown-content .aap-landing[data-world='field-notes'] h2 {
+  max-width: 18ch;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--aap-ink);
+  font-family: var(--aap-font-display);
+  font-size: clamp(2.5rem, 6vw, 5.4rem);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  text-wrap: balance;
+}
+
+.sl-markdown-content .aap-landing[data-world='field-notes'] h2::after {
+  display: none;
+}
+
+.aap-lede {
+  max-width: 62ch;
+  margin-top: 1.5rem !important;
+  color: var(--aap-ink-soft) !important;
+  font-size: clamp(1rem, 1.6vw, 1.18rem);
+  line-height: 1.8;
+}
+
+.aap-thesis {
+  padding: 1.5rem 0 0 1.5rem;
+  border-top: 3px solid var(--aap-color-tradeoff);
+}
+
+.aap-thesis > span {
+  color: var(--aap-ink-muted);
+  font-family: var(--aap-font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.aap-thesis ol {
+  display: grid;
+  gap: 1rem;
+  padding: 1.25rem 0 0 1.2rem;
+}
+
+.aap-thesis li {
+  padding-left: 0.35rem;
+  color: var(--aap-ink-soft);
+  line-height: 1.55;
+}
+
+.aap-thesis strong {
+  display: block;
+  color: var(--aap-ink);
+  font-family: var(--aap-font-display);
+  font-size: 1.22rem;
+  font-weight: 600;
+}
+
+.aap-text-link {
+  display: inline-flex;
+  margin-top: 1.25rem;
+  color: var(--aap-color-tradeoff) !important;
+  font-family: var(--aap-font-mono);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-decoration: none !important;
+}
+
+.aap-section-head {
+  display: grid;
+  gap: 0.75rem;
+  margin-bottom: clamp(2rem, 5vw, 3.5rem);
+}
+
+.aap-section-head p:last-child {
+  max-width: 66ch;
+  color: var(--aap-ink-soft);
+  line-height: 1.7;
+}
+
+.aap-route-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid var(--aap-ink);
+}
+
+.aap-route-card {
+  display: grid;
+  min-height: 17rem;
+  padding: 1.4rem;
+  border-bottom: 1px solid var(--aap-ink);
+  border-right: 1px solid var(--aap-ink);
+  text-decoration: none !important;
+  transition: background 160ms ease, color 160ms ease;
+}
+
+.aap-route-card:last-child {
+  border-right: 0;
+}
+
+.aap-route-card > span {
+  color: var(--aap-color-tradeoff);
+  font-family: var(--aap-font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.aap-route-card h3 {
+  align-self: end;
+  color: inherit;
+  font-family: var(--aap-font-display);
+  font-size: clamp(1.7rem, 3vw, 2.45rem);
+  font-weight: 600;
+  line-height: 1.02;
+}
+
+.aap-route-card p {
+  margin-top: 0.85rem !important;
+  color: var(--aap-ink-soft) !important;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.aap-route-card:hover {
+  color: var(--aap-paper);
+  background: var(--aap-ink);
+}
+
+.aap-route-card:hover :is(p, span) {
+  color: var(--aap-paper) !important;
+}
+
+.aap-evidence-section .aap-diagram {
+  margin-bottom: 0;
+}
+
+.aap-system-list {
+  border-top: 1px solid var(--aap-ink);
+}
+
+.aap-system-row {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.65fr) minmax(0, 1.35fr) minmax(10rem, 0.8fr);
+  gap: clamp(1rem, 4vw, 3rem);
+  align-items: baseline;
+  padding: 1.35rem 0;
+  border-bottom: 1px solid var(--aap-paper-line);
+  text-decoration: none !important;
+}
+
+.aap-system-row span {
+  color: var(--aap-color-tradeoff);
+  font-family: var(--aap-font-mono);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.aap-system-row strong {
+  color: var(--aap-ink);
+  font-family: var(--aap-font-display);
+  font-size: clamp(1.25rem, 2.4vw, 1.8rem);
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+.aap-system-row small {
+  color: var(--aap-ink-muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.aap-system-row:hover strong {
+  color: var(--aap-color-tradeoff);
+}
+
+.aap-skill-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2rem;
+  align-items: end;
+}
+
+.aap-final-cta {
+  display: inline-flex;
+  min-height: 3rem;
+  align-items: center;
+  padding: 0.8rem 1rem;
+  color: var(--aap-paper) !important;
+  background: var(--aap-ink);
+  border: 1px solid var(--aap-ink);
+  border-radius: var(--aap-radius-sm);
+  font-family: var(--aap-font-mono);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-decoration: none !important;
+  transition: background 160ms ease, border-color 160ms ease;
+}
+
+.aap-final-cta:hover {
+  background: var(--aap-color-tradeoff);
+  border-color: var(--aap-color-tradeoff);
+}
+
+@keyframes aap-field-rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 820px) {
+  .aap-opening-note,
+  .aap-skill-section {
+    grid-template-columns: 1fr;
+  }
+
+  .aap-route-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .aap-route-card {
+    min-height: 13rem;
+    border-right: 0;
+  }
+
+  .aap-system-row {
+    grid-template-columns: 1fr;
+    gap: 0.45rem;
+  }
+}
+
+@media (max-width: 520px) {
+  [data-has-hero] .hero {
+    padding-top: 5.5rem;
+  }
+
+  [data-has-hero] .hero h1 {
+    font-size: clamp(3rem, 14.5vw, 4rem);
+    letter-spacing: -0.04em;
+  }
+
+  [data-has-hero] .hero .actions {
+    align-items: stretch;
+  }
+
+  [data-has-hero] .hero :is(.action, .sl-link-button) {
+    justify-content: center;
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-has-hero] .hero > div {
+    animation: none;
+  }
+}

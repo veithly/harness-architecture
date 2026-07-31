@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## Channels differ; core state cannot fork
 
 <Verdict tldr="The same agent core has to face several very different callers at the same time: humans typing into a terminal, CI pipelines running non-interactive scripts, IDEs spawning the agent via plugins, external IDEs over a standardised protocol, users sending messages on Slack / Telegram / WeChat, and external systems pushing data in via webhooks. The four systems take wildly different approaches to organising this sprawl: Codex splits each calling mode into a separate binary (bare `codex` enters the TUI, `codex exec` runs scripts, `codex mcp-server` exposes MCP, `codex app-server` launches a long-running daemon) and uses a hidden `codex stdio-to-uds` bridge that forwards stdio over a Unix domain socket so the daemon can be upgraded without restarting the IDE; Claude Code goes one-binary-many-subcommands: everything lives in a single npm package organised by Node's commander library (REPL by default, `--print` for script mode, `mcp serve` / `server` / `auth` / `plugin` / `doctor` for each concern), plus a special `--bare` mode that disables every automation behaviour so CI / SDK callers have fully controllable auth and context loading; OpenClaw flattens 19 lazily-loaded sub-CLIs that are all RPC clients to one long-running gateway daemon, exposes ACP (Agent Control Protocol, OpenClaw's IDE integration protocol) for external IDEs, and ships Telegram / Discord / Slack as independently-published npm packages; Hermes folds 17 platform adapters (Telegram / Discord / Slack / Feishu / WeChat / Email / SMS / Webhook etc.) into a single GatewayRunner process behind a Python ABC base class with 6 required methods (connect, disconnect, send, send typing, send image, get chat info), and even models 'outbound HTTP API call' and 'inbound webhook' as platforms reusing the same message-handler pipeline. Bottom line: borrow from Codex / Claude Code for developer-tool agents, reuse Hermes's BasePlatformAdapter for ChatOps agents, reuse OpenClaw's channels-plugins for an open-ecosystem agent framework." />
 
-## §2 · Architecture Diagram
+## Four entry topologies
 
-:::tip[Key takeaways · 30-second read]
+<details>
+<summary>Before reading (optional)</summary>
+
 - **One agent core, many callers**: terminals, CI scripts, IDE plugins, chat platforms, and webhooks all need different lifecycles and protocols.
 - **Four splits**: Codex separates binaries and bridges IDE to daemon via hidden `codex stdio-to-uds`; Claude Code is one binary with a `--bare` mode for CI/SDK; OpenClaw flattens 19 sub-CLIs as RPC clients to one gateway daemon; Hermes folds 17 platform adapters behind one Python ABC with 6 required methods.
 - **A stateless stdio-to-socket bridge determines upgradability**: the daemon can restart or upgrade without restarting the IDE, because the bridge holds no state.
 - **Match the pattern to the agent type**: developer tools borrow Codex / Claude Code; ChatOps reuses Hermes's adapter base class; open ecosystems reuse OpenClaw's channels-plugins.
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/14-multi-channel-entry-base.svg"
@@ -47,13 +50,19 @@ How the four systems cover multi-channel entry:
   dimensionLabel="Dimension"
 />
 
-## §3 · How Each System Does It
+## How four systems connect multiple channels
 
 ### Codex · Make every calling mode a separate subcommand, then bridge IDE and daemon over a Unix domain socket
 
-Codex's reasoning is clear: it has to serve callers with wildly different needs. A developer running bare in the terminal wants a full ratatui-rendered TUI. A CI script wants something that takes a prompt and produces JSON before exiting. An IDE integration wants a bidirectional streaming channel. A desktop app wants a stateful daemon. A remote client wants an HTTP/WS service with authentication. These scenarios have different lifecycle patterns, different state management needs, and different protocol requirements. Cramming them all into one process makes them all conflict.
+Codex's reasoning is clear: it has to serve callers with wildly different needs. A developer running bare in the terminal wants a full ratatui-rendered TUI. A CI script wants something that takes a prompt and produces JSON before exiting.
 
-Codex's solution is to split each scenario into a subcommand of the `codex` multitool: one binary, but every subcommand maps to a completely different entry mode. This is the same design philosophy as git (one `git` command dispatching to `git-checkout`, `git-commit` and friends), but each subcommand's code organisation is genuinely cleanly separated, almost as if multiple independent binaries shared one dispatcher.
+An IDE integration wants a bidirectional streaming channel. A desktop app wants a stateful daemon. A remote client wants an HTTP/WS service with authentication.
+
+These scenarios have different lifecycle patterns, different state management needs, and different protocol requirements. Cramming them all into one process makes them all conflict.
+
+Codex's solution is to split each scenario into a subcommand of the `codex` multitool: one binary, but every subcommand maps to a completely different entry mode.
+
+This is the same design philosophy as git (one `git` command dispatching to `git-checkout`, `git-commit` and friends), but each subcommand's code organisation is genuinely cleanly separated, almost as if multiple independent binaries shared one dispatcher.
 
 <SourceBlock path="REF/codex/codex-rs/cli/src/main.rs" lines="105-182" system="codex" summary="codex multitool subcommands: exec / review / mcp / mcp-server / app-server / remote-control / app / resume / fork / cloud / responses-api-proxy / stdio-to-uds / exec-server / features">
 
@@ -112,15 +121,23 @@ Each subcommand corresponds to one independent entry mode. The most common ones 
 
 The most notable one is a hidden subcommand called **`codex stdio-to-uds`**. Its existence solves a very real engineering pain point in IDE integration.
 
-Picture the typical IDE-integration friction: an IDE spawns the agent as a child process, and the IDE talks to the child over stdio for JSON-RPC (this is how LSP, DAP, MCP, and basically every IDE protocol work); meanwhile the agent itself wants to be a long-running daemon: it wants to keep session state across IDE restarts, share sessions with other IDE instances, and let agent upgrades happen without restarting the IDE. These two needs conflict: IDEs assume "one child process per agent session", while the daemon model assumes "one daemon serves many clients".
+Picture the typical IDE-integration friction: an IDE spawns the agent as a child process, and the IDE talks to the child over stdio for JSON-RPC (this is how LSP, DAP, MCP, and basically every IDE protocol work); meanwhile the agent itself wants to be a long-running daemon: it wants to keep session state across IDE restarts, share sessions with other IDE instances, and let agent upgrades happen without restarting the IDE.
 
-`codex stdio-to-uds` resolves this with a small bridge process. The IDE spawns it as a child, and the bridge does exactly one thing: every byte it receives over stdio it forwards to a Unix domain socket, and every byte it receives from the socket it writes back to stdout. The daemon itself listens on that socket. From the IDE's perspective, it is talking to a plain stdio child; from the daemon's perspective, it is talking to a socket client. The daemon can be restarted/upgraded at any time (the IDE only feels a reconnect blip), and the bridge process has no state of its own, so a crash-restart costs almost nothing.
+These two needs conflict: IDEs assume "one child process per agent session", while the daemon model assumes "one daemon serves many clients".
+
+`codex stdio-to-uds` resolves this with a small bridge process. The IDE spawns it as a child, and the bridge does exactly one thing: every byte it receives over stdio it forwards to a Unix domain socket, and every byte it receives from the socket it writes back to stdout.
+
+The daemon itself listens on that socket. From the IDE's perspective, it is talking to a plain stdio child; from the daemon's perspective, it is talking to a socket client.
+
+The daemon can be restarted/upgraded at any time (the IDE only feels a reconnect blip), and the bridge process has no state of its own, so a crash-restart costs almost nothing.
 
 `codex app-server` uses axum with simultaneous HTTP1 and WebSocket support (the Cargo.toml declares axum's features as `["http1", "json", "tokio", "ws"]`), so the same daemon can do RESTful-style session management (for stateless clients) and real-time WebSocket streaming (for IDEs that need streaming output).
 
 ### Claude Code · Pack everything into one npm package, organised through a commander subcommand tree
 
-Claude Code's trade-off is the exact opposite of Codex. It assumes its users are developers who install with one `npm install -g @anthropic-ai/claude-code`; what it most wants to avoid is the user needing to remember "oh, you have to install another binary to get MCP mode". So it picks "one binary, many subcommands": every feature lives in the same npm package's entry, dispatched by commander.js.
+Claude Code's trade-off is the exact opposite of Codex. It assumes its users are developers who install with one `npm install -g @anthropic-ai/claude-code`; what it most wants to avoid is the user needing to remember "oh, you have to install another binary to get MCP mode".
+
+So it picks "one binary, many subcommands": every feature lives in the same npm package's entry, dispatched by commander.js.
 
 <SourceBlock path="REF/claude-code-2.1.88-expanded/src/main.tsx" lines="971-1006" system="claude" summary="Top-level program key flags: --print / --bare / --ide / --mcp-config / --print (script mode); almost every feature toggles via a flag">
 
@@ -159,15 +176,25 @@ program.command('server').description('Start a Claude Code session server')
 
 The five most commonly used entry modes are: **bare `claude`** opens the REPL (a terminal UI rendered with the ink library), the everyday conversational entry; **`claude -p "..."`** enters "print mode" (run the prompt, print the result, exit), friendly to shell pipes (think `cat file | claude -p "summarise"`), and the help text has one important note: this mode skips the workspace trust dialog, so use it only in directories you trust to avoid auto-loading project-level config from hostile directories.
 
-The mode that deserves a dedicated paragraph is **`claude --bare`**. It exists to give CI pipelines and SDK callers a "fully controllable" entry. A regular `claude` startup does a long list of automation: load project-level hooks, start an LSP server, sync plugins, generate git attribution, load long-term memory, prefetch data in the background, read the system keychain, auto-discover and load CLAUDE.md files. All of these are there for a smooth interactive developer experience. But in CI they become a liability: each run looks slightly different, surprising side effects appear, environment information leaks. `--bare` turns the whole automation pile off in one move, restricting auth to the two strictest modes (the `ANTHROPIC_API_KEY` env var or an explicit `apiKeyHelper` script) and refusing to touch OAuth or keychain.
+The mode that deserves a dedicated paragraph is **`claude --bare`**. It exists to give CI pipelines and SDK callers a "fully controllable" entry.
+
+A regular `claude` startup does a long list of automation: load project-level hooks, start an LSP server, sync plugins, generate git attribution, load long-term memory, prefetch data in the background, read the system keychain, auto-discover and load CLAUDE.md files.
+
+All of these are there for a smooth interactive developer experience. But in CI they become a liability: each run looks slightly different, surprising side effects appear, environment information leaks. `--bare` turns the whole automation pile off in one move, restricting auth to the two strictest modes (the `ANTHROPIC_API_KEY` env var or an explicit `apiKeyHelper` script) and refusing to touch OAuth or keychain.
 
 The remaining common entries: **`claude --ide`** auto-detects the currently open IDE on startup and connects (provided exactly one valid IDE instance is present, to avoid ambiguity); **`claude mcp serve`** turns the process into a stdio MCP server, **`claude mcp list`** manages MCP config; **`claude server`** boots an HTTP or Unix-socket session server with `--port`, `--host`, `--unix`, `--max-sessions`, `--idle-timeout` and other flags, designed for the enterprise case of many users sharing one agent process; and then auth (`auth login`, `auth status`, `auth logout`), plugin management (`plugin list`, `plugin marketplace`), initial token setup (`setup-token`), triage (`doctor`), auto-update (`update`), and listing sub-agent definitions (`agents`) each live in their own subcommand.
 
-Compared with Codex, Claude Code chooses "the user installs one npm package" (simple distribution), at the cost of `main.tsx` becoming a single ten-thousand-line file (heavy maintenance). Neither trade-off is absolutely better. It depends on how the team weighs UX simplicity vs engineering modularity.
+Compared with Codex, Claude Code chooses "the user installs one npm package" (simple distribution), at the cost of `main.tsx` becoming a single ten-thousand-line file (heavy maintenance). Neither trade-off is absolutely better.
+
+It depends on how the team weighs UX simplicity vs engineering modularity.
 
 ### OpenClaw · 19 lazily-loaded sub-CLIs plus channels as independently-published npm packages
 
-OpenClaw's reasoning differs from both of the above. The scenario it serves is much more complex than an IDE tool. It is a ChatOps framework that must simultaneously connect to many chat platforms (Telegram, Discord, Slack), provide RPC interfaces for many local tools, support sandbox container isolation, and provide a standardised connect protocol for external IDEs. One CLI ends up having to cover "manage Telegram config", "start a sandbox container", "tail logs", "manage DNS resolution", and dozens of other functions at once.
+OpenClaw's reasoning differs from both of the above. The scenario it serves is much more complex than an IDE tool.
+
+It is a ChatOps framework that must simultaneously connect to many chat platforms (Telegram, Discord, Slack), provide RPC interfaces for many local tools, support sandbox container isolation, and provide a standardised connect protocol for external IDEs.
+
+One CLI ends up having to cover "manage Telegram config", "start a sandbox container", "tail logs", "manage DNS resolution", and dozens of other functions at once.
 
 Its solution is to split the CLI into **19 independent sub-CLIs**: each sub-CLI corresponds to one function domain, and the organisation is neither Codex-style "each subcommand is its own entry mode" nor Claude Code-style "main entry with many small subcommands", but rather "the main program only dispatches, all heavy logic lives in the sub-CLIs".
 
@@ -227,11 +254,15 @@ const DEFAULT_CATALOG_PATHS = [
 
 </SourceBlock>
 
-A user adds Telegram by first running `openclaw plugins add @openclaw/channel-telegram` to install the Telegram channel plugin (which is actually just installing an independent npm package), then `openclaw channels add telegram` to configure the connection parameters. This buys several important engineering wins: first, the main repo size does not balloon (no need to bundle every platform's SDK dependencies); second, the ecosystem can contribute new channels (any third party can publish a `@vendor/channel-myplatform` package); third, each channel plugin can be versioned independently (a Telegram SDK upgrade does not affect the Discord plugin).
+A user adds Telegram by first running `openclaw plugins add @openclaw/channel-telegram` to install the Telegram channel plugin (which is actually just installing an independent npm package), then `openclaw channels add telegram` to configure the connection parameters.
+
+This buys several important engineering wins: first, the main repo size does not balloon (no need to bundle every platform's SDK dependencies); second, the ecosystem can contribute new channels (any third party can publish a `@vendor/channel-myplatform` package); third, each channel plugin can be versioned independently (a Telegram SDK upgrade does not affect the Discord plugin).
 
 ### Hermes · One gateway process pulling 17 platform adapters, with HTTP API modelled as a "platform" too
 
-Hermes's trade-off contrasts sharply with OpenClaw. Its goal is to be a ChatOps agent where "one pip install plus boot, you immediately have access to all 17 chat platforms", so it bundles every platform adapter into the main repo and runs them all inside the same gateway process. This looks heavy but is actually the most convenient for its target user (individual developers building a personal or family assistant bot): no plugin system to wrestle with, no extra npm packages, working out of the box.
+Hermes's trade-off contrasts sharply with OpenClaw. Its goal is to be a ChatOps agent where "one pip install plus boot, you immediately have access to all 17 chat platforms", so it bundles every platform adapter into the main repo and runs them all inside the same gateway process.
+
+This looks heavy but is actually the most convenient for its target user (individual developers building a personal or family assistant bot): no plugin system to wrestle with, no extra npm packages, working out of the box.
 
 The Hermes core abstraction is a base class called `BasePlatformAdapter`. It defines 6 methods every platform must implement, and unifies the wildly different shapes of 17 chat platforms behind the smallest common subset of those 6 methods.
 
@@ -273,7 +304,11 @@ class BasePlatformAdapter(ABC):
 
 </SourceBlock>
 
-Those 6 abstract methods cover "come in", "disconnect", "send out", "show typing indicator", "send image", "look up chat metadata": the essential capabilities every chat platform has to support. Subclasses implement the specific logic. TelegramAdapter's `connect` logs into Telegram's Bot API and opens long polling, DiscordAdapter's `connect` opens a Discord gateway WebSocket, EmailAdapter's `connect` opens an IMAP connection. The base class also handles a few things every adapter needs: managing "interrupt signals for active sessions" (so users can interrupt generation mid-flight), managing "pending messages" (for platforms that need queueing), and managing a "background task set" (preventing async tasks from being GC'd).
+Those 6 abstract methods cover "come in", "disconnect", "send out", "show typing indicator", "send image", "look up chat metadata": the essential capabilities every chat platform has to support. Subclasses implement the specific logic.
+
+TelegramAdapter's `connect` logs into Telegram's Bot API and opens long polling, DiscordAdapter's `connect` opens a Discord gateway WebSocket, EmailAdapter's `connect` opens an IMAP connection.
+
+The base class also handles a few things every adapter needs: managing "interrupt signals for active sessions" (so users can interrupt generation mid-flight), managing "pending messages" (for platforms that need queueing), and managing a "background task set" (preventing async tasks from being GC'd).
 
 The actual registration of the 17 platforms is laid out flatly inside the `_create_adapter` method:
 
@@ -321,7 +356,7 @@ A few design details deserve dedicated paragraphs:
 
 Beyond the 17 platform adapters, Hermes also ships several developer-and-toolchain entries: a simple `cli.py` for talking to the agent directly (mostly for development and testing), a `tui_gateway/` package providing a local TUI (connecting to the local gateway daemon), and an `mcp_serve.py` that wraps the entire Hermes as an MCP server so other agents can use it as a tool.
 
-## §4 · What They Agree On
+## What multi-channel entry already agrees on
 
 Despite the wildly different trade-offs in entry architecture, the four systems converge on four basics. Think of these as the minimum set for doing "multi-channel entry" well.
 
@@ -333,7 +368,7 @@ Despite the wildly different trade-offs in entry architecture, the four systems 
 
 **The fourth is that the protocols spoken are open standards: nobody invents private protocols**. MCP (used by Codex, Claude, Hermes), ACP (OpenClaw's bet), Telegram Bot API, Slack Bolt, Discord Gateway, IMAP/SMTP are all public. Nobody has built "a proprietary agent communication protocol", because public protocols come with existing SDKs and tooling, and private protocols would lock the ecosystem out, which would in turn limit the agent's own reachable scenarios.
 
-## §5 · Where They Differ
+## Choose subcommands, adapters, or separate packages
 
 <Diagram
   src="/diagrams/14-tradeoff.svg"
@@ -348,7 +383,7 @@ Four typical scenarios:
 - **Platform-style agent framework**: borrow from OpenClaw's channels-plugins + ACP design. Let the ecosystem build new channels.
 - **Both worlds (dev tool + ChatOps)**: borrow Hermes's "HTTP API as a platform" plus Codex's stdio-to-uds bridge. Reuse one message handler everywhere.
 
-## §6 · My Take
+## My take: channels should only translate
 
 <ScoreCard
   rows={[
@@ -361,7 +396,7 @@ Four typical scenarios:
   headers={['System', 'Score', 'Strengths', 'Risks']}
 />
 
-## §7 · Build recipe
+## Start with one entry and one core
 
 Below is the recipe distilled from the four systems for writing your own multi-channel entry. Lay solid foundations first, then add production-grade features, finally avoid five common dead ends.
 
@@ -394,7 +429,7 @@ Below is the recipe distilled from the four systems for writing your own multi-c
   ]}
 />
 
-## §8 · Four entry topologies side by side
+## Four entry topologies side by side
 
 <Diagram
   src="/diagrams/14-entry-topologies.svg"
@@ -404,7 +439,7 @@ Below is the recipe distilled from the four systems for writing your own multi-c
 
 Placed side by side, "how does the user come in" lights up: Codex gives each caller a dedicated binary, Claude Code lets commander dispatch, OpenClaw lets the ecosystem build new channels, and Hermes packs 17 platforms into one process.
 
-## §9 · Further Reading / Source Pointers
+## Follow channel adapters through source
 
 <SourceTrail
   title="Further Reading / Source Pointers"
@@ -428,14 +463,19 @@ Placed side by side, "how does the user come in" lights up: Codex gives each cal
   ]}
 />
 
-## §10 · Exercises
+## Appendix: exercises and review
+
+<details id="interview-drill">
+<summary>Open the exercises and ten review questions</summary>
+
+### Exercises
 
 1. **🟢 Four-entry summary**: Write one sentence per system describing its main entry. How does each handle a non-interactive mode?
 2. **🟠 Implement BasePlatformAdapter**: Write a Python `BasePlatformAdapter` abstract class with 5 abstract methods (`connect / disconnect / send / send_typing / get_chat_info`). Implement two subclasses: `StdinAdapter` (read messages from stdin) and `WebhookAdapter` (receive messages via HTTP POST).
 3. **🟠 Lazy-load sub-CLIs**: Use commander.js to write a CLI with three subcommands (`logs / sandbox / models`). Each subcommand lives in its own file and is imported only when the user runs it.
 4. **🔴 stdio-to-uds bridge**: Write a Node.js program that reads JSON-RPC messages from stdin, forwards them to a local UDS (`/tmp/agent.sock`), and writes any UDS responses back to stdout. Verify: your IDE spawns `node bridge.js` as a child, a separate `agent-daemon` listens on the UDS, and both sides exchange RPC messages.
 
-## §11 · Interview drill: 10 questions with worked answers
+### Review questions
 
 <details>
 <summary>**Q1 · Concept**: Why does Codex pick multi-binary while Claude Code picks single-binary?</summary>
@@ -559,7 +599,9 @@ The bridge itself is a lightweight process (< 5MB memory), exits when user close
 
 **1. Reuses message handler logic**
 
-Agent's message handler doesn't care where the message came from. A Telegram user message and an HTTP API call both arrive at the agent as `MessageEvent { content, chat_id, user_id }`. Same `connect / send / disconnect` abstraction, same response routing logic.
+Agent's message handler doesn't care where the message came from. A Telegram user message and an HTTP API call both arrive at the agent as `MessageEvent { content, chat_id, user_id }`.
+
+Same `connect / send / disconnect` abstraction, same response routing logic.
 
 **2. Unifies multi-channel behavior**
 
@@ -577,7 +619,9 @@ Each platform adapter self-manages `_active_sessions: Dict[str, asyncio.Event]`.
 
 **Why is Hermes's approach right?**
 
-Hermes positions as "ChatOps-first." HTTP API and Webhook are secondary entries, no need to architect around them. Reusing platform adapter keeps code small, maintenance simple. If HTTP API were the main entry, design should be reverse (HTTP-first, chat platforms as adapters).
+Hermes positions as "ChatOps-first." HTTP API and Webhook are secondary entries, no need to architect around them. Reusing platform adapter keeps code small, maintenance simple.
+
+If HTTP API were the main entry, design should be reverse (HTTP-first, chat platforms as adapters).
 
 **Follow-up**: "What to watch out for when implementing this unified adapter?" Make abstraction layer minimal (5-6 methods), let concrete adapters decide details. Hermes abstracts `send_typing` but allows no-op, that's the escape hatch.
 
@@ -1041,4 +1085,6 @@ Borrow Claude Code `doctor` subcommand.
 **Follow-up**: "Microservices better?" For small projects (< 10K LoC) multi-binary / microservices are over-engineering. Codex's multi-binary isn't required; it works because the 50+ Codex team has someone dedicated to app-server. MVP single binary + subcommand is right.
 
 **Source mosaic**: [`codex/codex-rs/cli/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/cli/) + [`codex/codex-rs/stdio-to-uds/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/stdio-to-uds/) + `claude-code/src/main.tsx` + [`openclaw/src/cli/program/register.subclis.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/cli/program/register.subclis.ts) + [`hermes-agent/gateway/`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/gateway/).
+</details>
+
 </details>

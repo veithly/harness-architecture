@@ -58,7 +58,7 @@ const resolved = resolveRepoLink(path, lines);
     ) : (
       <code class="aap-source__path">{resolved.display}</code>
     )}
-    {summary && <span class="aap-source__hint">— {summary}</span>}
+    {summary && <span class="aap-source__hint">{summary}</span>}
     <span class="aap-source__chevron" aria-hidden="true">▸</span>
   </summary>
   <div class="aap-source__body">

@@ -22,7 +22,7 @@ export default defineConfig({
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/veithly/harness-architecture' },
       ],
-      customCss: ['./src/styles/tokens.css', './src/styles/handdrawn.css'],
+      customCss: ['./src/styles/tokens.css', './src/styles/handdrawn.css', './src/styles/field-notes.css'],
       head: [
         {
           tag: 'meta',
@@ -77,7 +77,7 @@ export default defineConfig({
           tag: 'link',
           attrs: {
             rel: 'stylesheet',
-            href: 'https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Playfair+Display:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap',
+            href: 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600;6..72,700&display=swap',
           },
         },
       ],
@@ -166,7 +166,7 @@ export default defineConfig({
       ],
       lastUpdated: true,
       pagination: true,
-      tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
+      tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 2 },
     }),
     react(),
     mdx(),

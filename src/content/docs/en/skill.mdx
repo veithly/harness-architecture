@@ -8,11 +8,11 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import CompareTable from '@components/CompareTable.astro';
 
-<Verdict tldr="build-your-own-agent is a project-side engineering index: 22 chapters, 220 interview drills, and four system comparisons are distilled into a 5-phase Build flow, a 4-path Diagnose flow, 10 static lint rules, and 9 runtime anti-pattern checks. Each step points to source-backed references and runnable scripts." tone="insight" />
+<Verdict tldr="build-your-own-agent is a project-side engineering index. It reorganizes 22 chapters, 220 review questions, and four system comparisons into a 5-phase Build flow, a 4-path Diagnose flow, 10 static lint rules, and 9 runtime anti-pattern checks. The source references and runnable scripts remain attached to every step." tone="insight" />
 
-## §1 · What this Skill is
+## What it is for
 
-The companion engineering artifact to this book. It compresses 22 chapters of conclusions into a Claude Code / Cursor loadable `build-your-own-agent` skill that does two jobs:
+This is the site's companion engineering artifact. It organizes the conclusions from 22 chapters into a Claude Code / Cursor loadable `build-your-own-agent` skill that does two jobs:
 
 1. Build: scaffold a production-grade agent harness from zero.
 2. Diagnose & Optimize: audit an existing agent against the 10 iron laws + 9 anti-patterns and apply the source-backed fix.
@@ -51,7 +51,7 @@ build-your-own-agent/
     └── scaffold/                        # single source for generated source files
 ```
 
-## §2 · Install
+## Where to install it
 
 Two ways to install:
 
@@ -70,7 +70,7 @@ git clone https://github.com/veithly/build-your-own-agent.git ./skills/build-you
 # "When designing an agent, load skill at ./skills/build-your-own-agent/SKILL.md."
 ```
 
-## §3 · One-line invocation patterns
+## Call it by task
 
 The skill loads on demand without polluting context. Two main paths: Build and Diagnose.
 
@@ -108,7 +108,7 @@ The skill loads on demand without polluting context. Two main paths: Build and D
       label: 'Execution state routing',
       values: [
         '"Where should tool progress, todo, and away summary appear?"',
-        'SKILL.md + picking-from-spectrum.md + docs-site §22',
+        'SKILL.md + picking-from-spectrum.md + the Execution State Surfaces chapter',
         'Execution-state router: source / audience / lifetime / context policy',
         'Designing multi-layer progress surfaces'
       ],
@@ -153,7 +153,7 @@ The skill loads on demand without polluting context. Two main paths: Build and D
   caption="Load on demand. Build and Diagnose are two clean entry points."
 />
 
-### §3.1 · One-line commands: CI / local sweep
+### CI and local checks
 
 ```bash
 # Standard new-agent initialization
@@ -175,7 +175,7 @@ python ~/.claude/skills/build-your-own-agent/scripts/diagnose-agent.py /path/to/
 
 Exit 0 = pass; 1 = at least one finding. JSON output is stable enough to feed GitHub Actions / Jenkins / GitLab CI directly. `assets/ci-lint-diagnose.yml.template` is a working pipeline skeleton.
 
-## §4 · The 10 Iron Laws at a glance
+## Start with these ten constraints
 
 These 10 rules are the skill's spine. Every law is one that all four reference systems obey.
 
@@ -195,9 +195,9 @@ These 10 rules are the skill's spine. Every law is one that all four reference s
   title="10 Iron Laws of Agent Harness"
 />
 
-Each law maps to a chapter with worked examples. Want to know how Codex / Claude Code / OpenClaw / Hermes actually implement law N? Read the corresponding chapter's §11 interview section.
+Each law maps to a chapter with worked examples. To see how Codex, Claude Code, OpenClaw, and Hermes implement a law, open the review questions and source notes in that chapter's appendix.
 
-## §5 · How this skill relates to the book
+## How it complements the site
 
 The skill does not replace the book. It is the toolkit you reach for after reading:
 
@@ -212,12 +212,12 @@ The book: 22 chapters (depth + cases + comparison)
 
 If a law feels under-explained, jump back to the chapter. If you forget "wait, how does Codex do that transition again", let the skill find the citation for you.
 
-## §6 · Roadmap
+## Maintenance and contributions
 
 The skill is versioned in lockstep with the book. New references and rule edits land in the repo `CHANGELOG.md`. Welcome contributions on:
 
 - You built an agent: which laws actually bit you, and how you adjusted them;
-- Use cases missing from the §5 cross-reference table;
+- Use cases missing from the comparison table above;
 - Any reference doc that missed a case your real project hit.
 
 <SourceTrail

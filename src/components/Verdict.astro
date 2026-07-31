@@ -1,10 +1,10 @@
 ---
 /**
  * <Verdict tldr="一段话结论" />
- * 用于章节 §1 "TL;DR"。一段密集的结论摘要，覆盖四家的核心取舍。
+ * 用于章节开头。一段密集的结论摘要，覆盖四家的核心取舍。
  *
  * 长内容自适应：当 tldr 超过 ~120 字符（约 1-2 句），
- * 自动切换为「dense」模式，正文降级为 Inter（更适合密集阅读），
+ * 自动切换为「dense」模式，正文切回正文字体（更适合密集阅读），
  * 避免大段 Playfair 形成视觉墙。
  */
 interface Props {
@@ -14,11 +14,34 @@ interface Props {
 const { tldr, tone = 'default' } = Astro.props;
 const DENSE_THRESHOLD = 120;
 const isDense = tldr.length > DENSE_THRESHOLD;
+const isEnglish = Astro.url.pathname.startsWith('/en/');
+
+function makePreview(text: string, max = 190) {
+  if (text.length <= max) return text;
+  const candidate = text.slice(0, max);
+  if (isEnglish) {
+    const wordBreak = candidate.lastIndexOf(' ');
+    return `${candidate.slice(0, wordBreak > 130 ? wordBreak : max).trim()}…`;
+  }
+  const breaks = ['。', '；', '，', '、'];
+  const boundary = Math.max(...breaks.map((mark) => candidate.lastIndexOf(mark)));
+  return `${candidate.slice(0, boundary > 110 ? boundary + 1 : max).trim()}…`;
+}
+
+const preview = makePreview(tldr);
+const expandLabel = isEnglish ? 'Read the complete verdict' : '展开完整结论';
+const tagLabel = isEnglish ? 'Verdict' : '结论';
 ---
 
-<aside class:list={['aap-verdict', `aap-verdict--${tone}`, { 'aap-verdict--dense': isDense }]} role="note" aria-label="本章结论 / Chapter verdict">
-  <span class="aap-verdict__tag">TL;DR</span>
-  <p class="aap-verdict__body">{tldr}</p>
+<aside class:list={['aap-verdict', `aap-verdict--${tone}`, { 'aap-verdict--dense': isDense }]} role="note" aria-label={isEnglish ? 'Chapter verdict' : '本章结论'}>
+  <span class="aap-verdict__tag">{tagLabel}</span>
+  <p class="aap-verdict__body">{isDense ? preview : tldr}</p>
+  {isDense && (
+    <details class="aap-verdict__details">
+      <summary>{expandLabel}</summary>
+      <p>{tldr}</p>
+    </details>
+  )}
 </aside>
 
 <style>
@@ -34,7 +57,7 @@ const isDense = tldr.length > DENSE_THRESHOLD;
     padding: var(--aap-sp-4) var(--aap-sp-6);
     margin: var(--aap-sp-4) 0 var(--aap-sp-6);
     background: var(--aap-paper-soft);
-    box-shadow: var(--aap-shadow-soft);
+    box-shadow: none;
     position: relative;
   }
   .aap-verdict--warn { --bar: var(--aap-color-risk); }
@@ -60,12 +83,35 @@ const isDense = tldr.length > DENSE_THRESHOLD;
     color: var(--aap-ink);
     letter-spacing: -0.005em;
   }
-  /* 长内容自适应：切换到 Inter，降低字号，回到正文级行距 */
+  /* 长内容自适应：切回正文字体，降低字号，回到正文级行距 */
   .aap-verdict--dense .aap-verdict__body {
     font-family: var(--aap-font-body);
     font-weight: 400;
     font-size: var(--aap-fs-base);
     line-height: 1.7;
     letter-spacing: 0;
+  }
+  .aap-verdict__details {
+    grid-column: 2;
+    margin-top: calc(var(--aap-sp-2) * -1);
+    color: var(--aap-ink-soft);
+  }
+  .aap-verdict__details summary {
+    width: fit-content;
+    cursor: pointer;
+    color: var(--aap-color-tradeoff);
+    font-family: var(--aap-font-mono);
+    font-size: var(--aap-fs-xs);
+    font-weight: 600;
+  }
+  .aap-verdict__details p {
+    margin: var(--aap-sp-3) 0 0;
+    font-family: var(--aap-font-body);
+    font-size: var(--aap-fs-sm);
+    line-height: 1.75;
+  }
+  @media (max-width: 520px) {
+    .aap-verdict { grid-template-columns: 1fr; }
+    .aap-verdict__details { grid-column: 1; }
   }
 </style>

@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## 状态必须对用户可见
 
 <Verdict tldr="Todo List 章已经把当前执行清单讲清楚了；这里补的是执行状态的路由层。成熟 harness 不会只维护一张 checklist。Codex 同时保留自然语言 progress update、`update_plan`、Plan Mode 的 `PlanDelta`、MCP 工具进度通知和 TUI terminal-title progress。Claude Code 在 `TodoWrite`、Tasks V2 之外，还暴露 `hook_progress`、`tool_progress`、`task_started`、`task_progress`、OSC 9;4 terminal progress 和 away summary。OpenClaw 走事件投影：`tool_call` / `tool_call_update`、子 session progress relay、hidden-boundary projector。Hermes 把 `tool_progress` 做成 CLI / gateway / SSE 的显示策略，支持 off / new / all / verbose。设计自己的 agent 时，应先写 execution-state router：每条状态更新标清来源、受众、生命周期、上下文回注入规则、去重规则和无进展检测。" />
 
-## §2 · 执行状态面总览
+## 执行状态面总览
 
-:::tip[本章重点 · 30 秒速读]
+<details>
+<summary>读前提示（按需展开）</summary>
+
 - **一张 checklist 不够**：成熟 harness 把执行状态拆成多个面，本章讲的是 Todo List 之上的路由层。
 - **显示策略分歧最大**：Hermes 把 tool_progress 做成 off / new / all / verbose 四档按平台配置，Claude Code 拆出 hook_progress、tool_progress、task_started、task_progress 加 OSC 9;4 终端指示。
 - **来源和受众决定路由**：每条状态更新要标清来源、受众、生命周期和上下文回注入规则。
 - **第一优先**：先写 execution-state router，把去重规则和无进展检测一起做进去。
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/22-execution-state-surfaces-base.svg"
@@ -47,7 +50,7 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="状态面"
 />
 
-## §3 · 四家怎么落地
+## 四套系统怎样投影执行状态
 
 ### Codex · 从 prompt 纪律到协议事件再到终端标题
 
@@ -105,7 +108,9 @@ Away summary 解决的是“回来后从哪继续”。用户离开终端 5 分�
 
 ### OpenClaw · 事件投影和 hidden boundary
 
-OpenClaw 的进度核心不是模型 todo，而是 ACP runtime event。translator 在工具开始时发 `tool_call` 且状态 `in_progress`，工具结束时发 `tool_call_update`。auto-reply projector 默认把 `tool_call` 和 `tool_call_update` 当 hidden boundary tag，必要时转成工具摘要；`tool_call_update` 允许 edit，避免同一个工具状态在聊天平台上刷屏。
+OpenClaw 的进度核心不是模型 todo，而是 ACP runtime event。translator 在工具开始时发 `tool_call` 且状态 `in_progress`，工具结束时发 `tool_call_update`。auto-reply projector 默认把 `tool_call` 和 `tool_call_update` 当 hidden boundary tag，必要时转成工具摘要；
+
+`tool_call_update` 允许 edit，避免同一个工具状态在聊天平台上刷屏。
 
 OpenClaw 的 child session relay 也属于 execution state surface：spawn 后会告诉父 session “正在把进度流回 parent”，之后把 child 的片段变成 `contextPrefix:progress`。这和 Todo List 不同，它是父子 session 间的事实传播。
 
@@ -115,7 +120,7 @@ Hermes 把 `tool_progress` 做成产品级开关。CLI 里进度模式是 `off`�
 
 它还把默认值按平台分层：CLI / API 可以是 all，聊天平台可以是 new 或 off，webhook 默认 off。API server 则把 `("__tool_progress__", payload)` 推进 SSE 队列。同一条 tool progress 在不同平台上的显示密度必须分开配置。
 
-## §4 · 共同点
+## 状态展示已经形成的共识
 
 **来源**决定可信度。模型写的 todo、工具返回的事实、后台任务生命周期、终端 chrome、恢复摘要，不属于同一种真相；混在一起后，审计和恢复都会失真。
 
@@ -125,7 +130,7 @@ Hermes 把 `tool_progress` 做成产品级开关。CLI 里进度模式是 `off`�
 
 **无进展检测**不能省。Hermes 的 `new` 模式跳过重复工具名，OpenClaw 的 projector 可编辑同一 tool update，OpenClaw 还做 tool-loop / no-output detector。没有这层，UI 只是把卡死包装成进度。
 
-## §5 · 差异点
+## 透明度与信息噪声怎么取舍
 
 <TradeOff
   title="执行状态面怎么分层"
@@ -139,7 +144,7 @@ Hermes 把 `tool_progress` 做成产品级开关。CLI 里进度模式是 `off`�
   caption="状态面按职责拆分；每一层都要写清来源、受众和失效条件。"
 />
 
-## §6 · 我的点评
+## 我的判断：先展示用户能行动的信息
 
 <ScoreCard
   rows={[
@@ -151,7 +156,7 @@ Hermes 把 `tool_progress` 做成产品级开关。CLI 里进度模式是 `off`�
   caption="自己实现时，先抄 Codex 的边界，再抄 Hermes 的显示密度配置；需要 IDE / 后台任务时再引入 Claude Code 的事件族。"
 />
 
-## §7 · 自己实现怎么选
+## 从最小状态面开始
 
 <BuildRecipe
   title="Execution State Router 复刻方案"
@@ -178,7 +183,7 @@ Hermes 把 `tool_progress` 做成产品级开关。CLI 里进度模式是 `off`�
   ]}
 />
 
-## §8 · 动画图解
+## 状态从事件流到界面
 
 <Diagram
   src="/diagrams/22-tradeoff.svg"
@@ -187,7 +192,7 @@ Hermes 把 `tool_progress` 做成产品级开关。CLI 里进度模式是 `off`�
   wide
 />
 
-## §9 · 源码索引
+## 沿着状态事件读源码
 
 <SourceTrail
   entries={[
@@ -213,7 +218,12 @@ Hermes 把 `tool_progress` 做成产品级开关。CLI 里进度模式是 `off`�
   ]}
 />
 
-## §10 · 小练习
+## 附录：练习与复盘
+
+<details id="interview-drill">
+<summary>按需展开练习和十道复盘题</summary>
+
+### 练习
 
 1. 给一个现有 agent 画出 6 个状态面：approval plan、execution todo、tool progress、task progress、terminal/status、resume summary。
 2. 写一个 projection policy 表：每种事件是否显示给用户、是否进日志、是否回注入模型、何时过期。
@@ -221,7 +231,7 @@ Hermes 把 `tool_progress` 做成产品级开关。CLI 里进度模式是 `off`�
 4. 模拟用户离开 5 分钟后返回，生成一条 1-3 句 away summary，确认不会把 raw tool log 当总结。
 5. 把一个外部 MCP 工具改成支持 progress notification，确认前端能显示中间状态但最终 prompt 只拿摘要。
 
-## §11 · 面试题：10 道带答案的高频考点
+### 复盘题
 
 <details>
 <summary>**Q1 · 概念**：Execution State Surface 和 Todo List 有什么区别？</summary>
@@ -301,4 +311,6 @@ Claude Code 的 away summary 用最近 30 条消息、小模型、`skipCacheWrit
 最小 envelope 至少有 `source`、`surface`、`audience`、`lifetime`、`thread_id`、`turn_id`、`item_id`、`message`、`status` 和 `parent_id?`。
 
 有了这些字段，UI 可以按 audience 投影，resume 可以按 lifetime 过滤，日志可以按 source 审计，父子任务可以按 parent id 聚合。
+</details>
+
 </details>

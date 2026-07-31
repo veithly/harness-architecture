@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## Tool boundaries begin with the schema
 
 <Verdict tldr="The tool system is the agent's only channel to the outside world: no tools, no file reads, no commands, no HTTP requests. But mounting tools onto an agent is harder than it sounds; you have to answer five questions: what schema describes a tool, whether multiple tool calls in one turn run serial or parallel, how permission interception happens before a call, how MCP (Model Context Protocol, the standardised tool protocol) integrates, and how to paper over the differences between OpenAI's `function_call`, Anthropic's `tool_use`, and Gemini's `function declarations`. The four systems answer those five questions very differently. Codex registers most tools via the OpenAI Responses API's `function_tool` JSON schema, with `apply_patch` as a deliberate exception. Instead of going through a standard function call, the model is taught the V4A diff format and inlines the patch in the assistant message, dodging function-args size limits so a single turn can ship arbitrarily large diffs. Permission is enforced by `execpolicy`, which gives every command an `allow | ask | deny` verdict; combined with `approval_mode` (auto / on-request / off) and `sandbox_mode` (read-only / workspace-write / danger-full-access) the result is a 3D permission matrix. MCP gets its own four crates (`mcp-client` / `mcp-server` / `mcp-protocol` / `mcp-types`) and MCP tools surface to the model as ordinary `function_tool`s. Claude Code uses Anthropic's native `tool_use` block protocol and does not trust `stop_reason='tool_use'` (the API field is unreliable, so the code scans `tool_use` blocks itself); multiple blocks in one assistant message are fired through `dispatchToolUseBlocks` via `Promise.all` for same-turn parallel execution, then a turn-end `stopHooks` round verifies them together. The `canUseTool` hook filters tools at runtime; a denied call returns a `deny` `tool_result` so the model sees «this tool was blocked» and picks an alternative. Permission mode has four settings (`plan` shuts the tool-call channel so the model can only emit text, `acceptEdits` auto-approves edit tools, `bypassPermissions` full-auto for CI, `default` asks per call), and 12+ built-in tools (Edit, Read, Bash, Glob, Grep, Task, TodoWrite, …) share one schema with MCP tools so the model cannot tell them apart. OpenClaw organises tools into 11 categories (fs / runtime / web / memory / sessions / etc.) and exposes a `ToolProfileId` enum (`minimal` / `coding` / `messaging` / `full`) so ops can swap entire tool sets in one click. The `tool-policy-pipeline` turns «what happens before and after a tool call» into a middleware chain with three pluggable hook points (`before_tool_call` / `after_tool_call` / `tool_result_persist`), plus dedicated detectors: `tool-loop-detection` (the model dead-loops calling the same tool), `tool-fs-policy` (filesystem-specific second permission layer), `tool-mutation` (rewrites tool results before they reach the model). Tool events are mirrored to a separate stream so external observers can audit every tool action. Hermes defines each tool once in a single registry (OpenAI function-calling style); three adapter files (`anthropic_adapter` / `bedrock_adapter` / `gemini_native_adapter`) translate the internal OpenAI-style messages to the target API, so swapping models only edits adapters and never tool definitions. `skills_guard` is a hard-deny tool that intercepts dangerous paths (`rm -rf /`, etc.) before dispatch; per-tool permission checks live inside each tool function (direct but harder to extend). Tools run serial by default (the trajectory model assumes a single time axis), and parallel execution requires explicitly spawning a subagent. Coding agent? Borrow Codex's `execpolicy` + `apply_patch`. IDE tooling? Borrow Claude Code's parallel dispatch + permission mode. Enterprise control plane? Borrow OpenClaw's categories + middleware chain. Multi-model compatibility? Borrow Hermes's registry + adapter split." />
 
-## §2 · The base diagram
+## The four layers of a tool stack
 
-:::tip[Key takeaways · 30-second read]
+<details>
+<summary>Before reading (optional)</summary>
+
 - **The only channel out**: tools are the agent's sole path to files, commands, and HTTP; the design reduces to schema, dispatch order, permission interception, MCP integration, and protocol adaptation.
 - **Permission split**: Codex crosses `execpolicy` (allow | ask | deny) with `approval_mode` and `sandbox_mode` into a 3D matrix; Claude Code filters at runtime via the `canUseTool` hook plus 4 permission modes; OpenClaw runs the `tool-policy-pipeline` middleware chain (`before_tool_call` / `after_tool_call` / `tool_result_persist`); Hermes hard-denies dangerous paths with `skills_guard`.
 - **Definitions decide swap cost**: decoupling tool definitions from model protocols (Hermes's single registry + three adapters) means swapping models only edits adapters, never tools.
 - **Do not trust `stop_reason`**: Claude Code treats `stop_reason='tool_use'` as unreliable and scans `tool_use` blocks itself; count tool calls yourself before dispatch.
-:::
+
+</details>
 
 Every agent's tool stack is four layers:
 
@@ -49,31 +52,59 @@ Each layer splits four ways:
   dimensionLabel="Dimension"
 />
 
-## §3 · How each system does it
+## Four tool systems, four boundaries
 
 ### Codex · Responses function_tool + apply_patch DSL + execpolicy forming a complete three-dimensional permission matrix
 
-Codex's core judgement on the tool system is: as OpenAI's own coding agent, it should maximise reuse of OpenAI's own Responses API capability (function_tool) rather than inventing a new protocol; but function calling has a hard problem in the "large patch" scenario. Function arguments usually cap at 8-16K tokens, a real refactor patch is often thousands of lines, and function calls just don't fit; so this one tool must be specially handled. Coding agents running commands also carry far higher risk than chat agents (might `rm -rf /`, might modify system config), so there must be a "command-level review one layer earlier than the sandbox".
+Codex's starting point on the tool system is: as OpenAI's own coding agent, it should maximise reuse of OpenAI's own Responses API capability (function_tool) rather than inventing a new protocol; but function calling has a hard problem in the "large patch" scenario.
 
-Most tools register via the standard Responses function_tool route, each tool a JSON schema (parameters / return values / description all expressed via schema). `apply_patch` is the only exception. It doesn't go through standard function call but teaches the model the V4A diff format (detailed in ch. 06) to inline output the entire patch in the assistant message, parsed and executed by the Rust apply-patch crate. This "inline DSL" design specifically dodges function args size limits (message body has no args ceiling).
+Function arguments usually cap at 8-16K tokens, a real refactor patch is often thousands of lines, and function calls just don't fit; so this one tool must be specially handled.
 
-The permission layer is `execpolicy` (detailed in ch. 07), one of Codex's deepest engineering parts: every shell command runs through a rule review before execution (allow / ask / deny three tiers); rules are described in Starlark DSL (a Python-like config language), which can be git-tracked and self-tested (match / not_match let CI verify rule correctness). This command-level review combined with `approval_mode` (auto auto-approve / on-request ask user when needed / off no review) and `sandbox_mode` (read-only / workspace-write / danger-full-access) forms a three-dimensional permission matrix (command × approval × sandbox). Codex users pick combinations for different scenarios (CI run can be auto + workspace-write, local dev can be on-request + read-only), extreme flexibility.
+Coding agents running commands also carry far higher risk than chat agents (might `rm -rf /`, might modify system config), so there must be a "command-level review one layer earlier than the sandbox".
 
-MCP support is fully implemented in `codex-rs/mcp-client` / `codex-rs/mcp-server` / `codex-rs/mcp-protocol` / `codex-rs/mcp-types` four crates (simultaneously supports being an MCP client to call external services and an MCP server for external IDEs to call). MCP tools are registered as normal function_tool transparent to the model; the model sees "these tools are available", not distinguishing local from MCP, simplifying model decisions.
+Most tools register via the standard Responses function_tool route, each tool a JSON schema (parameters / return values / description all expressed via schema). `apply_patch` is the only exception.
+
+It doesn't go through standard function call but teaches the model the V4A diff format (detailed in ch. 06) to inline output the entire patch in the assistant message, parsed and executed by the Rust apply-patch crate.
+
+This "inline DSL" design specifically dodges function args size limits (message body has no args ceiling).
+
+The permission layer is `execpolicy` (detailed in ch. 07), one of Codex's deepest engineering parts: every shell command runs through a rule review before execution (allow / ask / deny three tiers); rules are described in Starlark DSL (a Python-like config language), which can be git-tracked and self-tested (match / not_match let CI verify rule correctness).
+
+This command-level review combined with `approval_mode` (auto auto-approve / on-request ask user when needed / off no review) and `sandbox_mode` (read-only / workspace-write / danger-full-access) forms a three-dimensional permission matrix (command × approval × sandbox).
+
+Codex users pick combinations for different scenarios (CI run can be auto + workspace-write, local dev can be on-request + read-only), extreme flexibility.
+
+MCP support is fully implemented in `codex-rs/mcp-client` / `codex-rs/mcp-server` / `codex-rs/mcp-protocol` / `codex-rs/mcp-types` four crates (simultaneously supports being an MCP client to call external services and an MCP server for external IDEs to call).
+
+MCP tools are registered as normal function_tool transparent to the model; the model sees "these tools are available", not distinguishing local from MCP, simplifying model decisions.
 
 ### Claude Code · Same-turn parallel multi-tool + canUseTool hook + permission mode 4 modes
 
-Claude Code's core judgement on the tool system is: as an IDE-integrated coding agent, a single user request often needs multiple independent tools cooperating (e.g. "fix this bug" needs simultaneously Read multiple files, Grep keywords, Glob find similar patterns). If these tools run serially, users wait several seconds; if running in parallel, the experience instantly becomes smooth. Anthropic's tool_use block protocol naturally supports "multiple tool_use blocks in one assistant message", which Claude Code uses fully.
+Claude Code's starting point on the tool system is: as an IDE-integrated coding agent, a single user request often needs multiple independent tools cooperating (e.g.
 
-Actual implementation uses Anthropic's native tool_use block protocol: the model outputs multiple tool_use blocks in the assistant message (each block one tool call); after the harness receives the entire message it scans all tool_use blocks, throws them all at `dispatchToolUseBlocks` using Promise.all for parallel execution. One engineering detail: the comment at `queryLoop` line 557 admits "`stop_reason === 'tool_use'` is unreliable". The Anthropic API stop_reason field theoretically should be 'tool_use' when a tool needs calling, but in practice sometimes stop_reason is 'end_turn' yet the message has tool_use blocks; so Claude Code doesn't trust stop_reason but counts blocks itself (more reliable).
+"fix this bug" needs simultaneously Read multiple files, Grep keywords, Glob find similar patterns). If these tools run serially, users wait several seconds; if running in parallel, the experience instantly becomes smooth.
+
+Anthropic's tool_use block protocol naturally supports "multiple tool_use blocks in one assistant message", which Claude Code uses fully.
+
+Actual implementation uses Anthropic's native tool_use block protocol: the model outputs multiple tool_use blocks in the assistant message (each block one tool call); after the harness receives the entire message it scans all tool_use blocks, throws them all at `dispatchToolUseBlocks` using Promise.all for parallel execution.
+
+One engineering detail: the comment at `queryLoop` line 557 admits "`stop_reason === 'tool_use'` is unreliable".
+
+The Anthropic API stop_reason field theoretically should be 'tool_use' when a tool needs calling, but in practice sometimes stop_reason is 'end_turn' yet the message has tool_use blocks; so Claude Code doesn't trust stop_reason but counts blocks itself (more reliable).
 
 The permission layer has two coordinating mechanisms. The `canUseTool` hook allows the runtime to filter tools before each tool call; a denied tool makes the harness assemble a deny tool_result (with reason) returned to the model letting it see "this can't be called" and pick another way (rather than directly throwing error interrupting the loop). `permission mode` 4 tiers provides "scenario mode" one-click switching: `plan` mode entirely shuts the tool-call channel forcing the model to only emit text (used for PRD design / requirements discussion); `acceptEdits` edit tools auto-approved (used when focused on coding); `bypassPermissions` fully auto-approved (CI run tests use); `default` asks user one by one (default safe mode).
 
-Built-in tools (Edit / Read / Bash / Glob / Grep / Task / TodoWrite / WebFetch / WebSearch etc. 12+ tools) + MCP tools share the same tool_use schema transparent to the model. The model doesn't need to distinguish built-in vs MCP, just looks at schema to decide, lowering decision complexity.
+Built-in tools (Edit / Read / Bash / Glob / Grep / Task / TodoWrite / WebFetch / WebSearch etc. 12+ tools) + MCP tools share the same tool_use schema transparent to the model.
+
+The model doesn't need to distinguish built-in vs MCP, just looks at schema to decide, lowering decision complexity.
 
 ### OpenClaw · Splits tool stack into 11 categories + 4-tier profile + middleware chain, deepest engineering
 
-OpenClaw's core judgement on the tool system is: as a generic agent control plane (simultaneously supporting coding / messaging / automation and other workloads), tools cannot be like Codex's "pile of coding tools heaped together". Messaging scenario agents don't need fs tools, coding agents don't need messaging tools; forcing all tools to be open to all scenarios just makes model decisions harder (long tool list, more wrong choices). So OpenClaw classifies tools by function, with each tool clearly belonging to certain scenario profiles, filtered by profile at startup. A messaging agent at startup only sees messaging / web / memory categories.
+OpenClaw's starting point on the tool system is: as a generic agent control plane (simultaneously supporting coding / messaging / automation and other workloads), tools cannot be like Codex's "pile of coding tools heaped together".
+
+Messaging scenario agents don't need fs tools, coding agents don't need messaging tools; forcing all tools to be open to all scenarios just makes model decisions harder (long tool list, more wrong choices).
+
+So OpenClaw classifies tools by function, with each tool clearly belonging to certain scenario profiles, filtered by profile at startup. A messaging agent at startup only sees messaging / web / memory categories.
 
 Actual implementation is `tool-catalog.ts` organising tools by 11 categories (fs / runtime / web / memory / sessions / ui / messaging / automation / nodes / agents / media); each tool belongs to one or more `ToolProfileId`:
 
@@ -99,39 +130,59 @@ const CORE_TOOL_SECTION_ORDER: Array<{ id: string; label: string }> = [
 
 </SourceBlock>
 
-`ToolProfileId` 4 tiers correspond to different agent forms: `minimal` (smallest tool set, e.g. pure chat agent), `coding` (opens fs / runtime / web etc. coding-essential categories), `messaging` (opens messaging / web / memory, specifically for customer service / messaging agents), `full` (all open, for omnipotent assistants). This "pre-configuration by scenario" makes enterprise deployment not require deciding tool by tool; picking a profile gets it all done.
+`ToolProfileId` 4 tiers correspond to different agent forms: `minimal` (smallest tool set, e.g. pure chat agent), `coding` (opens fs / runtime / web etc. coding-essential categories), `messaging` (opens messaging / web / memory, specifically for customer service / messaging agents), `full` (all open, for omnipotent assistants).
 
-`tool-policy-pipeline.ts` is OpenClaw's deepest engineering, making "things to do before / after a tool call" entirely a middleware chain. `before_tool_call` (before call) / `after_tool_call` (after call) / `tool_result_persist` (before result persistence) three hook points all allow registering external plugins, making permission checks / audit / cache / mocking etc. all middleware-driven. E.g. want to add "check via LLM whether intent matches company policy before calling" check to a tool? Write a plugin registered to before_tool_call.
+This "pre-configuration by scenario" makes enterprise deployment not require deciding tool by tool; picking a profile gets it all done.
 
-Beyond the generic middleware chain, OpenClaw has several specialised tool subsystems: `tool-loop-detection.ts` separately detects "the model is in a dead loop calling the same tool" (avoiding N consecutive same tool calls wasting tokens, on hit forces loop exit); `tool-fs-policy.ts` is a filesystem-specific second permission layer (detailed in ch. 06 workspaceOnly design, distinct from the generic hook); `tool-mutation.ts` processes tool results before returning them to the model (e.g. auto-truncating overly long results, masking sensitive fields, adding context hints). These dozens of files together make up OpenClaw's "tool middleware capability ceiling".
+`tool-policy-pipeline.ts` is OpenClaw's deepest engineering, making "things to do before / after a tool call" entirely a middleware chain. `before_tool_call` (before call) / `after_tool_call` (after call) / `tool_result_persist` (before result persistence) three hook points all allow registering external plugins, making permission checks / audit / cache / mocking etc. all middleware-driven.
 
-Tool events bridge to a separate `tool` stream (`subscribeEmbeddedPiSession`). Any external observer subscribing to this stream sees every tool activity (each tool call is an event + parameters + result). This is the central entry for audit / debug / monitoring: enterprise deployments can hook an external logger subscribing to this stream to write all tool calls to a database, so retrospection doesn't need to scoop from rollout files.
+E.g. want to add "check via LLM whether intent matches company policy before calling" check to a tool? Write a plugin registered to before_tool_call.
+
+Beyond the generic middleware chain, OpenClaw has several specialised tool subsystems: `tool-loop-detection.ts` separately detects "the model is in a dead loop calling the same tool" (avoiding N consecutive same tool calls wasting tokens, on hit forces loop exit); `tool-fs-policy.ts` is a filesystem-specific second permission layer (detailed in ch. 06 workspaceOnly design, distinct from the generic hook); `tool-mutation.ts` processes tool results before returning them to the model (e.g. auto-truncating overly long results, masking sensitive fields, adding context hints).
+
+These dozens of files together make up OpenClaw's "tool middleware capability ceiling".
+
+Tool events bridge to a separate `tool` stream (`subscribeEmbeddedPiSession`). Any external observer subscribing to this stream sees every tool activity (each tool call is an event + parameters + result).
+
+This is the central entry for audit / debug / monitoring: enterprise deployments can hook an external logger subscribing to this stream to write all tool calls to a database, so retrospection doesn't need to scoop from rollout files.
 
 ### Hermes · Single-source registry + multi-model adapter + skills_guard hard-deny dangerous actions
 
-Hermes' core judgement on the tool system is: long-running agents often need to swap models (one task GPT cheap, one task Claude strong, one task Gemini multimodal). If tool definitions bind to model protocols, every model swap means rewriting tools, an unacceptable cost. So Hermes must decouple tool definitions from model protocols: tool definitions in a unified format, runtime translates to the current model's protocol.
+Hermes' starting point on the tool system is: long-running agents often need to swap models (one task GPT cheap, one task Claude strong, one task Gemini multimodal).
 
-Actual implementation is the registry only writing tool definitions once (using OpenAI function calling style as internal format because it's the most widely community-supported), with three adapter files each handling one protocol. `anthropic_adapter.py` translates OpenAI-style messages to Anthropic's tool_use block format (note tool_use_id correlation, stop_reason handling and other differences); `bedrock_adapter.py` handles AWS Bedrock's Anthropic models (basically same as anthropic_adapter but with Bedrock-specific fields); `gemini_native_adapter.py` handles Gemini's functionDeclarations + functionCall format (note thinking-mode and text content mixing handling). The three adapters make model swap "change one config line" rather than "change all tools".
+If tool definitions bind to model protocols, every model swap means rewriting tools, an unacceptable cost.
 
-The permission layer takes "per-tool permission check + skills_guard double-layer". `skills_guard` is a hard-deny tool: before each dispatch it uses an independent LLM to judge "is this call legitimate / dangerous" (e.g. `rm -rf /` / trying to read `~/.ssh` / trying to execute `curl | bash` and other dangerous paths); on hit it directly intercepts and does not let the tool execute. Permission check inside each tool function (each tool judges itself if approval needed / handles approval itself) is more direct than the middleware approach but worse in extensibility (new tools must rewrite permission logic, can't do global policy).
+So Hermes must decouple tool definitions from model protocols: tool definitions in a unified format, runtime translates to the current model's protocol.
 
-Tools run serial by default (the trajectory model assumes single-line time-axis: a trajectory file records each step's events in order, concurrency would mess up trajectory order). Parallel execution needs explicit subagent spawn; subagents have their own trajectory + tool stack. This design keeps trajectory always "a linear story", easy for debug / replay / training data generation.
+Actual implementation is the registry only writing tool definitions once (using OpenAI function calling style as internal format because it's the most widely community-supported), with three adapter files each handling one protocol. `anthropic_adapter.py` translates OpenAI-style messages to Anthropic's tool_use block format (note tool_use_id correlation, stop_reason handling and other differences); `bedrock_adapter.py` handles AWS Bedrock's Anthropic models (basically same as anthropic_adapter but with Bedrock-specific fields); `gemini_native_adapter.py` handles Gemini's functionDeclarations + functionCall format (note thinking-mode and text content mixing handling).
 
-MCP integrates through runtime config: `~/.hermes/config.json` writes `mcp_servers` field; runtime server bridges each MCP tool into a regular registry tool transparent to the model (the model sees normal tools). This design makes MCP tool extensibility excellent: users installing a new MCP server only need to change config, not Hermes source.
+The three adapters make model swap "change one config line" rather than "change all tools".
 
-## §4 · The four systems' shared understanding of tool systems
+The permission layer takes "per-tool permission check + skills_guard double-layer". `skills_guard` is a hard-deny tool: before each dispatch it uses an independent LLM to judge "is this call legitimate / dangerous" (e.g. `rm -rf /` / trying to read `~/.ssh` / trying to execute `curl | bash` and other dangerous paths); on hit it directly intercepts and does not let the tool execute.
+
+Permission check inside each tool function (each tool judges itself if approval needed / handles approval itself) is more direct than the middleware approach but worse in extensibility (new tools must rewrite permission logic, can't do global policy).
+
+Tools run serial by default (the trajectory model assumes single-line time-axis: a trajectory file records each step's events in order, concurrency would mess up trajectory order).
+
+Parallel execution needs explicit subagent spawn; subagents have their own trajectory + tool stack. This design keeps trajectory always "a linear story", easy for debug / replay / training data generation.
+
+MCP integrates through runtime config: `~/.hermes/config.json` writes `mcp_servers` field; runtime server bridges each MCP tool into a regular registry tool transparent to the model (the model sees normal tools).
+
+This design makes MCP tool extensibility excellent: users installing a new MCP server only need to change config, not Hermes source.
+
+## What tool systems already agree on
 
 The four systems share four obvious common understandings on tool system design. These are engineering bottom lines that all agents should follow:
 
 **First, tool signatures must use JSON schema description (not natural language)**: all four systems use JSON schema to express tool input parameters / return value types. Even Codex's apply_patch DSL keeps a schema slot (parameter = a `diff` string). The reason is simple: model's parsing accuracy on JSON schema is significantly higher than natural language (schema is a structured constraint, model doesn't have to guess parameter type / required); tool call failure rate drops from 10% to under 1%.
 
-**Second, must have explicit permission layer (regardless of implementation)**: all four have specialised permission layers (execpolicy / canUseTool / tool-policy-pipeline / per-tool check), never letting tools execute without any interception. This is the lowest baseline of agent safety: an agent that can `rm -rf /` is a time bomb in production.
+**Second, must have explicit permission layer (regardless of implementation)**: all four have specialised permission layers (execpolicy / canUseTool / tool-policy-pipeline / per-tool check), never letting tools execute without any interception. This is the lowest baseline of agent safety: an agent that can `rm -rf /` is a production incident waiting to happen.
 
 **Third, must support MCP (let the agent connect to external ecosystems)**: all four support MCP, but bridge it differently. Codex with four dedicated crates (mcp-client / mcp-server / mcp-protocol / mcp-types) makes MCP first-class; OpenClaw via plugin mechanism; Claude Code / Hermes treat MCP tools as regular tools transparent to the model. MCP is the tool protocol standard Anthropic started pushing in 2024, with hundreds of MCP servers forming an ecosystem; not supporting MCP means cutting off from the entire ecosystem.
 
 **Fourth, tool calls must have event streams (for auditing / debugging)**: all four make tool calls observable event streams (trajectory / tool stream / event stream). Every tool call is an independent event (which tool, what parameters, what result, what time); external observers subscribe to fully reconstruct agent behaviour. This is a hard requirement for enterprise production environments: issues must be traceable.
 
-## §5 · The four systems' key divergences on tool systems
+## Trade granularity against permission and parallelism
 
 <Diagram
   src="/diagrams/04-tradeoff.svg"
@@ -149,7 +200,7 @@ The four systems represent four typical trade-offs in tool system design:
 
 **If you want multi-model compatibility (same set of tools running OpenAI / Anthropic / Gemini)**: borrow from Hermes' registry + adapter route. One registry definition runs three protocols; skills_guard before dispatch uses LLM to judge dangerous actions (more flexible than hardcoded rules); MCP transparent bridge makes ecosystem extension easy. The cost is default serial not parallel (trajectory model limit); permissions scattered inside each tool function (hard to do global policy changes). Suits long-running assistants / cross-model experiments / research-style agents.
 
-## §6 · The verdict
+## My take: fewer tools, harder edges
 
 <ScoreCard
   rows={[
@@ -162,7 +213,7 @@ The four systems represent four typical trade-offs in tool system design:
   headers={{ system: 'System', value: 'Score', reason: 'Strength', risk: 'Risk' }}
 />
 
-## §7 · Build recipe
+## Build the smallest tool system
 
 Below is the recipe distilled from the four systems for writing your own Tool System. Lay solid foundations first, then add production-grade features, finally avoid four common dead ends.
 
@@ -191,7 +242,7 @@ Below is the recipe distilled from the four systems for writing your own Tool Sy
   ]}
 />
 
-## §8 · Call pipeline
+## Trace one tool call through the stack
 
 <Diagram
   src="/diagrams/04-tool-pipeline.svg"
@@ -199,7 +250,7 @@ Below is the recipe distilled from the four systems for writing your own Tool Sy
   caption="OpenClaw's four hook points. Codex uses static execpolicy rules; Claude Code gives canUseTool one hook; Hermes scatters checks inside tool functions."
 />
 
-## §9 · Source map & further reading
+## Follow the dispatcher through source
 
 <SourceTrail
   title="Source map & further reading"
@@ -219,24 +270,37 @@ Below is the recipe distilled from the four systems for writing your own Tool Sy
   externalLabel="Official docs ↗"
 />
 
-## §10 · Exercises
+## Appendix: exercises and review
+
+<details id="interview-drill">
+<summary>Open the exercises and ten review questions</summary>
+
+### Exercises
 
 1. **🟢 Beginner**: Add a `before_tool_call` hook to your agent. Minimal implementation: print `[tool] {name}({args})`, no mutation, no blocking. After a week, find your top 3 most-called tools.
 2. **🟠 Intermediate**: Build a minimal `apply_patch` DSL. The model emits `*** Begin Patch ...` blocks in plain text. Your code parses and applies them. Compare with function-call JSON: how large a diff can you fit?
 3. **🔴 Challenge**: Implement OpenClaw-style `tool-loop-detection`. Five consecutive calls to the same tool with < 10% argument variance triggers a block, and the message "you're in a loop" gets injected back. Provide a trajectory that reproduces the loop and show at which step your detector blocks it.
 
-## §11 · Interview drill: 10 questions with worked answers
+### Review questions
 
 <details>
 <summary>**Q1 · Concept**: Disambiguate tool / function call / MCP server / skill.</summary>
 
 Tool is the lowest concept: code that "the model triggers, the harness executes, the result returns." Every other term is a concrete shape of tool.
 
-Function call is the protocol layer. OpenAI standardized tool calls as function call schema (`name` + `parameters` JSON schema) in 2023; Anthropic uses `tool_use` blocks, Gemini uses `function_call` proto. Same idea: the model writes `I want to call X(args)` in a structured field. Codex names it function_tool at the protocol layer (a Responses API wrapper).
+Function call is the protocol layer. OpenAI standardized tool calls as function call schema (`name` + `parameters` JSON schema) in 2023; Anthropic uses `tool_use` blocks, Gemini uses `function_call` proto.
 
-MCP server is Anthropic's 2024 Model Context Protocol. One MCP server exposes a group of tools (via stdio / SSE); the harness bridges them into its tool registry. All four support it: Codex uses 4 separate crates (`mcp-client` / `mcp-server` / `mcp-protocol` / `mcp-types`); Claude Code and Hermes feed MCP tools to the model as ordinary tools; OpenClaw goes through plugins. MCP solves "same set of tools for different agents."
+Same idea: the model writes `I want to call X(args)` in a structured field. Codex names it function_tool at the protocol layer (a Responses API wrapper).
 
-Skill (chapter 17 covers it) is Anthropic's higher-level package: a skill = SKILL.md (description) + scripts/ + references/ + assets/, essentially a tool collection with docs and resources. Hermes and Claude Code both implement skills, lazy-loadable.
+MCP server is Anthropic's 2024 Model Context Protocol. One MCP server exposes a group of tools (via stdio / SSE); the harness bridges them into its tool registry.
+
+All four support it: Codex uses 4 separate crates (`mcp-client` / `mcp-server` / `mcp-protocol` / `mcp-types`); Claude Code and Hermes feed MCP tools to the model as ordinary tools; OpenClaw goes through plugins.
+
+MCP solves "same set of tools for different agents."
+
+Skill (chapter 17 covers it) is Anthropic's higher-level package: a skill = SKILL.md (description) + scripts/ + references/ + assets/, essentially a tool collection with docs and resources.
+
+Hermes and Claude Code both implement skills, lazy-loadable.
 
 Relationships: tool is core, function call is the serialization protocol, MCP is the tool distribution protocol, skill is a tool + resource bundle.
 
@@ -282,7 +346,9 @@ Concrete cases:
 
 The reliable approach: **walk the `content` array and count blocks with `type === 'tool_use'`**. Dispatch as many as you found; don't trust `stop_reason`. The Claude Code comment tells you Anthropic itself hit this bug internally.
 
-This "don't trust metadata, recompute from data" pattern shows up everywhere: Codex doesn't trust `finish_reason` and re-parses `content`; Hermes doesn't trust `done` and detects trajectory termination itself. Protocol fields are a fallback; business logic recomputes.
+This "don't trust metadata, recompute from data" pattern shows up everywhere: Codex doesn't trust `finish_reason` and re-parses `content`; Hermes doesn't trust `done` and detects trajectory termination itself.
+
+Protocol fields are a fallback; business logic recomputes.
 
 **Source**: `claude-code/src/query.ts:557` (the comment); additional robustness logic in `dispatchToolUseBlocks`.
 **Follow-up**: "Is OpenAI's `finish_reason` reliable?" Comparatively, but the same advice applies: count `tool_calls` array length yourself. Anthropic has shipped more bugs around this field than OpenAI.
@@ -291,9 +357,13 @@ This "don't trust metadata, recompute from data" pattern shows up everywhere: Co
 <details>
 <summary>**Q4 · Architecture**: Codex's `apply_patch` doesn't go through function call; it has the model emit V4A diff inline in assistant text. Why?</summary>
 
-Core constraint: **function_call arguments have a size cap**. OpenAI Responses API defaults to 32K-128K and truncates beyond it; Anthropic `tool_use` input has a similar cap. A real code patch often runs 5K-30K lines, and JSON-serializing it crosses the limit.
+Core constraint: **function_call arguments have a size cap**. OpenAI Responses API defaults to 32K-128K and truncates beyond it; Anthropic `tool_use` input has a similar cap.
 
-The `apply_patch` DSL puts patches directly in assistant text content (not tool_use args). The model emits `*** Begin Patch ... *** End Patch` blocks, and Codex's `apply-patch` crate parses them. This bypasses the function_call size cap; patch as large as you want.
+A real code patch often runs 5K-30K lines, and JSON-serializing it crosses the limit.
+
+The `apply_patch` DSL puts patches directly in assistant text content (not tool_use args). The model emits `*** Begin Patch ... *** End Patch` blocks, and Codex's `apply-patch` crate parses them.
+
+This bypasses the function_call size cap; patch as large as you want.
 
 Costs:
 
@@ -327,7 +397,9 @@ OpenClaw's `tool-policy-pipeline` is a **full middleware chain**:
 4. **`tool_result_persist`**: write the full record to persistent storage.
 5. **`tool-loop-detection`**: detect consecutive identical calls and inject a "you're looping" signal.
 
-The difference is **composability**. Claude Code's `canUseTool` is a single stop and done; OpenClaw stacks 5 middlewares running in registration order. In enterprise, the middleware chain is non-negotiable (compliance demands audit log + telemetry + rate limit running together, not pick-one).
+The difference is **composability**. Claude Code's `canUseTool` is a single stop and done; OpenClaw stacks 5 middlewares running in registration order.
+
+In enterprise, the middleware chain is non-negotiable (compliance demands audit log + telemetry + rate limit running together, not pick-one).
 
 Cost: debug chains get long; tracing one tool call now spans 5 middlewares. OpenClaw provides full trace in dev mode and trims to essentials in prod.
 
@@ -449,7 +521,7 @@ Common false positives observed:
 Practical: run in read-only mode first (detect but don't inject). After a week of logs, confirm detector behaviour, then enable inject mode. Chapter 19 (self-improvement) covers turning detector output into training data.
 
 **Source**: [`openclaw/src/agents/tool-loop-detection.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/tool-loop-detection.ts); Hermes has `agent/loop_guard.py` with a similar implementation.
-**Follow-up**: "Token-budget would catch loops too, right?" Token budget is the safety net (chapter 02 §3.6), "we'll stop when you've burned everything". The detector catches earlier: "you're drifting, course-correct now."
+**Follow-up**: "Token-budget would catch loops too, right?" A budget limits damage: "we stop when the allowance is gone." The detector catches drift earlier and can still change course.
 </details>
 
 <details>
@@ -521,6 +593,8 @@ Rollout cadence:
 
 Total ~8-12 weeks of one senior full-time. Lighter than copying any one system whole, but you keep the trade-off decisions.
 
-**Source**: synthesized from all 4 systems; paths in §9 SourceTrail.
+**Source**: synthesized from all four systems; paths are in the SourceTrail at the end.
 **Follow-up**: "Why not directly adopt LangChain's Tool?" LangChain Tool is too thick (each tool is a class), bad for fast iteration. An OSS framework should let a tool be a simple dict; users wrap into a class only when needed.
+</details>
+
 </details>

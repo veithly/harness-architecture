@@ -55,8 +55,11 @@ if (mode === 'multi-dim' && systems) {
 }
 
 const dotFor = (n: number) => '●'.repeat(Math.max(0, Math.min(5, n))) + '○'.repeat(5 - Math.max(0, Math.min(5, n)));
-const scoreWidth = (n: number) => `${Math.max(0, Math.min(10, n)) * 10}%`;
+const disclosureLabel = isEnglish ? 'Open the comparison and scoring rationale' : '展开四套系统的比较与评分依据';
 ---
+
+<details class="aap-scorecard-disclosure">
+<summary>{disclosureLabel}</summary>
 
 {mode === 'value-reason-risk' && isValueRows(rows) && (
   <figure class="aap-scorecard aap-scorecard--value-reason-risk">
@@ -113,10 +116,8 @@ const scoreWidth = (n: number) => `${Math.max(0, Math.min(10, n)) * 10}%`;
             <th scope="row">{r.name}</th>
             <td>
               <span class="aap-scorecard__score" aria-label={`${r.score} / 10`}>
-                <span class="aap-scorecard__score-track" aria-hidden="true">
-                  <span class="aap-scorecard__score-fill" style={`width: ${scoreWidth(r.score)}`}></span>
-                </span>
-                <span class="aap-scorecard__score-label">{r.score}/10</span>
+                <strong>{r.score}</strong>
+                <span>/10</span>
               </span>
             </td>
             <td><span class="aap-scorecard__badge">{r.badge}</span></td>
@@ -161,9 +162,27 @@ const scoreWidth = (n: number) => `${Math.max(0, Math.min(10, n)) * 10}%`;
   </figure>
 )}
 
+</details>
+
 <style>
+  .aap-scorecard-disclosure {
+    margin: var(--aap-sp-5) 0 var(--aap-sp-7);
+    border-left: 2px solid var(--aap-color-judgment);
+    padding-left: var(--aap-sp-4);
+  }
+  .aap-scorecard-disclosure > summary {
+    width: fit-content;
+    cursor: pointer;
+    color: var(--aap-color-judgment);
+    font-family: var(--aap-font-mono);
+    font-size: var(--aap-fs-sm);
+    font-weight: 600;
+  }
+  .aap-scorecard-disclosure[open] > summary {
+    margin-bottom: var(--aap-sp-3);
+  }
   .aap-scorecard {
-    margin: var(--aap-sp-6) 0;
+    margin: 0;
     border: 1px solid var(--aap-paper-line);
     border-top: 3px solid var(--aap-color-judgment);
     border-radius: var(--aap-radius-md);
@@ -265,27 +284,18 @@ const scoreWidth = (n: number) => `${Math.max(0, Math.min(10, n)) * 10}%`;
     line-height: 1.65;
   }
   .aap-scorecard__score {
-    display: grid;
-    gap: var(--aap-sp-2);
+    display: inline-flex;
+    gap: 0.2rem;
+    align-items: baseline;
     min-width: 0;
-  }
-  .aap-scorecard__score-track {
-    display: block;
-    height: 0.45rem;
-    border-radius: 999px;
-    background: var(--aap-paper-strong);
-    overflow: hidden;
-  }
-  .aap-scorecard__score-fill {
-    display: block;
-    height: 100%;
-    border-radius: inherit;
-    background: var(--aap-color-judgment);
-  }
-  .aap-scorecard__score-label {
     font-family: var(--aap-font-mono);
     font-size: var(--aap-fs-xs);
     color: var(--aap-ink-soft);
+  }
+  .aap-scorecard__score strong {
+    color: var(--aap-color-judgment);
+    font-size: var(--aap-fs-lg);
+    line-height: 1;
   }
   .aap-scorecard__badge {
     display: inline-block;

@@ -53,24 +53,19 @@ if (isEnglishPage && src.startsWith('/diagrams/') && !src.startsWith('/diagrams/
 <style>
   .aap-diagram {
     margin: var(--aap-sp-8) 0;
-    padding: var(--aap-sp-6) var(--aap-sp-4);
-    /* SVG diagrams are authored on a warm-white canvas. Keep the card
-     * background light-on-dark-mode too so semi-transparent fills and
-     * dark text inside the SVG remain readable. */
-    background: #fbfaf7;
+    padding: var(--aap-sp-4);
+    background: var(--aap-paper-soft);
     border: 1px solid var(--aap-paper-line);
     border-radius: var(--aap-radius-md);
-    box-shadow: var(--aap-shadow-soft);
-    transition: box-shadow 0.2s ease;
-  }
-  .aap-diagram:hover {
-    box-shadow: var(--aap-shadow-card);
+    box-shadow: none;
   }
 
-  /* In dark mode, soften the figure-caption color so it contrasts with the
-   * dark page chrome rather than the light diagram card. */
-  :global(:root[data-theme='dark']) .aap-diagram figcaption {
-    color: var(--aap-ink-muted);
+  /* The SVGs were authored with hard-coded light inks. A full inversion plus
+   * hue rotation produces a real dark canvas while preserving their semantic
+   * blue/green/orange/purple identities. */
+  :global(:root[data-theme='dark']) .aap-diagram img {
+    filter: invert(0.9) hue-rotate(180deg) saturate(0.86) brightness(1.05);
+    opacity: 0.94;
   }
 
   /* breakout for very wide diagrams on large screens */
@@ -117,7 +112,7 @@ if (isEnglishPage && src.startsWith('/diagrams/') && !src.startsWith('/diagrams/
     font-size: var(--aap-fs-xs);
     color: var(--aap-ink-muted);
     font-family: var(--aap-font-body);
-    font-style: italic;
+    font-style: normal;
     letter-spacing: 0.01em;
   }
 </style>

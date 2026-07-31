@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## Session state must outlive the process
 
 <Verdict tldr="Sessions are the agent's memory substrate, and they have to answer four entangled product questions. How does a conversation start: what initial context must be loaded before the user types their first word? How is the state generated during a conversation persisted: message history, file-change records, cost tracker (the running tally of tokens and dollars), todo list, all of it? How is that state fully reconstructed when the user resumes, given you cannot just replay messages because cwd (current working directory), approval mode, git state, and other hidden premises do not appear in the transcript? And when should a session reset automatically, since never resetting leads to unbounded growth but resetting too aggressively costs the user their context? How you answer those four directly determines the agent's UX ceiling: get it right and the user works continuously for days, get it wrong and they spend ten minutes re-explaining every time they come back. The four systems take wildly different routes. Codex takes the «database-style engineering» route: every session is one append-only JSONL file (only appended, never rewritten, so a crash still recovers up to the last complete line). The first line is a `SessionMeta` record capturing cwd, model, `git_sha`, agent identity: all the hidden premises resume must restore. A SQLite state DB sits on top as a thread index so listing thousands of sessions is fast. «Logical conversation» (`ThreadId`, a stable ID that survives across process restarts) and «concrete runtime instance» (`SessionId`, scoped to the current process lifetime) are two separate IDs, so users can resume / fork / archive across time. Claude Code takes the «IDE first-class citizen» route: it accepts that session is a complex system that cannot be simplified, and splits it across 22 files each owning a slice of state (`sessionStorage` for on-disk persistence, `sessionRestore` for restoration, `sessionMemory` for in-process message history, `sessionMemoryCompact` for the post-compaction history, `sessionHooks` for lifecycle hook registration, `sessionTracing`, …). Lifecycle events are explicitly modelled as 4 sources (`startup` fresh launch / `resume` restoring from history / `clear` user-initiated reset / `compact` context-compression triggered), each firing different plugin hooks and user hooks, so a plugin can precisely declare «I run only on startup, not on clear». The most striking engineering discipline is a code comment that literally says «do not add ANY warmup logic»: a rule earned through painful experience that the startup path must do no extra work. OpenClaw takes the «session is an identity, not state» minimalist route: the whole sessions module is 12 files but the core is under 100 lines, doing only UUID regex validation, agent-scope-key (a namespace prefix derived from the agent name) concatenation, and transcript event serialisation. Where the data lives, when it resets, how resume works: all left to the upstream caller. Hermes is built for multi-platform chat: when one user talks to the same agent across Telegram, Slack, and Discord, each platform gets an independent session. `SessionSource` is a dataclass recording where a message came from (`platform`, `chat_id`, `chat_type`, `user_id`); `SessionContext` records which platforms are currently connected and where «home» is (the default channel for unsolicited messages); `SessionResetPolicy` ships 4 reset modes (daily at a fixed hour, idle timeout, either trigger, never). Most distinctively, a `_PII_SAFE_PLATFORMS` allow-list scrubs PII (personally identifiable information: names, emails, phone numbers) before content reaches the LLM, but only on platforms whose mention syntax does not require raw user IDs (Discord and Slack are deliberately excluded because mentions there need real user_ids). Pick by product shape: a long-lived developer-tool agent with deep history maps onto Codex; a multi-subsystem IDE agent that must coordinate cost tracker, todos, and worktree maps onto Claude Code; a framework that lets callers bring their own storage maps onto OpenClaw; and a multi-platform chat agent maps onto Hermes." />
 
-## §2 · Reference architecture
+## Four session shapes
 
-:::tip[Key takeaways · 30-second read]
+<details>
+<summary>Before reading (optional)</summary>
+
 - **Memory substrate, UX ceiling**: how you start, persist, resume, and reset sessions directly determines whether users work continuously for days or re-explain for ten minutes every return.
 - **Four session routes**: Codex appends JSONL rollouts with a `SessionMeta` first line plus a SQLite index, splitting `ThreadId` from `SessionId`; Claude Code spreads state across 22 files with 4 lifecycle events (startup / resume / clear / compact); OpenClaw keeps session as an identity in under 100 core lines; Hermes routes per-platform sessions via `SessionSource` with 4 reset modes.
 - **Resume needs hidden premises**: replaying messages is not enough—cwd, approval mode, and git state never appear in the transcript and must be captured up front, as Codex's `SessionMeta` does.
 - **Keep startup empty**: Claude Code's comment says "do not add ANY warmup logic"—extra work on the startup path is the trap earned through painful experience.
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/11-session-lifecycle-base.svg"
@@ -47,15 +50,33 @@ How the four systems cover the five session-critical concerns:
   dimensionLabel="Dimension"
 />
 
-## §3 · How each system does it
+## How four systems manage sessions
 
 ### Codex · Treat session as a database engineering problem: JSONL persistence + SQLite index + Thread/Session ID separation
 
-The core judgement Codex makes about sessions is this: a session is the most important state container in an agent, so it should be engineered to database standards rather than treated as casual application state. That judgement produces three interlocking design decisions.
+The starting point Codex makes about sessions is this: a session is the most important state container in an agent, so it should be engineered to database standards rather than treated as casual application state.
 
-The first decision is JSONL append-only files rather than a single JSON file. The reason traces back to the realities of an agent process: it can be killed by the IDE, OOM-killed, Ctrl-C'd by the user, or wiped out by an OS restart, and the crash can land at any byte position during a write. If you used a single JSON file, a crash mid-write corrupts the whole file beyond parsing; the next startup's resume fails completely and the whole session is lost. JSONL changes the failure mode: each line parses independently, so if a crash lands mid-write on line N, only line N is lost. Lines 1 through N-1 remain fully recoverable. Crash recovery goes from "all or nothing" to "lose at most one line". A second benefit is write performance: a long session might have hundreds of turns; with a single JSON file every turn has to fully reserialize the multi-MB content and atomic-write it, and IO pressure grows linearly with turn count. JSONL only appends one line (a few KB), one write syscall, and Codex measures < 5ms per turn write cost on a several-hundred-turn session. A third benefit is streaming consumption: Codex's TUI wants to display "what the agent is doing right now" in real time; JSONL can be `tail -f`'d, every new line is an event; a single JSON file cannot support this at all.
+That judgement produces three interlocking design decisions.
 
-The second decision is the filename pattern: `rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl`. The prefix is an ISO timestamp so listing the directory is already time-sorted; the suffix is a UUID to prevent collisions when multiple sessions are created in the same second; the hyphen separators let humans visually parse the timestamp. This kind of "encode all routing info in the filename" design lets session management tools work without a database. Finding the most recent session is just listing files in reverse order, finding a specific time window is just a prefix match, and archiving old sessions is moving files to an `archived_sessions/` subdirectory.
+The first decision is JSONL append-only files rather than a single JSON file. The reason traces back to the realities of an agent process: it can be killed by the IDE, OOM-killed, Ctrl-C'd by the user, or wiped out by an OS restart, and the crash can land at any byte position during a write.
+
+If you used a single JSON file, a crash mid-write corrupts the whole file beyond parsing; the next startup's resume fails completely and the whole session is lost.
+
+JSONL changes the failure mode: each line parses independently, so if a crash lands mid-write on line N, only line N is lost. Lines 1 through N-1 remain fully recoverable.
+
+Crash recovery goes from "all or nothing" to "lose at most one line". A second benefit is write performance: a long session might have hundreds of turns; with a single JSON file every turn has to fully reserialize the multi-MB content and atomic-write it, and IO pressure grows linearly with turn count.
+
+JSONL only appends one line (a few KB), one write syscall, and Codex measures < 5ms per turn write cost on a several-hundred-turn session.
+
+A third benefit is streaming consumption: Codex's TUI wants to display "what the agent is doing right now" in real time; JSONL can be `tail -f`'d, every new line is an event; a single JSON file cannot support this at all.
+
+The second decision is the filename pattern: `rollout-2025-05-07T17-24-21-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl`.
+
+The prefix is an ISO timestamp so listing the directory is already time-sorted; the suffix is a UUID to prevent collisions when multiple sessions are created in the same second; the hyphen separators let humans visually parse the timestamp.
+
+This kind of "encode all routing info in the filename" design lets session management tools work without a database.
+
+Finding the most recent session is just listing files in reverse order, finding a specific time window is just a prefix match, and archiving old sessions is moving files to an `archived_sessions/` subdirectory.
 
 The third decision is that the first line of every session must be a SessionMeta:
 
@@ -126,11 +147,29 @@ pub(crate) fn builder_from_session_meta(
 
 </SourceBlock>
 
-Why does resume need so much metadata? Because replaying the message history alone is not enough. When the model sees a message like "please rewrite the bar function in foo.py to be async", it needs to know what the cwd was at the time (otherwise it cannot find foo.py), which model was running (different models behave differently and mixing them mid-conversation makes the dialogue incoherent), what the approval mode was (was it `--accept-edits` before but resume turned it back to `interactive`, getting stuck on every edit?), what the git commit was (the agent reasoned based on some specific commit, and if resume happens on a different branch the recommendations will be wrong). If these hidden premises are not restored, the agent will appear to "have a different personality" and the user will conclude the resume feature is useless.
+Why does resume need so much metadata? Because replaying the message history alone is not enough.
 
-The fourth engineering decision is to pre-solve the performance problem of session count growth. When sessions accumulate to hundreds or thousands, every startup that lists the directory and parses every JSONL's first line to extract SessionMeta gets slow (IO cost + JSON parse cost). On top of JSONL, Codex maintains a SQLite `state.db` for thread indexing: each thread's metadata (cwd / model / created_at / last_message_at / archived flag) goes into a table, listing threads becomes a SQL query with millisecond response, and JSONL files remain the source of truth (if SQLite is corrupted you can rebuild from JSONL) but day-to-day queries go through SQLite. Startup does not scan all files; only when a thread_id is missing from SQLite does it backfill once. This "files as durable layer + database as index layer" two-tier design is the standard pattern for database systems.
+When the model sees a message like "please rewrite the bar function in foo.py to be async", it needs to know what the cwd was at the time (otherwise it cannot find foo.py), which model was running (different models behave differently and mixing them mid-conversation makes the dialogue incoherent), what the approval mode was (was it `--accept-edits` before but resume turned it back to `interactive`, getting stuck on every edit?), what the git commit was (the agent reasoned based on some specific commit, and if resume happens on a different branch the recommendations will be wrong).
 
-The fifth engineering decision is splitting "logical conversation" and "concrete runtime instance" into two independent IDs. ThreadId is the logical conversation unit: when a user says "that refactoring conversation I had", they mean a thread; a thread can span multiple process launches, can be forked (start a new branch based on existing history), and can be archived (moved into `archived_sessions/`). SessionId is one concrete runtime instance: every time the process starts, that is one session, scoped to the process lifetime, and the user does not care about nor see the specific session_id. A thread might span multiple sessions (each resume creates a new session inheriting the same thread_id). This separation lets the user view (persistent thread) and the system view (transient session) evolve independently, avoiding confusion.
+If these hidden premises are not restored, the agent will appear to "have a different personality" and the user will conclude the resume feature is useless.
+
+The fourth engineering decision is to pre-solve the performance problem of session count growth.
+
+When sessions accumulate to hundreds or thousands, every startup that lists the directory and parses every JSONL's first line to extract SessionMeta gets slow (IO cost + JSON parse cost).
+
+On top of JSONL, Codex maintains a SQLite `state.db` for thread indexing: each thread's metadata (cwd / model / created_at / last_message_at / archived flag) goes into a table, listing threads becomes a SQL query with millisecond response, and JSONL files remain the source of truth (if SQLite is corrupted you can rebuild from JSONL) but day-to-day queries go through SQLite.
+
+Startup does not scan all files; only when a thread_id is missing from SQLite does it backfill once. This "files as durable layer + database as index layer" two-tier design is the standard pattern for database systems.
+
+The fifth engineering decision is splitting "logical conversation" and "concrete runtime instance" into two independent IDs.
+
+ThreadId is the logical conversation unit: when a user says "that refactoring conversation I had", they mean a thread; a thread can span multiple process launches, can be forked (start a new branch based on existing history), and can be archived (moved into `archived_sessions/`).
+
+SessionId is one concrete runtime instance: every time the process starts, that is one session, scoped to the process lifetime, and the user does not care about nor see the specific session_id.
+
+A thread might span multiple sessions (each resume creates a new session inheriting the same thread_id).
+
+This separation lets the user view (persistent thread) and the system view (transient session) evolve independently, avoiding confusion.
 
 The Session in memory is a locked state machine:
 
@@ -164,13 +203,25 @@ pub(crate) struct Session {
 
 </SourceBlock>
 
-The comment "A session has at most 1 running task at a time, and can be interrupted by user input" is the core invariant: one session can only run one turn at a time, user input can interrupt the current turn, but two turns cannot run concurrently. This invariant prevents race conditions. If two turns simultaneously wrote to message history, called tools, and modified files, the state would be a mess. The trade-off is that a single session cannot serve concurrent user requests in parallel. Codex compensates with a more aggressive strategy: if the user wants parallelism, they open a new thread (fork the current thread), and the new thread is an independent session running an independent turn with no interference.
+The comment "A session has at most 1 running task at a time, and can be interrupted by user input" is the core invariant: one session can only run one turn at a time, user input can interrupt the current turn, but two turns cannot run concurrently.
+
+This invariant prevents race conditions. If two turns simultaneously wrote to message history, called tools, and modified files, the state would be a mess.
+
+The trade-off is that a single session cannot serve concurrent user requests in parallel.
+
+Codex compensates with a more aggressive strategy: if the user wants parallelism, they open a new thread (fork the current thread), and the new thread is an independent session running an independent turn with no interference.
 
 ### Claude Code · Split session into 22 subsystems + 4 lifecycle events firing hooks
 
-Claude Code does more on session than Codex, but with completely different reasoning. The core judgement: session is not one thing but a collection of mutually independent subsystems (message history is one subsystem, the cost tracker another, attribution another, todo list another, worktree state another, file history another…), each with its own storage format, lifecycle, and restore logic. So Claude Code splits session across 22 files, each with `session` in its name: sessionStart manages startup, sessionRestore manages restoration, sessionStorage manages persistence, sessionState manages runtime state, sessionMemory manages the in-memory message buffer, sessionMemoryCompact manages context compression, sessionRunner manages turn execution, sessionIngress manages entry points (IDE / CLI), sessionEnvVars manages env vars, sessionEnvironment manages runtime environment, sessionActivity manages activity detection (idle judgement), sessionHistory manages historical logs, sessionFileAccessHooks manages file access hooks, sessionHooks manages lifecycle hook registration, sessionTracing manages OTEL tracing, sessionUrl manages IDE jump URLs, sessionTitle manages display titles, sessionIngressAuth manages ingress auth, sessionIdCompat manages legacy ID compat, sessionStoragePortable manages cross-device storage, SessionsWebSocket manages IDE WebSocket.
+Claude Code does more on session than Codex, but with completely different reasoning.
 
-The benefit of this split is that each subsystem can evolve independently. Adding a new feature (e.g. "record which skills the user used") only requires adding a sessionSkillUsage subsystem without touching the others. The flip side is that resume becomes complex: you have to restore 22 subsystems' worth of state in the right order, and getting one wrong makes the agent misbehave.
+The starting point: session is not one thing but a collection of mutually independent subsystems (message history is one subsystem, the cost tracker another, attribution another, todo list another, worktree state another, file history another…), each with its own storage format, lifecycle, and restore logic.
+
+So Claude Code splits session across 22 files, each with `session` in its name: sessionStart manages startup, sessionRestore manages restoration, sessionStorage manages persistence, sessionState manages runtime state, sessionMemory manages the in-memory message buffer, sessionMemoryCompact manages context compression, sessionRunner manages turn execution, sessionIngress manages entry points (IDE / CLI), sessionEnvVars manages env vars, sessionEnvironment manages runtime environment, sessionActivity manages activity detection (idle judgement), sessionHistory manages historical logs, sessionFileAccessHooks manages file access hooks, sessionHooks manages lifecycle hook registration, sessionTracing manages OTEL tracing, sessionUrl manages IDE jump URLs, sessionTitle manages display titles, sessionIngressAuth manages ingress auth, sessionIdCompat manages legacy ID compat, sessionStoragePortable manages cross-device storage, SessionsWebSocket manages IDE WebSocket.
+
+The benefit of this split is that each subsystem can evolve independently. Adding a new feature (e.g. "record which skills the user used") only requires adding a sessionSkillUsage subsystem without touching the others.
+
+The flip side is that resume becomes complex: you have to restore 22 subsystems' worth of state in the right order, and getting one wrong makes the agent misbehave.
 
 The central abstraction collapses all session lifecycle events into 4 sources, each source firing a set of plugin hooks + user hooks:
 
@@ -213,9 +264,23 @@ export async function processSessionStartHooks(
 
 These 4 sources express 4 completely different scenarios. `startup` is "brand-new conversation": the user types `claude` for the first time, with no history; what hooks should do is load the CLAUDE.md project description, set the working directory, initialise the cost tracker, and inject certain system prompt sections per plugin config; what they should not do is pull from archive (there isn't any) or restore worktree state (the user did not ask for worktree). `resume` is "continue from historical session": the user types `claude --resume` and picks a past conversation; what hooks should do is restore cost state, attribution snapshot, file history, todos, model override, and worktree state; what they should not do is reset the cost tracker (resume means continue, not start from zero) or reload CLAUDE.md (already in history). `clear` is "user-issued /clear": during a conversation the user wants to reset context while preserving session metadata; what hooks should do is clear message history, preserve the cost tracker (billing should not reset), and preserve the model override (user preference is stable); what they should not do is delete the session file (the user might resume later). `compact` is "context exceeded threshold, triggering compression": the system judges context tokens > limit and fires the compact subagent; what hooks should do is snapshot critical info (to avoid losing it post-compression) and pause cost tracker writes (compact's own LLM-call billing must be separated); what they should not do is clear message history (compact is "condense" not "discard").
 
-Merging these 4 sources is tempting: startup and resume are both "begin a session", clear and compact are both "mid-session events", so on the surface merging into 2 looks cleaner. But each source has its own do/don't list, and merging them forces hooks to write if-else branches inside themselves to detect the current case, which is actually more verbose than keeping them separate. Claude Code's experience shows 4 is the "minimum sufficient" granularity, since each source has clean do/don't lists making hook authoring more precise.
+Merging these 4 sources is tempting: startup and resume are both "begin a session", clear and compact are both "mid-session events", so on the surface merging into 2 looks cleaner.
 
-There is one line in the code comments that is critical engineering doctrine and deserves to be highlighted: **"do not add ANY 'warmup' logic. It is CRITICAL that you do not add extra work on startup."** This rule comes from painful repeated experience. Before Claude Code 2.0, there were these warmups: scanning ~/.claude on startup to prepare a quick-resume list (3 seconds), loading all plugins on startup to avoid lazy-load latency later (5 seconds), running git status on startup to prefill context (1-3 seconds), fetching the latest version on startup for update checks (2 seconds). Each one individually is reasonable (every PR adds 1-3 seconds, no reviewer would object), but a year later startup went from 2 seconds to 11 seconds. CLI tools above 200ms feel "laggy" to humans, and 11 seconds completely breaks the "responsive tool" product positioning. After enough pain, the team wrote this rule into the code comments so every new PR has to justify "why this work cannot be lazy".
+But each source has its own do/don't list, and merging them forces hooks to write if-else branches inside themselves to detect the current case, which is actually more verbose than keeping them separate.
+
+Claude Code's experience shows 4 is the "minimum sufficient" granularity, since each source has clean do/don't lists making hook authoring more precise.
+
+There is one line in the code comments that is critical engineering doctrine and deserves to be highlighted: **"do not add ANY 'warmup' logic.
+
+It is CRITICAL that you do not add extra work on startup."** This rule comes from painful repeated experience.
+
+Before Claude Code 2.0, there were these warmups: scanning ~/.claude on startup to prepare a quick-resume list (3 seconds), loading all plugins on startup to avoid lazy-load latency later (5 seconds), running git status on startup to prefill context (1-3 seconds), fetching the latest version on startup for update checks (2 seconds).
+
+Each one individually is reasonable (every PR adds 1-3 seconds, no reviewer would object), but a year later startup went from 2 seconds to 11 seconds.
+
+CLI tools above 200ms feel "laggy" to humans, and 11 seconds completely breaks the "responsive tool" product positioning.
+
+After enough pain, the team wrote this rule into the code comments so every new PR has to justify "why this work cannot be lazy".
 
 Resume is not "reload the JSONL": it has to restore 7 categories of state in order:
 
@@ -265,7 +330,11 @@ import { getCwd } from './cwd.js'
 
 </SourceBlock>
 
-Every import corresponds to a state category that must be restored: cost-tracker is how much money has been spent, commitAttribution tracks which changes the user wrote vs the agent wrote, AgentTool/agentColorManager handles subagent colour coding, TodoWriteTool tracks the todo list, AppState manages app-level UI state, claudemd cache clearing, worktree-related types handle git worktree session state. Missing any one of these makes the agent inconsistent on that dimension: cost not restored gives the user the illusion of "billing reset to zero", attribution not restored loses the "Co-authored-by Claude" on git commits, todos not restored loses the user's outstanding todo items from last time, worktree state not restored means the agent doesn't know which worktree to operate in. This "resume complexity" is the price of an IDE-grade session. State is deliberately distributed across subsystems so each evolves independently, and resume has to orchestrate across them.
+Every import corresponds to a state category that must be restored: cost-tracker is how much money has been spent, commitAttribution tracks which changes the user wrote vs the agent wrote, AgentTool/agentColorManager handles subagent colour coding, TodoWriteTool tracks the todo list, AppState manages app-level UI state, claudemd cache clearing, worktree-related types handle git worktree session state.
+
+Missing any one of these makes the agent inconsistent on that dimension: cost not restored gives the user the illusion of "billing reset to zero", attribution not restored loses the "Co-authored-by Claude" on git commits, todos not restored loses the user's outstanding todo items from last time, worktree state not restored means the agent doesn't know which worktree to operate in.
+
+This "resume complexity" is the price of an IDE-grade session. State is deliberately distributed across subsystems so each evolves independently, and resume has to orchestrate across them.
 
 ### OpenClaw · Reduce session to a pure identity concept: only validate the ID, leave storage to upstream
 
@@ -283,15 +352,31 @@ export function looksLikeSessionId(value: string): boolean {
 
 </SourceBlock>
 
-Just that regex and a helper function. The rest of the session module is at the same "small utilities" level: `session-key-utils.ts` prepends agent scope to the session key (`{agentId}:{sessionId}` format, so the same session can be distinguished from different agent perspectives), `session-label.ts` generates human-readable labels (for UI), `transcript-events.ts` handles transcript event serialization, `model-overrides.ts` and `level-overrides.ts` provide per-session config overrides, `send-policy.ts` manages outbound message policy. The whole module has no rollout files, no SQLite index, no lifecycle hooks, and does not even specify where the session should be stored.
+Just that regex and a helper function. The rest of the session module is at the same "small utilities" level: `session-key-utils.ts` prepends agent scope to the session key (`{agentId}:{sessionId}` format, so the same session can be distinguished from different agent perspectives), `session-label.ts` generates human-readable labels (for UI), `transcript-events.ts` handles transcript event serialization, `model-overrides.ts` and `level-overrides.ts` provide per-session config overrides, `send-policy.ts` manages outbound message policy.
 
-This minimalism looks "incomplete", but it is actually a consequence of OpenClaw's positioning. OpenClaw is a framework (agent platform), not a product (agent product): its users are developers writing agents, not end users using agents. These two audiences want completely different things from session. End users need product features like "list past 7 days of conversations", "resume any session", "auto-archive old sessions"; developers each have their own storage stack. Someone writing a Slack bot wants to store session in a Slack thread, someone writing an IDE plugin wants to store it in IDE workspace state, someone writing SaaS wants to store it in PostgreSQL / Redis, someone writing a CLI tool wants local JSONL. If OpenClaw mandated one storage approach at the framework layer, all these scenarios would be cut off. So OpenClaw validates only ID format compliance, provides only the session_key namespace utility, provides only the transcript event serialization format, and leaves "where it lives, when it resets, how it resumes" entirely to the upstream caller.
+The whole module has no rollout files, no SQLite index, no lifecycle hooks, and does not even specify where the session should be stored.
 
-This is a "define contract, not implementation" framework design philosophy, analogous to how a database's query layer should not decide where data lives (SQLite / PostgreSQL / MySQL backends are interchangeable, but the query layer is unified). The cost is poorer out-of-box experience (demoing a complete agent requires choosing a session backend first) and possible ecosystem fragmentation (different plugins might store to different places); the benefit is OpenClaw can adapt to any deployment shape without changing framework code.
+This minimalism looks "incomplete", but it is actually a consequence of OpenClaw's positioning. OpenClaw is a framework (agent platform), not a product (agent product): its users are developers writing agents, not end users using agents.
+
+These two audiences want completely different things from session. End users need product features like "list past 7 days of conversations", "resume any session", "auto-archive old sessions"; developers each have their own storage stack.
+
+Someone writing a Slack bot wants to store session in a Slack thread, someone writing an IDE plugin wants to store it in IDE workspace state, someone writing SaaS wants to store it in PostgreSQL / Redis, someone writing a CLI tool wants local JSONL.
+
+If OpenClaw mandated one storage approach at the framework layer, all these scenarios would be cut off.
+
+So OpenClaw validates only ID format compliance, provides only the session_key namespace utility, provides only the transcript event serialization format, and leaves "where it lives, when it resets, how it resumes" entirely to the upstream caller.
+
+This is a "define contract, not implementation" framework design philosophy, analogous to how a database's query layer should not decide where data lives (SQLite / PostgreSQL / MySQL backends are interchangeable, but the query layer is unified).
+
+The cost is poorer out-of-box experience (demoing a complete agent requires choosing a session backend first) and possible ecosystem fragmentation (different plugins might store to different places); the benefit is OpenClaw can adapt to any deployment shape without changing framework code.
 
 ### Hermes · Designed for multi-platform chat: SessionSource records where messages come from + 4 reset modes
 
-Hermes's session design differs from all three because its reality is the most complex: one Hermes agent simultaneously serves 6+ messaging platforms (Telegram, Slack, Discord, WhatsApp, Signal, BlueBubbles) plus CLI and Webhook, and the same user might tell the agent one thing in a Telegram DM, another in a Slack workspace, and a third in a Discord channel. From the user's perspective these are "different sub-threads with the same agent", but at the system level they must be completely independent sessions. The contents of a Telegram DM must not bleed into a Slack workspace (privacy / compliance), and a Discord public channel's content must not pollute a Telegram DM (context confusion).
+Hermes's session design differs from all three because its reality is the most complex: one Hermes agent simultaneously serves 6+ messaging platforms (Telegram, Slack, Discord, WhatsApp, Signal, BlueBubbles) plus CLI and Webhook, and the same user might tell the agent one thing in a Telegram DM, another in a Slack workspace, and a third in a Discord channel.
+
+From the user's perspective these are "different sub-threads with the same agent", but at the system level they must be completely independent sessions.
+
+The contents of a Telegram DM must not bleed into a Slack workspace (privacy / compliance), and a Discord public channel's content must not pollute a Telegram DM (context confusion).
 
 So Hermes's session design has two core abstractions. The first is SessionSource, which records "where each message came from":
 
@@ -330,7 +415,11 @@ class SessionSource:
 
 </SourceBlock>
 
-This dataclass has to answer three questions: which routing path does a reply take (platform + chat_id determine where replies go), what context should be injected into the system prompt (so the agent knows "you are in a Slack workspace right now, be more professional; you are in a Telegram DM right now, be more casual"), and where should cron task output be delivered (if a user asks "remind me to attend a meeting at 8am tomorrow", the agent has to proactively send to the right platform and chat the next morning). Note that `chat_type` covers 4 chat shapes: dm (direct message), group (regular group), channel (public channel), thread (threaded conversation), and the agent's behaviour should differ per type: DM allows uninhibited dialogue, group requires restraint to avoid spamming, channel demands more formality. There are also Signal-specific `user_id_alt` and `chat_id_alt` fields. Signal's protocol uses phone numbers in groups but sometimes UUIDs too, and both must be stored to route correctly.
+This dataclass has to answer three questions: which routing path does a reply take (platform + chat_id determine where replies go), what context should be injected into the system prompt (so the agent knows "you are in a Slack workspace right now, be more professional; you are in a Telegram DM right now, be more casual"), and where should cron task output be delivered (if a user asks "remind me to attend a meeting at 8am tomorrow", the agent has to proactively send to the right platform and chat the next morning).
+
+Note that `chat_type` covers 4 chat shapes: dm (direct message), group (regular group), channel (public channel), thread (threaded conversation), and the agent's behaviour should differ per type: DM allows uninhibited dialogue, group requires restraint to avoid spamming, channel demands more formality.
+
+There are also Signal-specific `user_id_alt` and `chat_id_alt` fields. Signal's protocol uses phone numbers in groups but sometimes UUIDs too, and both must be stored to route correctly.
 
 The second core abstraction is the 4 reset modes provided by SessionResetPolicy:
 
@@ -357,7 +446,17 @@ class SessionResetPolicy:
 
 </SourceBlock>
 
-These 4 modes correspond to 4 real user populations. `daily` is "reset at a fixed time every day". Typical users are personal-assistant users with regular schedules: they use the agent for a stretch in the morning, do not use it at night, and the default 4am at_hour auto-resets to start the next day fresh. The benefit is a clean session every day with no garbage context accumulation; the cost is that night-owl users might suddenly lose memory at 4am. `idle` is "reset after idle timeout", and its typical users are in project-collaboration settings: discussing a project with the agent in a Slack workspace, replying once every few days, but keeping context as long as activity continues. The benefit is "active-engagement" granularity, where context persists across consecutive discussion of the same project; the cost is that crossing the idle threshold forces a reset that may annoy the user. `both` is "either trigger resets", and it is Hermes's default, combining daily-cleanup stability with workday continuity, fitting most scenarios. `none` means "never auto-reset". Its typical users are people maintaining long-term projects (novel writing, knowledge-base curation), where context persists forever and the agent truly "remembers" what the user has been doing. The cost is unbounded context growth, so it must rely on the compact mechanism as a safety net.
+These 4 modes correspond to 4 real user populations. `daily` is "reset at a fixed time every day".
+
+Typical users are personal-assistant users with regular schedules: they use the agent for a stretch in the morning, do not use it at night, and the default 4am at_hour auto-resets to start the next day fresh.
+
+The benefit is a clean session every day with no garbage context accumulation; the cost is that night-owl users might suddenly lose memory at 4am. `idle` is "reset after idle timeout", and its typical users are in project-collaboration settings: discussing a project with the agent in a Slack workspace, replying once every few days, but keeping context as long as activity continues.
+
+The benefit is "active-engagement" granularity, where context persists across consecutive discussion of the same project; the cost is that crossing the idle threshold forces a reset that may annoy the user. `both` is "either trigger resets", and it is Hermes's default, combining daily-cleanup stability with workday continuity, fitting most scenarios. `none` means "never auto-reset".
+
+Its typical users are people maintaining long-term projects (novel writing, knowledge-base curation), where context persists forever and the agent truly "remembers" what the user has been doing.
+
+The cost is unbounded context growth, so it must rely on the compact mechanism as a safety net.
 
 The `notify_exclude_platforms` field is a very practical detail. On reset, the user is notified by default ("the agent has reset its context") so they understand why the agent suddenly forgot earlier work; but for api_server and webhook (program callers), the notification is meaningless noise, so those two platforms are excluded by default.
 
@@ -400,11 +499,19 @@ def build_session_context_prompt(
 
 </SourceBlock>
 
-The comment makes "why Discord can't redact" very clear. Discord's mention syntax is `<@user_id>` (must use numeric ID), Slack's mention syntax is `<@U12345678>` (must use Slack member ID); if these platforms had user_id replaced with a hash before sending to the LLM, the LLM would not be able to generate correct mentions in its response, and the agent-to-user product signal of "I am talking to you" would be lost. WhatsApp, Signal, Telegram, BlueBubbles use natural-language mentions (@username / phone number) that do not depend on internal IDs, so they are safe to redact. This is a concrete conclusion landed after product and security needs tug at each other, not abstract design. Putting "why this way" directly in the code comments is a level of engineering transparency worth learning.
+The comment makes "why Discord can't redact" very clear. Discord's mention syntax is `<@user_id>` (must use numeric ID), Slack's mention syntax is `<@U12345678>` (must use Slack member ID); if these platforms had user_id replaced with a hash before sending to the LLM, the LLM would not be able to generate correct mentions in its response, and the agent-to-user product signal of "I am talking to you" would be lost.
 
-The design at the heart of the whole PII system is "routing path separated from LLM path": SessionSource always retains the raw user_id and chat_id for routing (Hermes's system layer knows the real IDs so it can route replies to the right place), but the prompt sent to the LLM has those IDs replaced with deterministic hashes (hash_user_001 / hash_chat_001). When the LLM generates a reply referencing hash_user_001, before Hermes routes that reply out it maps the hash back to the real user_id and then sends. This "LLM doesn't know real IDs but the system does" design is extremely useful in enterprise deployments.
+WhatsApp, Signal, Telegram, BlueBubbles use natural-language mentions (@username / phone number) that do not depend on internal IDs, so they are safe to redact.
 
-## §4 · What the four systems agree on at the session layer
+This is a concrete conclusion landed after product and security needs tug at each other, not abstract design. Putting "why this way" directly in the code comments is a level of engineering transparency worth learning.
+
+The design at the heart of the whole PII system is "routing path separated from LLM path": SessionSource always retains the raw user_id and chat_id for routing (Hermes's system layer knows the real IDs so it can route replies to the right place), but the prompt sent to the LLM has those IDs replaced with deterministic hashes (hash_user_001 / hash_chat_001).
+
+When the LLM generates a reply referencing hash_user_001, before Hermes routes that reply out it maps the hash back to the real user_id and then sends.
+
+This "LLM doesn't know real IDs but the system does" design is extremely useful in enterprise deployments.
+
+## What session systems already agree on
 
 Despite wildly different implementation depth, three things are unavoidable engineering consensus, and each system acknowledges them in its own way.
 
@@ -414,7 +521,7 @@ Despite wildly different implementation depth, three things are unavoidable engi
 
 **The third is that resume cannot just replay messages: hidden state must also be restored.** This is where resume looks simple but is easy to get wrong. The most common pitfall: developers implement resume thinking "just load the messages list and feed it to the model", and find the agent resumes "like a different person", because the model reading the conversation history can see "the user asked me to modify foo.py" but doesn't know what the cwd was at the time (so it cannot find foo.py, errors out), doesn't know what approval mode was on (so it gets stuck on every edit waiting for approval, when it was originally auto-accept), doesn't know the git state (so it reasons based on the wrong commit). So all four systems mandatorily store these "hidden premises" in session metadata: Codex's SessionMeta first line records cwd/model/git_sha/agent_role/cli_version/sandbox_policy/approval_mode, Claude Code's sessionRestore restores state across 7 subsystems, OpenClaw lets the upstream caller decide but provides the transcript_events serialization framework, Hermes rebuilds SessionContext.
 
-## §5 · Where the four diverge most sharply on sessions
+## Separate identity, storage, and lifecycle
 
 <Diagram
   src="/diagrams/11-tradeoff.svg"
@@ -432,7 +539,7 @@ The agreements establish the floor, but the divergences on "how deep should sess
 
 **If you want a multi-platform chat agent simultaneously serving Telegram, Slack, Discord, then Hermes's SessionSource + 4 reset modes + PII safe-platform list is the right choice.** The core need is "precisely model where messages come from, customise reset policy per platform and scenario, distinguish whether redaction is possible by platform capability", and Hermes's design hits each: SessionSource encodes the 4 chat_type variants of message origin, SessionResetPolicy provides 4 reset modes overridable per platform, _PII_SAFE_PLATFORMS precisely divides by mention syntax. The burden shifts to owning compatibility for 6+ platforms and drawing a clean boundary between reset policy and compact. A multi-platform chat agent simply cannot dodge that complexity.
 
-## §6 · My takeaway
+## My take: define recovery semantics first
 
 <ScoreCard
   rows={[
@@ -445,7 +552,7 @@ The agreements establish the floor, but the divergences on "how deep should sess
   headers={['System', 'Score', 'Strengths', 'Risks']}
 />
 
-## §7 · Build recipe
+## Build the smallest session lifecycle
 
 Below is the recipe distilled from the four systems for writing your own session system. Lay solid foundations first, then add production-grade features, finally avoid five common dead ends.
 
@@ -477,7 +584,7 @@ Below is the recipe distilled from the four systems for writing your own session
   ]}
 />
 
-## §8 · Four session flows side by side
+## Four session flows side by side
 
 <Diagram
   src="/diagrams/11-session-flows.svg"
@@ -487,7 +594,7 @@ Below is the recipe distilled from the four systems for writing your own session
 
 Lined up, the engineering-direction spread is one glance: file-level persistence (Codex) -> subsystem decomposition (Claude Code) -> minimal ID (OpenClaw) -> multi-platform routing (Hermes).
 
-## §9 · Further reading / source entry points
+## Follow session entry points through source
 
 <SourceTrail
   title="Further reading / source entry points"
@@ -509,14 +616,19 @@ Lined up, the engineering-direction spread is one glance: file-level persistence
   ]}
 />
 
-## §10 · Exercises
+## Appendix: exercises and review
+
+<details id="interview-drill">
+<summary>Open the exercises and ten review questions</summary>
+
+### Exercises
 
 1. **Easy**: define a SessionMeta record capturing session-startup metadata: cwd, model, git_sha, agent_role, timestamp. Write it as the first JSONL line when the session opens.
 2. **Medium**: add a SQLite index. When session count exceeds 100, directory scanning becomes the bottleneck. Build a sqlite table storing thread_id / cwd / timestamp / last_message_at, and backfill on demand at startup.
 3. **Medium**: implement `processSessionLifecycle(source)` where source is in `{startup, resume, clear, compact}`. Each source calls a different hook set. Verify: `clear` resets the cost tracker, `resume` does not.
 4. **Hard**: implement SessionResetPolicy with all four modes (daily / idle / both / none). `idle_minutes` compares against `last_message_at`; `daily` checks whether local time has crossed `at_hour`. On reset, fire a notification (excluding api_server / webhook).
 
-## §11 · Interview drill: 10 questions with worked answers
+### Review questions
 
 <details>
 <summary>**Q1 · Concept**: Why does Codex use JSONL append-only instead of a single JSON file for sessions?</summary>
@@ -1088,7 +1200,9 @@ sessionRestore({
 })
 ```
 
-The easiest to miss is **system_prompt sections**. Claude Code builds the system prompt from several sections (CLAUDE.md + plugin injections + tool descriptions + user overrides). Restoring only part of it means the agent does not know about certain tools or project conventions.
+The easiest to miss is **system_prompt sections**. Claude Code builds the system prompt from several sections (CLAUDE.md + plugin injections + tool descriptions + user overrides).
+
+Restoring only part of it means the agent does not know about certain tools or project conventions.
 
 **Layer 4 · Context-window management**
 
@@ -1377,4 +1491,6 @@ sm.lifecycle.register({
 **Follow-up**: "How to add cross-device sync?" Layer 9: cloud sync. Swap RolloutRecorder to cloud storage (S3 / GCS / Azure), swap index to cloud DB. Big architectural change; design cloud-first from the start.
 
 **Source composition**: Codex `rollout/` + `core/session/` (basics) → Claude Code `utils/sessionStart.ts` + `utils/sessionRestore.ts` (lifecycle) → OpenClaw `sessions/session-id.ts` (minimal validation) → Hermes `gateway/session.py` + `gateway/config.py` (multi-platform + reset). Stitch the four together = session framework v0.1.
+</details>
+
 </details>

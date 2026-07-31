@@ -14,20 +14,23 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-> **承接 02 章 §3.9「何时停止」**：那一节给了三层 verifier 的概览。本章把每一层的真源码、失败模式、选型逻辑讲透。
+> **承接 [Agent Loop](/patterns/02-agent-loop/)**：那一章给了三层 verifier 的概览。本章继续看每一层的源码、失败模式与选型逻辑。
 
-## §1 · TL;DR
+## 谁来判定任务完成
 
 <Verdict tldr="Verifier 是 agent loop 唯一能托底的外部判官。模型说「我做完了」这件事在生产环境基本不能信，loop 完全靠模型自评停或不停，必然出现「bug 还没修但 agent 说改完了」的灾难。三层 verifier：硬 verifier 看外部产物（exit code、patch 合法性、lint、tests），软 verifier 看预算和启发式（token 增量、调用模式哈希），放任型 verifier（lazy verifier）信模型自停（最后兜底）。三层都得有，缺一翻车。四家覆盖度差别巨大：Codex 走最严格路线，4 个硬 verifier 串到底（apply_patch 对 patch 做语法校验、run tests 看测试退出码、execpolicy 给每条 shell 命令打 allow/prompt/forbidden 三态、goals.rs 1500 行状态机周期性检测 goal 是否收敛）；Claude Code 走软 verifier 算法化路线，tokenBudget.ts 60 行做出普适算法（0.9 阈值、500 token 增量、3 轮连续低增量判 diminishing），但没硬 verifier 接口；OpenClaw 走中间件化路线，tool-policy-pipeline 让外部任意挂检查，tool-loop-detection 4 种 detector（generic_repeat 同工具同参数重复、known_poll_no_progress 已知的轮询模式无进展、ping_pong 两个工具在两步之间来回切换、global_circuit_breaker 全局调用次数熔断）拦死循环；Hermes 走长期累积路线，单 loop 只有 IterationBudget 软兜底，靠 memory.prefetch（loop 启动前注入跨会话记忆）加 insights（loop 结束后自评写回 memory）跨会话变聪明。选型：严格 coding agent 参考 Codex，IDE 工具参考 Claude Code TOKEN_BUDGET，企业可扩展参考 OpenClaw 中间件，长跑助理参考 Hermes memory 加 insights。" />
 
-## §2 · 三层 verifier 加 4 家覆盖度
+## 硬验证、软验证与止损上限
 
-:::tip[本章重点 · 30 秒速读]
+<details>
+<summary>读前提示（按需展开）</summary>
+
 - **模型说「我做完了」基本不能信**：loop 完全靠模型自评收尾，必然出现「bug 没修但 agent 说改完了」的灾难。
 - **覆盖度分歧最大**：Codex 4 个硬 verifier 串到底（execpolicy 三态、goals.rs 收敛检测），Claude Code 只有 TOKEN_BUDGET 软算法，OpenClaw 靠 tool-loop-detection 4 种 detector，Hermes 靠 insights 跨会话累积。
 - **verifier 层数决定翻车概率**：硬、软、放任型三层都得有，缺一翻车。
 - **自己动手第一优先**：先接外部客观信号（exit code、patch 合法性、tests），别指望模型自评。
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/05-verifier-base.svg"
@@ -48,11 +51,13 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="层级"
 />
 
-## §3 · 四家怎么实现 verifier
+## 四套系统怎样验证完成
 
 ### Codex · 4 个硬 verifier 串联，loop 完全不靠模型自评
 
-Codex 对 verifier 设计的核心判断是：模型说「我完成了」基本不能信。很多时候模型实际没有完成任务但它觉得自己完成了（比如改了一个文件就以为整个 bug 都修好了，但还有 3 个相关文件没改。或者跑了一次测试看到通过就以为修好了，但其实测试覆盖不全）。Coding 场景的好处是有大量客观可验证的信号：exit code 是 0 还是非 0、patch 语法对不对、lint 是否通过、tests 是否全 pass，这些信号都是机器可读不需要模型判断。Codex 把这些客观信号全部串起来，loop 完全不依赖模型自评。
+Codex 在 verifier 设计上的出发点是：模型说「我完成了」基本不能信。很多时候模型实际没有完成任务但它觉得自己完成了（比如改了一个文件就以为整个 bug 都修好了，但还有 3 个相关文件没改。或者跑了一次测试看到通过就以为修好了，但其实测试覆盖不全）。Coding 场景的好处是有大量客观可验证的信号：exit code 是 0 还是非 0、patch 语法对不对、lint 是否通过、tests 是否全 pass，这些信号都是机器可读不需要模型判断。
+
+Codex 把这些客观信号全部串起来，loop 完全不依赖模型自评。
 
 实际实现是 `goals.rs` 里 1500 多行的 `GoalRuntimeEvent` 状态机处理每一次 turn 的预算、收敛、外部 goal 变更，把所有事件统一收敛成机器可判断的「任务完成」信号：
 
@@ -114,7 +119,9 @@ Codex 的硬 verifier 4 件套，每一个都对应一个具体的「客观完�
 
 ### Claude Code · 60 行算法判 token 收敛速率
 
-Claude Code 对 verifier 设计的核心判断是：作为 IDE 集成的 coding agent，硬 verifier（exit code、tests）的接入成本太高（用户的项目可能没测试、测试可能很慢、IDE 不该擅自跑测试），但完全靠模型自评又会出现「模型啰嗦没完没了」（特别是用户问个简单问题模型却写了一大篇分析）。所以 Claude Code 选择把软 verifier 做到极致：用 token 收敛速率做主要判退信号，便宜（不用跑外部命令）、快速（每轮就能算）、对场景普适（任何任务都能算 token 增量）。
+Claude Code 在 verifier 设计上的出发点是：作为 IDE 集成的 coding agent，硬 verifier（exit code、tests）的接入成本太高（用户的项目可能没测试、测试可能很慢、IDE 不该擅自跑测试），但完全靠模型自评又会出现「模型啰嗦没完没了」（特别是用户问个简单问题模型却写了一大篇分析）。
+
+所以 Claude Code 选择把软 verifier 做得很深：用 token 收敛速率做主要判退信号，便宜（不用跑外部命令）、快速（每轮就能算）、对场景普适（任何任务都能算 token 增量）。
 
 实际实现在 `query/tokenBudget.ts` 几十行，把按 token 收敛速率判退做成一个标准算法：
 
@@ -160,13 +167,19 @@ export function checkTokenBudget(
 
 这套设计有一个特别巧妙的地方：算法看的不是绝对 token 数（绝对数因任务复杂度差异巨大）而是 token 增量趋势（不管任务多复杂，只要连续 3 轮增量都很小就说明在打转）。这种相对趋势的设计让算法不需要为每个任务调阈值。
 
-但 Claude Code 这套做得再好也只是软 verifier，没有硬 verifier 接口。`query.ts` 1729 行单文件没开放外部 hook，想让 loop 强制等 `pnpm test` pass 再退出，只能 fork 整个文件改。`stopHooks` 系统只允许反向门控（阻止模型自停，让 loop 继续跑），不接「必须先通过外部检查」这种正向要求（强制必须 pass 才能退）。这是 Claude Code 在 verifier 上明显的盲点：对于需要严格保证「测试通过才能 PR」的工作流，Claude Code 不适合直接用。
+但 Claude Code 这套做得再好也只是软 verifier，没有硬 verifier 接口。`query.ts` 1729 行单文件没开放外部 hook，想让 loop 强制等 `pnpm test` pass 再退出，只能 fork 整个文件改。`stopHooks` 系统只允许反向门控（阻止模型自停，让 loop 继续跑），不接「必须先通过外部检查」这种正向要求（强制必须 pass 才能退）。
+
+这是 Claude Code 在 verifier 上明显的盲点：对于需要严格保证「测试通过才能 PR」的工作流，Claude Code 不适合直接用。
 
 ### OpenClaw · verifier 中间件化加 4 种 loop detector
 
-OpenClaw 对 verifier 设计的核心判断是：作为通用 agent 控制面（不只服务 coding），verifier 不能写死在 loop 里。不同企业、不同业务场景对「什么算完成」的定义完全不同（销售 agent 完成等于 CRM 字段全填、客服 agent 完成等于工单关闭、coding agent 完成等于 tests pass），如果 verifier 是写死的就没法适配多样性。最好的办法是把 verifier 做成中间件接口，让具体的检查逻辑由使用者自己注册。
+OpenClaw 在 verifier 设计上的出发点是：作为通用 agent 控制面（不只服务 coding），verifier 不能写死在 loop 里。不同企业、不同业务场景对「什么算完成」的定义完全不同（销售 agent 完成等于 CRM 字段全填、客服 agent 完成等于工单关闭、coding agent 完成等于 tests pass），如果 verifier 是写死的就没法适配多样性。
 
-实际实现是 `tool-policy-pipeline` 把 verifier 抽象成可注册的中间件，十几个 hook 点（`before_tool_call`「调用前」、`after_tool_call`「调用后」、`tool_result_persist`「结果持久化前」等）让外部任意挂 lint check、typecheck、human approval、业务规则验证。比如想给某个企业 agent 加「PR 必须有 reviewer 才能 merge」的 verifier？写个 plugin 注册到 after_tool_call 即可，不用改 OpenClaw 源码。
+最好的办法是把 verifier 做成中间件接口，让具体的检查逻辑由使用者自己注册。
+
+实际实现是 `tool-policy-pipeline` 把 verifier 抽象成可注册的中间件，十几个 hook 点（`before_tool_call`「调用前」、`after_tool_call`「调用后」、`tool_result_persist`「结果持久化前」等）让外部任意挂 lint check、typecheck、human approval、业务规则验证。
+
+比如想给某个企业 agent 加「PR 必须有 reviewer 才能 merge」的 verifier？写个 plugin 注册到 after_tool_call 即可，不用改 OpenClaw 源码。
 
 但这种「verifier 中间件化」只解决了外部能注入检查的问题，还有一个 OpenClaw 内部要解的问题：loop 死循环检测。模型有时候会陷入「不停调用同一个工具」或「在两个工具之间来回切」的死循环，单纯靠用户写中间件不一定及时发现，所以 OpenClaw 内置了一个专门的子系统 `tool-loop-detection.ts`，4 种 detector 分管不同的死循环模式：
 
@@ -201,7 +214,7 @@ export const GLOBAL_CIRCUIT_BREAKER_THRESHOLD = 30;
 
 ### Hermes · 单 loop 无硬 verifier，verifier 跨会话累积
 
-Hermes 对 verifier 设计的核心判断是：长跑助理（陪伴用户几个月几年）的 verifier 不该是「单次 loop 内一定要严格判对错」。这种严格性会让 agent 太死板没法处理多样性场景，反而损害用户体验。正确的方式是把 verifier 摊到时间轴上：单次 loop 不严格但每次 loop 结束后做事后分析写回 memory，下次类似任务 prefetch 出来注入 context，agent 就会越来越聪明。
+Hermes 在 verifier 设计上的出发点是：长跑助理（陪伴用户几个月几年）的 verifier 不该是「单次 loop 内一定要严格判对错」。这种严格性会让 agent 太死板没法处理多样性场景，反而损害用户体验。正确的方式是把 verifier 摊到时间轴上：单次 loop 不严格但每次 loop 结束后做事后分析写回 memory，下次类似任务 prefetch 出来注入 context，agent 就会越来越聪明。
 
 实际实现上 Hermes 单 loop 跑 90 步（subagent 50 步），耗尽走 grace call、总结、停。`agent/insights.py` 不是运行时 verifier，它是**事后**的会话分析引擎，看 token、成本、工具分布：
 
@@ -233,7 +246,7 @@ Hermes 的 verifier 设计可以分三个时间维度：
 
 Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没法机器判断对错（用户问「这次任务做对了吗」，Hermes 给不出客观答案，只能让用户自己判断），依赖 memory 累积加 skill 自评。所以 Hermes 不适合「单次 loop 必须严格判对」的场景（CI、自动 merge、关键业务流程），更适合陪伴型助理。
 
-## §4 · 四家共有的 5 条 verifier 工程底线
+## Verifier 已经形成的共识
 
 四家在 verifier 设计上有五个明显的共同认知，这是所有 agent 都该遵循的工程底线：
 
@@ -241,13 +254,13 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 
 **第二，硬 verifier 看外部产物（不依赖模型自评）**：exit code、diff 合法性、policy 决策、lint 结果，这些都是机器可判断的信号。模型说「我做完了」不算数，必须有客观信号确认。Codex 和 OpenClaw 都把硬 verifier 做到这一层。
 
-**第三，软 verifier 用预算和启发式（便宜但够用）**：token 增量、重试次数、调用模式哈希，这些信号成本低（不用跑外部命令）但能拦下大部分浪费。Claude Code 把软 verifier 做到极致，60 行算法覆盖主要场景。
+**第三，软 verifier 用预算和启发式（便宜但够用）**：token 增量、重试次数、调用模式哈希，这些信号成本低（不用跑外部命令）但能拦下大部分浪费。Claude Code 把软 verifier 做得很深，60 行算法覆盖主要场景。
 
 **第四，放任型 verifier 是最后一道兜底（不能让 loop 只靠它）**：模型不再发 tool_use 即认为完成，是兜底机制不是主力。完全靠模型自评的 agent 一定不可信。
 
 **第五，verifier 信号要可观测（暴露给监控）**：`transition.reason`（Claude Code）、`GOAL_*_METRIC`（Codex）、`LoopDetectorKind`（OpenClaw）都把退出原因显式暴露给监控系统。监控不能看 verifier 信号的 agent 出问题没法定位。
 
-## §5 · 关键分歧 · 按场景选型
+## 验证强度决定自治范围
 
 <Diagram
   src="/diagrams/05-tradeoff.svg"
@@ -265,7 +278,7 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 
 **长期累积学习，不强求单 loop 严格**：参考 Hermes 的 memory.prefetch 加 insights 路线。把 verifier 摊到时间轴上，单 loop 不严格但跨会话累积变好。但单 loop 还是得有硬上限兜底（IterationBudget），不能完全没有。这是长跑陪伴型 agent 的最优方案。
 
-## §6 · 我的点评
+## 我的判断：先找事实，再谈评分
 
 <ScoreCard
   rows={[
@@ -278,7 +291,7 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
   headers={['系统', '评分', '亮点', '风险']}
 />
 
-## §7 · 自己实现 Verifier 的最佳实践
+## 从一个领域验证器开始
 
 下面是从四家提炼的自己写 Verifier 配方。先把基础三层补齐，再加生产级特性，最后避开四个常见死路。
 
@@ -303,7 +316,7 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
   ]}
 />
 
-## §8 · 失败路径流程图
+## 失败怎样回到循环
 
 <Diagram
   src="/diagrams/05-failure-paths.svg"
@@ -313,7 +326,7 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 
 把 verifier 拆三层最大的好处：监控能区分「loop 还在干活」、「loop 在原地打转」、「loop 应该停了」三种状态。把这三种状态混成一个 boolean，agent 系统永远看不清。
 
-## §9 · 延伸阅读 · 源码入口
+## 沿着验证路径读源码
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -329,14 +342,19 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
   ]}
 />
 
-## §10 · 小练习
+## 附录：练习与复盘
+
+<details id="interview-drill">
+<summary>按需展开练习和十道复盘题</summary>
+
+### 练习
 
 1. **自查（简单）**：你现在做的 agent 有几层 verifier？把它们列出来，分类成硬、软、放任型三层。哪一层是空的？补上的成本是什么？
 2. **移植一段（中等）**：把 Claude Code 的 `checkTokenBudget` 函数移植到你自己的 agent。`0.9`、`500`、`3` 三个常量按你的场景调整一遍，记录调整理由。
 3. **移植一段（中等）**：实现 OpenClaw 的 `generic_repeat` detector：哈希 `toolName` 加 `JSON.stringify(sorted params)`，最近 30 次调用里同一哈希出现 10 次以上警告，20 次以上熔断。
 4. **设计（高难）**：给一个非 coding 场景的 agent 设计硬 verifier（比如「写周报」或「做调研」）。任务没 tests 也没 exit code，怎么造一个机器可判断的「完成」信号？
 
-## §11 · 面试题：10 道带答案的高频考点
+### 复盘题
 
 <details>
 <summary>**Q1 · 概念**：「硬 verifier」「软 verifier」「放任型 verifier」三者怎么界定？</summary>
@@ -363,7 +381,7 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 因为它把 4 件事并到一个状态机：
 
 1. **Token budget 收敛检测**：每 turn 算 `current_tokens / budget`，命中阈值触发 `GOAL_BUDGET_LIMITED_METRIC`。
-2. **Goal 完成判定**：一个任务可能分解成多个 sub-goal（chapter 02 §3.2 讲过），需要追踪每个 sub-goal 的完成状态。
+2. **Goal 完成判定**：一个任务可能分解成多个 sub-goal，需要追踪每个 sub-goal 的完成状态。
 3. **外部 goal 变更**：用户在 turn 之间可能改 goal（比如说「除了那个 bug 之外，也帮我加 tests」），状态机要支持运行时 goal 修改。
 4. **Tool completion 与 goal 关联**：一个 tool 调完不代表 goal 完成。某些 tool（`apply_patch`、`run_tests`）会推动 goal 状态前进，需要明确建模。
 
@@ -653,4 +671,6 @@ console.log(result.transition.reason);
 
 **源码定位**：综合参考 [`codex/codex-rs/core/src/goals.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/goals.rs)、`claude-code/src/query/tokenBudget.ts`、[`openclaw/src/agents/tool-loop-detection.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/tool-loop-detection.ts)。
 **追问**：「这套框架能开源吗？」能。Verifier 抽象不依赖具体 model provider，跟 LangChain 这种偏 protocol 的框架正交。可作为独立 lib（`@agent/verifier-kit`）发到 npm。
+</details>
+
 </details>

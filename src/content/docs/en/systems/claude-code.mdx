@@ -1,6 +1,6 @@
 ---
 title: Claude Code
-description: "Anthropic Claude Code: TypeScript + skill engine + multi-channel IDE integration, the most complete dev UX of the four"
+description: "Anthropic Claude Code: TypeScript, a skill engine, and multi-channel IDE integration"
 sidebar:
   order: 2
 ---
@@ -9,13 +9,13 @@ import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 
-<Verdict tldr="Claude Code has the most complete developer UX. 17 bundled skills, a `skillify` meta-skill, four entry types (CLI, IDE plugin, Web, Mobile), and `/insights` plus `/security-review` plus autoMode forming the agent self-audit loop. Closed source. This site's analysis comes from public docs plus npm sourcemap reverse-engineering. Reverse-engineered claims are tagged 'behavioural inference'." tone="insight" />
+<Verdict tldr="Claude Code puts 17 bundled skills, a `skillify` meta-skill, CLI, IDE, Web, and Mobile entry points, plus `/insights`, `/security-review`, and autoMode into one developer workflow. It is closed source. This site treats only public documentation and npm sourcemap evidence as fact, and labels the rest as behavioural inference." tone="insight" />
 
-## §1 · What Claude Code is
+## One loop behind four entry points
 
 Anthropic's agentic coding tool, shipped as the npm package `@anthropic-ai/claude-code`. The same TypeScript codebase supports four entry types: terminal, IDE plugin, Web, and Mobile.
 
-## §2 · Architecture stack by directory
+## Directories organized around developer actions
 
 <CompareTable
   rows={[
@@ -26,25 +26,25 @@ Anthropic's agentic coding tool, shipped as the npm package `@anthropic-ai/claud
     { label: 'Hooks & coordination', values: ['`hooks/` lifecycle hooks', '`buddy/` collaboration mode', '`coordinator/` multi-agent dispatch', '`outputStyles/` output format injection'] },
     { label: 'Observability & cost', values: ['`cost-tracker.ts` + `costHook.ts` live cost tracking', '`commands/insights.ts` Opus over jsonl produces narrative', '`logEvent("tengu_*")` event stream', '`modelCost.ts` hardcoded price table'] },
   ]}
-  caption="Claude Code keeps pushing every capability behind a slash command. The result: developer UX at the top of the industry."
+  caption="Claude Code exposes most capabilities as slash commands while keeping protocol adaptation at the entry layer."
 />
 
-## §3 · Engineering highlights
+## Skills, self-audit, and memory checks
 
-1. **Skill engine is the industry ceiling**. 17 bundled skills plus `skillify` as a meta-skill. `skillify` runs 4 rounds of AskUserQuestion to distill a session into SKILL.md. The most complete "agent produces its own skill" loop.
+1. **The skill engine has explicit boundaries**. 17 bundled skills sit beside `skillify`, a meta-skill that uses four AskUserQuestion rounds to turn a session into SKILL.md. Its prompts and exit conditions are concrete enough to study directly.
 2. **Four entries share one codebase**. All four entries run the same turn loop. Protocol adapters live only in `entrypoints/`.
 3. **autoMode classifier**. An LLM reviews the user-written auto allow, soft_deny, and env classifier rules for clarity, completeness, and conflicts.
 4. **`/security-review` acts as senior security engineer**. The LLM scans a PR diff against 5 vulnerability classes, with an 80% confidence floor. Actively excludes DOS and disk-secret findings.
 5. **MEMORY_DRIFT_CAVEAT admits staleness up front**. The prompt tells the model memories may be stale and forces a grep verification before acting.
 
-## §4 · Where it falls short
+## Closed-source and isolation limits
 
 1. **Closed source**. All conclusions come from sourcemap reverse-engineering. Some behavior is inferred.
 2. **No native cross-OS sandbox**. Relies on the host IDE for execution isolation. Sandbox is weak in pure-CLI mode.
 3. **Memory drift is prompt-mitigated, not mechanism-mitigated**. Compared to OpenClaw's temporal decay plus retrieval, the mechanism layer is thin.
 4. **Trace is weaker**. No Codex-style full-session rollout-trace.jsonl.
 
-## §5 · Five things worth stealing
+## Five designs worth carrying over
 
 1. **`skillify` 4-round AskUserQuestion flow** (`src/skills/bundled/skillify.ts`). R1 captures name and description, R2 captures step and arg, R3 decomposes, R4 extracts triggers. Splits "agent produces its own skill" into four bounded questions.
 2. **`/security-review` prompt design** (`src/commands/security-review.ts`). Senior security engineer persona, 5 vulnerability classes, and an explicit exclusion list.
@@ -52,7 +52,7 @@ Anthropic's agentic coding tool, shipped as the npm package `@anthropic-ai/claud
 4. **autoMode classifier reviewing user rules** (`src/cli/handlers/autoMode.ts`). Rule audit is itself an LLM task.
 5. **The boundaries of the 17 bundled skills**. `loop`, `stuck`, `remember`, and `verify` each have explicit exit conditions you can lift as design patterns.
 
-## §6 · Source map
+## Where the unpacked evidence begins
 
 <SourceTrail
   entries={[

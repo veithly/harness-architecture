@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## 代码审查要独立于代码生成
 
 <Verdict tldr="Code Review 这件事的核心范式是「让另一个 agent 来检查这个 agent 在做的事」：听起来简单，但真做起来要回答四个具体问题：reviewer 应该是同一个对话还是独立的 agent（同对话便宜但容易跑偏，独立 agent 贵但判断力强）、reviewer 应该看什么（uncommitted 改动、当前 branch 对比 base branch、特定 commit、用户自定义的 diff，至少四种 target 要支持）、reviewer 跑命令时怎么处理审批（reviewer 弹一堆审批框会让用户不堪其扰，但不弹又可能让它跑危险命令）、review 的输出怎么消费（自由格式 markdown 让用户看就好，还是结构化 findings 喂给 IDE 高亮）。四家在这四件事上做出了截然不同的取舍。Codex 走到最深：它有两套独立的 reviewer 系统：第一套是用户主动触发的代码 review，由一个独立的 sub-agent thread 运行（run_codex_thread_one_shot），这个 sub-agent 的 config 被精心剪裁过：关掉 web_search 防止跑偏去搜文档、关掉 SpawnCsv 和 MultiAgentV2 防止递归 spawn 子 agent、把 AskForApproval 设成 Never 让它永远不弹审批、可以用单独的便宜模型（review_model 字段，主 agent 跑 GPT-5、reviewer 跑 mini 省成本），4 种 review target 各对应一段参数化的 prompt 模板。第二套是 guardian、review，专门做「agent 审 agent 的危险动作」：主 agent 想跑某条危险命令时，guardian sub-agent 先看一眼给出 risk level 加 allow、deny 决策，里面还有特别精彩的「防越狱」机制：明文写在 GUARDIAN_REJECTION_INSTRUCTIONS 里告诉 reviewer「主 agent 被你拒了之后可能想用迂回方式干同样的坏事，要拒得彻底」。Claude Code 走两条独立路线：本地的 /review 是 prompt-as-command 模式（一段精心写好的 prompt 塞回主 agent 让模型自己跑 gh pr view 走 gh pr diff 走分析），实现极简但缺乏 reviewer 角色隔离。远程的 /ultrareview 是 teleport 到 Claude Code Web（CCR，Claude Code Remote 服务端，跑在 Anthropic 自己的 sandbox 集群里）远程 session，GitHub 应用拉代码后跑 10-20 分钟的 bug-hunter pipeline（几个独立 agent 各看一个维度：security、performance、correctness、style），跑完通过 task-notification（一个推送回本地 IDE 的事件流，把远端结果实时同步给用户）回灌结果到本地，走 quota、billing gate（免费配额耗尽触发 overage dialog，弹窗让用户确认要不要走超额计费）。OpenClaw 选择不内建 review：理由是 review 的定义对不同企业差异巨大（PR review、commit review、lint review、安全 review、business logic review 完全不一样），所以平台只提供 hook，让用户在 plugin 的 tool-policy-pipeline 的 after_tool_call 里挂自己的 reviewer middleware。Hermes 最极简，连入口都没有，模型要 review 就走 terminal_tool 跑 git diff 自己看自己。要做认真的 reviewer 系统：独立 sub-agent 加受约束 config 加结构化输出，这三件套是最稳的。" />
 
-## §2 · Reviewer 形态 4 档对照
+## 四种 Reviewer 形态
 
-:::tip[本章重点 · 30 秒速读]
+<details>
+<summary>读前提示（按需展开）</summary>
+
 - **核心范式**：让另一个 agent 检查这个 agent 在做的事，要答四问：reviewer 形态、看什么 target、怎么处理审批、输出怎么消费。
 - **分歧最大点**：Codex 独立 sub-agent thread（`run_codex_thread_one_shot` 加 `AskForApproval::Never`）、Claude Code 本地 prompt-as-command 加远程 CCR pipeline、OpenClaw 只留 `after_tool_call` hook、Hermes 连入口都没有。
 - **工程判断**：reviewer 是否独立 agent 决定判断力：同对话便宜但会为自己辩护，独立 agent 贵但批判性强。
 - **动手要点**：先上三件套：独立 sub-agent 加受约束 config 加结构化输出；最大的坑是递归 spawn 和越狱重试（参考 GUARDIAN_REJECTION_INSTRUCTIONS）。
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/09-code-review-base.svg"
@@ -46,11 +49,13 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## §3 · 四家怎么实现 Code Review
+## 四套系统怎样做 Code Review
 
 ### Codex · 独立 sub-agent 跑 review 加 4 种参数化 target 加 guardian 双层架构
 
-Codex 在 code review 这件事上的核心判断是：review 跟主对话本质上是两个完全不同的任务：主对话的目标是「帮用户完成需求」（带着倾向性、看过完整历史、可以用任何工具），review 的目标是「带着批判眼光独立判断」（必须没有偏见、不应该看历史、只能看当前 diff、不能跑会改变状态的工具）。如果让同一个 agent 来回切换这两种角色，模型本能会偏向「为自己刚才的实现辩护」：它见过太多上下文，知道每个改动的「为什么这么改」，很难真正批判性地看 diff。所以 Codex 决定把 review 做成一个完全独立的 sub-agent，从一开始就有干净的 context 和受限的能力集。
+Codex 在 code review 这件事上的出发点是：review 跟主对话本质上是两个完全不同的任务：主对话的目标是「帮用户完成需求」（带着倾向性、看过完整历史、可以用任何工具），review 的目标是「带着批判眼光独立判断」（必须没有偏见、不应该看历史、只能看当前 diff、不能跑会改变状态的工具）。如果让同一个 agent 来回切换这两种角色，模型本能会偏向「为自己刚才的实现辩护」：它见过太多上下文，知道每个改动的「为什么这么改」，很难真正批判性地看 diff。
+
+所以 Codex 决定把 review 做成一个完全独立的 sub-agent，从一开始就有干净的 context 和受限的能力集。
 
 具体的实现是这样的：当用户触发 review（通过 /review 命令或 API），Codex 不在主对话里继续，而是建一个全新的 codex thread（叫 review sub-agent），把它的 config 精心剪裁一遍：关掉所有不该用的 feature、换上 reviewer 专属的 system prompt、强制 approval policy 为 Never：
 
@@ -101,7 +106,11 @@ async fn start_review_conversation(
 
 </SourceBlock>
 
-这段配置代码里有三个工程细节是为了解决三个具体问题。第一个细节是把 web_search 设成 Disabled：reviewer 不应该联网搜文档，否则它看到一段陌生 API 调用会本能跑去搜「这个 API 是用来做什么的」，几分钟过去 review 跑偏到完全无关的方向，token 全浪费在搜索上。强制 Disabled 让 reviewer 只能看 diff 本身做判断。第二个细节是关掉 SpawnCsv、Collab、MultiAgentV2 这一组 feature：这三个都是「这个 agent 能 spawn 更多子 agent」的能力，如果不关 reviewer 可能 spawn 出 reviewer-of-reviewer 形成递归，token 和 latency 都爆炸。关掉这一组让 reviewer 只能用「单 agent 加工具调用」的能力。第三个细节是 AskForApproval::Never：reviewer 跑命令时（比如 git diff、git log）不应该弹审批框，因为用户的注意力本来在主 agent 上，被 reviewer 不停弹框打断会很烦。设成 Never 让 reviewer 永远不弹审批，要审批就抛错让主 agent 看着办（reviewer 通常只读，不需要审批）。
+这段配置代码里有三个工程细节是为了解决三个具体问题。第一个细节是把 web_search 设成 Disabled：reviewer 不应该联网搜文档，否则它看到一段陌生 API 调用会本能跑去搜「这个 API 是用来做什么的」，几分钟过去 review 跑偏到完全无关的方向，token 全浪费在搜索上。强制 Disabled 让 reviewer 只能看 diff 本身做判断。
+
+第二个细节是关掉 SpawnCsv、Collab、MultiAgentV2 这一组 feature：这三个都是「这个 agent 能 spawn 更多子 agent」的能力，如果不关 reviewer 可能 spawn 出 reviewer-of-reviewer 形成递归，token 和 latency 都爆炸。关掉这一组让 reviewer 只能用「单 agent 加工具调用」的能力。
+
+第三个细节是 AskForApproval::Never：reviewer 跑命令时（比如 git diff、git log）不应该弹审批框，因为用户的注意力本来在主 agent 上，被 reviewer 不停弹框打断会很烦。设成 Never 让 reviewer 永远不弹审批，要审批就抛错让主 agent 看着办（reviewer 通常只读，不需要审批）。
 
 特别值得讲的是 review_model 这个独立字段：它允许 reviewer 用跟主 agent 不同的模型。主 agent 用昂贵的 GPT-5 做复杂推理和工具调用，但 reviewer 的任务相对简单（看 diff 找问题），可以用便宜的 mini 模型。按一次 review 5-20K token 算，省下来的钱在大规模使用时是真金白银。这个设计反映了「不同任务用不同成本的模型」的精细化运营思路。
 
@@ -121,9 +130,17 @@ const COMMIT_PROMPT: &str = "Review the code changes introduced by commit {{sha}
 
 </SourceBlock>
 
-这四种 target 各自对应一个明确的使用场景。UNCOMMITTED 是「我刚改完，帮我看一眼」：staged 加 unstaged 加 untracked 全包括，最快出结果，适合 PR 提交前的本地预审。BASE_BRANCH 是「这条 branch 跟主干的差距」：典型的 PR review 前置步骤，让 reviewer 看「如果我现在提 PR 合并，主干会接收哪些改动」。这里有个性能优化值得专门讲：模板分了两个版本，BASE_BRANCH_PROMPT 是「主 agent 已经算过 merge_base_sha」的版本，直接把 SHA 塞给 reviewer，让 reviewer 一行 git diff 就能拿到 diff。BASE_BRANCH_PROMPT_BACKUP 是「主 agent 没算过 merge_base」的备份版本，让 reviewer 自己跑 `git merge-base HEAD upstream` 解析出来。为什么要分两版？因为 git merge-base 在大型 monorepo 里可能要跑 1-5 秒，能在主 agent 那边算好就算好（主 agent 有 git-utils crate 可以并发跑），别让 reviewer 浪费一次 tool call 在已知数据上。COMMIT_PROMPT 是「review 一个特定的 commit」：用于回顾历史，COMMIT_PROMPT_WITH_TITLE 是带 commit title 的版本（如果调用方知道 title 就传进来给 reviewer 更多上下文）。
+这四种 target 各自对应一个明确的使用场景。UNCOMMITTED 是「我刚改完，帮我看一眼」：staged 加 unstaged 加 untracked 全包括，最快出结果，适合 PR 提交前的本地预审。BASE_BRANCH 是「这条 branch 跟主干的差距」：典型的 PR review 前置步骤，让 reviewer 看「如果我现在提 PR 合并，主干会接收哪些改动」。
 
-Codex 的第二套 review 系统是 guardian/review.rs，它跟代码 review 完全不同：guardian 不是 review 代码改动，是 review 主 agent 在跑的危险动作。具体场景：主 agent 想跑 `rm -rf /tmp/cache` 这种动作，按理说要弹审批让用户决定，但用户可能在喝咖啡或者忙别的，让用户每次都看到审批框很烦。这时候 guardian 这个独立 sub-agent 先帮你看一眼：它拿到 `{tool, args, cwd, sandbox_state}` 这些上下文，调用模型判断「这条命令风险有多大」，返回 allow、deny、timeout 三态决策。如果 guardian 判断风险低（比如 `rm -rf /tmp/cache` 在临时目录里，且 cache 看起来是无关紧要的内容），就自动 allow 不打扰用户。如果判断高风险，就拒绝并把决策原因告诉主 agent。
+这里有个性能优化值得专门讲：模板分了两个版本，BASE_BRANCH_PROMPT 是「主 agent 已经算过 merge_base_sha」的版本，直接把 SHA 塞给 reviewer，让 reviewer 一行 git diff 就能拿到 diff。BASE_BRANCH_PROMPT_BACKUP 是「主 agent 没算过 merge_base」的备份版本，让 reviewer 自己跑 `git merge-base HEAD upstream` 解析出来。
+
+为什么要分两版？因为 git merge-base 在大型 monorepo 里可能要跑 1-5 秒，能在主 agent 那边算好就算好（主 agent 有 git-utils crate 可以并发跑），别让 reviewer 浪费一次 tool call 在已知数据上。
+
+COMMIT_PROMPT 是「review 一个特定的 commit」：用于回顾历史，COMMIT_PROMPT_WITH_TITLE 是带 commit title 的版本（如果调用方知道 title 就传进来给 reviewer 更多上下文）。
+
+Codex 的第二套 review 系统是 guardian/review.rs，它跟代码 review 完全不同：guardian 不是 review 代码改动，是 review 主 agent 在跑的危险动作。具体场景：主 agent 想跑 `rm -rf /tmp/cache` 这种动作，按理说要弹审批让用户决定，但用户可能在喝咖啡或者忙别的，让用户每次都看到审批框很烦。
+
+这时候 guardian 这个独立 sub-agent 先帮你看一眼：它拿到 `{tool, args, cwd, sandbox_state}` 这些上下文，调用模型判断「这条命令风险有多大」，返回 allow、deny、timeout 三态决策。如果 guardian 判断风险低（比如 `rm -rf /tmp/cache` 在临时目录里，且 cache 看起来是无关紧要的内容），就自动 allow 不打扰用户。如果判断高风险，就拒绝并把决策原因告诉主 agent。
 
 guardian 的两段特别指令值得仔细看：
 
@@ -147,7 +164,13 @@ const GUARDIAN_TIMEOUT_INSTRUCTIONS: &str = concat!(
 
 </SourceBlock>
 
-第一段 GUARDIAN_REJECTION_INSTRUCTIONS 是 Codex 团队对「agent 反向越狱」的明确防御。具体的攻击模式是：主 agent 想 `rm -rf /important` 被 guardian 拒了，主 agent 不放弃可能想「换个写法干同样的事」（比如改成 `find /important -delete`、或者 `cd /important && rm -rf .`），这种迂回方式如果 guardian 没识别出来就被绕过。所以 Codex 在 guardian 的 prompt 里明文写「agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention」，让 guardian 拒绝时同时拒绝所有「实质达到同样结果」的变体，而不是只看字面命令。这是把一个真实工程教训直接写进 prompt 里，做得很细致。第二段 GUARDIAN_TIMEOUT_INSTRUCTIONS 是处理 guardian 自己挂掉的情况：guardian 调模型 API 可能因为网络问题超时（默认 5 秒），如果默认认为「超时等于 unsafe」会过于保守把所有动作都拒了。这段告诉主 agent「timeout 不代表 unsafe，可以 retry 一次，或者直接问用户」。除了这两段，guardian 还有 circuit breaker 机制：3 次连续 deny 触发熔断，guardian 暂停 30 秒，防止 guardian 模型在某段时间内异常地把所有动作都 deny 拖死主 agent。
+第一段 GUARDIAN_REJECTION_INSTRUCTIONS 是 Codex 团队对「agent 反向越狱」的明确防御。具体的攻击模式是：主 agent 想 `rm -rf /important` 被 guardian 拒了，主 agent 不放弃可能想「换个写法干同样的事」（比如改成 `find /important -delete`、或者 `cd /important && rm -rf .`），这种迂回方式如果 guardian 没识别出来就被绕过。
+
+所以 Codex 在 guardian 的 prompt 里明文写「agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention」，让 guardian 拒绝时同时拒绝所有「实质达到同样结果」的变体，而不是只看字面命令。这是把一个真实工程教训直接写进 prompt 里，做得很细致。
+
+第二段 GUARDIAN_TIMEOUT_INSTRUCTIONS 是处理 guardian 自己挂掉的情况：guardian 调模型 API 可能因为网络问题超时（默认 5 秒），如果默认认为「超时等于 unsafe」会过于保守把所有动作都拒了。这段告诉主 agent「timeout 不代表 unsafe，可以 retry 一次，或者直接问用户」。
+
+除了这两段，guardian 还有 circuit breaker 机制：3 次连续 deny 触发熔断，guardian 暂停 30 秒，防止 guardian 模型在某段时间内异常地把所有动作都 deny 拖死主 agent。
 
 ### Claude Code · 本地 prompt-as-command 加远程 ultrareview 双轨制
 
@@ -185,7 +208,13 @@ const LOCAL_REVIEW_PROMPT = (args: string) => `
 
 </SourceBlock>
 
-这段实现就是 25 行 prompt 字符串，没有任何业务逻辑代码：用户输入 `/review 123`，Claude Code 把 `LOCAL_REVIEW_PROMPT(123)` 这段 prompt 塞进 chat context，让模型在下一轮自己跑 gh pr view 走 gh pr diff 走分析。这种「命令本身不调代码，只是 prompt 注入」的模式有几个工程上的好处。第一是实现成本极低：写一段 prompt 比写一段 TypeScript 函数快 10 倍。Claude Code 沿用这个模式做了 `/review`、`/refactor`、`/test`、`/docs`、`/explain` 一整套，每个就是 25-50 行 prompt 字符串。第二是用户可见可改：Claude Code 的 slash 命令源码本身放在 `.claude/commands/` 目录的 markdown 文件里，用户可以打开看 prompt 写的什么、自己改。第三是模型能力的复利：模型升级时所有 prompt-as-command 命令的能力同步升级，GPT-4 走 GPT-5 那次 `/review` 没改一行代码 review 质量却显著提升。第四是跨工具组合：prompt 一句话告诉模型「用 gh pr view 走 gh pr diff 走分析」，模型自己组合调用工具，比写 TypeScript 函数自己 wrap gh CLI 简洁得多。
+这段实现就是 25 行 prompt 字符串，没有任何业务逻辑代码：用户输入 `/review 123`，Claude Code 把 `LOCAL_REVIEW_PROMPT(123)` 这段 prompt 塞进 chat context，让模型在下一轮自己跑 gh pr view 走 gh pr diff 走分析。这种「命令本身不调代码，只是 prompt 注入」的模式有几个工程上的好处。
+
+第一是实现成本极低：写一段 prompt 比写一段 TypeScript 函数快 10 倍。Claude Code 沿用这个模式做了 `/review`、`/refactor`、`/test`、`/docs`、`/explain` 一整套，每个就是 25-50 行 prompt 字符串。
+
+第二是用户可见可改：Claude Code 的 slash 命令源码本身放在 `.claude/commands/` 目录的 markdown 文件里，用户可以打开看 prompt 写的什么、自己改。第三是模型能力的复利：模型升级时所有 prompt-as-command 命令的能力同步升级，GPT-4 走 GPT-5 那次 `/review` 没改一行代码 review 质量却显著提升。
+
+第四是跨工具组合：prompt 一句话告诉模型「用 gh pr view 走 gh pr diff 走分析」，模型自己组合调用工具，比写 TypeScript 函数自己 wrap gh CLI 简洁得多。
 
 代价也很明显：本地版没有 reviewer 角色隔离。模型还是同一个对话上下文（看过主 agent 的所有历史），同样的 feature set（web_search、子 agent 套娃全开），同样的 approval policy。如果用户的 review 标准要求严格的批判性判断（比如「这段代码安全吗」），本地版可能因为见过太多上下文导致判断不够中立。这是 prompt-as-command 模式的根本局限：你只能调整 prompt 内容，调整不了 agent 配置。
 
@@ -208,17 +237,31 @@ const LOCAL_REVIEW_PROMPT = (args: string) => `
 
 </SourceBlock>
 
-这段注释里有几个关键设计点值得展开。「Teleport」是 Claude Code 的一个抽象：它允许本地 session 把状态完整迁移到远程 CCR session，远程跑完再把结果迁回本地，用户体感是「我在本地输入了 /ultrareview，远程跑了 10 分钟，结果出现在我的本地 chat 里」。这个 teleport 的实现细节是：本地的 RemoteAgentTask 被注册到 polling loop 里，每隔一段时间 poll 远程任务的状态，远程任务完成时通过 task-notification 机制把结果回写到本地 session 的 message 流里，跟用户用本地命令完成的体感完全一致。CCR 是 Claude Code Web 的别名，它是一个能跑长任务的远程 agent runtime，专为「超过本地能跑的任务深度」设计的（参见 18 章 cron 跟 background task）。
+这段注释里有几个关键设计点值得展开。「Teleport」是 Claude Code 的一个抽象：它允许本地 session 把状态完整迁移到远程 CCR session，远程跑完再把结果迁回本地，用户体感是「我在本地输入了 /ultrareview，远程跑了 10 分钟，结果出现在我的本地 chat 里」。
 
-远程版能做本地版做不到的几件事。第一是跑深度 pipeline：远程 sandbox 里 bug-hunter pipeline 跑 10-20 分钟，几个独立 agent 各看一个维度（security、performance、correctness、style），每个 agent 用自己的专属 prompt 和模型，深度做完汇总成结构化 findings。本地版用户绝不愿意等这么久。第二是同质化结果：远程 sandbox 跑同样的 base image、同样的 git 版本、同样的 lint config，结果完全可重复。本地版受用户环境影响（macOS、Linux、Windows 版本不同，git、gh 版本不同），review 质量参差不齐。第三是计费模式独立：/ultrareview 走 quota、billing 检查（参见 ultrareviewQuota.ts），免费配额耗尽触发 overage dialog 让用户确认才扣钱，团队、企业用户直通。这种 monetization 模式只能在远程实现，本地版谁也收不了费。第四是跟 CI 整合：远程 review 本质上是个 cron job，可以接 GitHub webhook 让 PR open 时自动跑。
+这个 teleport 的实现细节是：本地的 RemoteAgentTask 被注册到 polling loop 里，每隔一段时间 poll 远程任务的状态，远程任务完成时通过 task-notification 机制把结果回写到本地 session 的 message 流里，跟用户用本地命令完成的体感完全一致。
+
+CCR 是 Claude Code Web 的别名，它是一个能跑长任务的远程 agent runtime，专为「超过本地能跑的任务深度」设计的（参见 18 章 cron 跟 background task）。
+
+远程版能做本地版做不到的几件事。第一是跑深度 pipeline：远程 sandbox 里 bug-hunter pipeline 跑 10-20 分钟，几个独立 agent 各看一个维度（security、performance、correctness、style），每个 agent 用自己的专属 prompt 和模型，深度做完汇总成结构化 findings。本地版用户绝不愿意等这么久。
+
+第二是同质化结果：远程 sandbox 跑同样的 base image、同样的 git 版本、同样的 lint config，结果完全可重复。本地版受用户环境影响（macOS、Linux、Windows 版本不同，git、gh 版本不同），review 质量参差不齐。
+
+第三是计费模式独立：/ultrareview 走 quota、billing 检查（参见 ultrareviewQuota.ts），免费配额耗尽触发 overage dialog 让用户确认才扣钱，团队、企业用户直通。这种 monetization 模式只能在远程实现，本地版谁也收不了费。第四是跟 CI 整合：远程 review 本质上是个 cron job，可以接 GitHub webhook 让 PR open 时自动跑。
 
 代价也有：远程版依赖 push branch（GitHub app 拉代码靠 git clone，本地未提交的代码看不到），所以源码注释里有 `TODO(#22051)` 说要等 useBundleMode 落地才能支持本地代码上传。远程版需要网络（用户离线时不可用）。远程 sandbox 看到全部代码，企业敏感场景可能有隐私顾虑。
 
 ### OpenClaw · 不内建 review，把它做成 plugin pipeline 的 hook
 
-OpenClaw 在 code review 上的判断是：每个企业的「review 是什么」差异巨大：有的团队定义为 PR review（看 diff、提改进建议），有的定义为 commit review（看历史 commit、找回归 bug），有的定义为 lint review（自动跑 lint 工具、汇总报告），有的定义为安全 review（专门找注入、auth 漏洞），有的定义为 business logic review（检查代码符不符合业务规则）。这些「review」共享的只是「另一个 agent 来检查」这个 meta 模式，具体实现细节完全不同。所以 OpenClaw 选择不内建任何具体的 review 实现，而是提供 hook 让用户自己在 plugin 里定义。
+OpenClaw 在 code review 上的判断是：每个企业的「review 是什么」差异巨大：有的团队定义为 PR review（看 diff、提改进建议），有的定义为 commit review（看历史 commit、找回归 bug），有的定义为 lint review（自动跑 lint 工具、汇总报告），有的定义为安全 review（专门找注入、auth 漏洞），有的定义为 business logic review（检查代码符不符合业务规则）。
 
-实际写法是这样的：用户在 tool-policy-pipeline.ts（详见 04 章 §3）的 after_tool_call hook 里挂一个自己写的 reviewer middleware。每当模型用 fs.write 改完一个文件，middleware 拿到 `{ tool_name, args, result }`，跑一遍用户自定义的 reviewer prompt（可能是「检查这次修改有没有破坏既有测试」、「检查这段代码符不符合公司编码规范」、或者「检查有没有引入 SQL 注入」），结果作为下一轮 system message 注入到主 agent 的 context 里。这种「review 作为 pipeline 副作用而不是显式命令」的模式更适合企业自定义场景：团队可以根据自己的业务定义任何 review 逻辑，不用迁就平台提供的「标准 review 流程」。
+这些「review」共享的只是「另一个 agent 来检查」这个 meta 模式，具体实现细节完全不同。所以 OpenClaw 选择不内建任何具体的 review 实现，而是提供 hook 让用户自己在 plugin 里定义。
+
+实际写法是这样的：用户在 tool-policy-pipeline.ts（详见[工具系统](/patterns/04-tool-system/)）的 after_tool_call hook 里挂一个自己写的 reviewer middleware。
+
+每当模型用 fs.write 改完一个文件，middleware 拿到 `{ tool_name, args, result }`，跑一遍用户自定义的 reviewer prompt（可能是「检查这次修改有没有破坏既有测试」、「检查这段代码符不符合公司编码规范」、或者「检查有没有引入 SQL 注入」），结果作为下一轮 system message 注入到主 agent 的 context 里。
+
+这种「review 作为 pipeline 副作用而不是显式命令」的模式更适合企业自定义场景：团队可以根据自己的业务定义任何 review 逻辑，不用迁就平台提供的「标准 review 流程」。
 
 OpenClaw 这种选择跟它的整体定位完全一致：它是 agent 控制面而不是 coding 工具，给出 review 这种「业务定义高度可变」的功能任何 hardcode 都是错的，把灵活性留给用户。
 
@@ -226,11 +269,13 @@ OpenClaw 这种选择跟它的整体定位完全一致：它是 agent 控制面�
 
 Hermes 走的是最极简路线：既没有 /review 命令也没有 reviewer agent，整个项目里没有任何「code review」相关的代码。要 review，用户直接对 agent 说「看看刚才改的代码有没有问题」，agent 通过 terminal_tool 跑 `git diff` 拿到改动，然后在主对话里直接输出 review 内容。
 
-这种模式的好处是零基础设施：不用维护 reviewer agent、不用维护 prompt 模板、不用考虑 review target 的参数化。代价也很大：review 质量完全取决于用户写的 prompt 和模型当时的注意力。没有受约束的 system prompt 强制 reviewer 角色，模型可能跟 review 跑偏到「我帮你修一下吧」（直接动手改而不是给建议）。没有结构化输出格式，review 结果可能这次是 markdown bullet 下次是段落散文不一致。没有 4 种 target 的参数化，用户必须自己想清楚「我要 review 什么」并准确告诉 agent。
+这种模式的好处是零基础设施：不用维护 reviewer agent、不用维护 prompt 模板、不用考虑 review target 的参数化。代价也很大：review 质量完全取决于用户写的 prompt 和模型当时的注意力。没有受约束的 system prompt 强制 reviewer 角色，模型可能跟 review 跑偏到「我帮你修一下吧」（直接动手改而不是给建议）。
+
+没有结构化输出格式，review 结果可能这次是 markdown bullet 下次是段落散文不一致。没有 4 种 target 的参数化，用户必须自己想清楚「我要 review 什么」并准确告诉 agent。
 
 对 Hermes 的定位（多平台 chat agent，code review 不是核心场景）这种取舍是合理的：大部分用户跟 Hermes 聊的是日常事务而不是代码 review，给所有用户硬塞一个 reviewer 抽象层是不必要的复杂度。但如果有用户想用 Hermes 做认真的 code review，他得自己写完整的 prompt 加反复对齐 agent 行为，远不如直接用 Codex。
 
-## §4 · 四家在 code review 上的共同认知
+## Review 已经形成的共识
 
 虽然四家在 review 的工程深度上差距巨大（Codex 双层 sub-agent 对比 Hermes 零基础设施），但只要做了 review，三件事是共识。
 
@@ -240,7 +285,7 @@ Hermes 走的是最极简路线：既没有 /review 命令也没有 reviewer age
 
 **第三件是 reviewer 跑命令时不应该弹审批框**。Codex 显式设 AskForApproval::Never，Claude Code 本地版让 reviewer 只用 BashTool 跑只读命令，OpenClaw 让用户在 hook 里控制工具集，都遵循「reviewer 只读不写」的原则。这背后的考虑是 UX：用户的注意力本来在主 agent 上，被 reviewer 弹审批框打断会很烦。如果 reviewer 需要审批（说明它要做副作用操作），那它就不该是 reviewer，应该是另一个 agent。
 
-## §5 · 四家在 code review 上的关键分歧
+## 本地、远程与插件式审查怎么选
 
 <Diagram
   src="/diagrams/09-tradeoff.svg"
@@ -260,7 +305,7 @@ Hermes 走的是最极简路线：既没有 /review 命令也没有 reviewer age
 
 **如果你的 agent 跟 code review 没什么关系（chat agent、客服 agent），那 Hermes 的「不做 review」是合理的克制**。强行加 review 抽象层是过度工程。代价是真要 review 时质量没有保证，但这本来就不是核心场景。
 
-## §6 · 我的点评
+## 我的判断：生成者不该拥有最终裁决权
 
 <ScoreCard
   rows={[
@@ -273,7 +318,7 @@ Hermes 走的是最极简路线：既没有 /review 命令也没有 reviewer age
   headers={['系统', '评分', '亮点', '风险']}
 />
 
-## §7 · 自己实现 Code Review 系统的最佳实践
+## 从最小 Review 流程开始
 
 下面是从四家提炼的「自己写 reviewer agent」配方。先用 prompt 起步再抽成独立 sub-agent，最后避开五个常见死路。
 
@@ -302,7 +347,7 @@ Hermes 走的是最极简路线：既没有 /review 命令也没有 reviewer age
   ]}
 />
 
-## §8 · 四种 review 模型并列
+## 四条审查路径并列
 
 <Diagram
   src="/diagrams/09-review-flows.svg"
@@ -312,7 +357,7 @@ Hermes 走的是最极简路线：既没有 /review 命令也没有 reviewer age
 
 把 4 种放一起就能看清「另一个 agent 来检查」这个模式的演化：从「同对话塞 prompt」到「独立 sub-agent」到「远程 pipeline」到「pipeline 里的 hook」，深度逐渐增加。
 
-## §9 · 延伸阅读 / 源码入口
+## 沿着 Reviewer 入口读源码
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -331,14 +376,19 @@ Hermes 走的是最极简路线：既没有 /review 命令也没有 reviewer age
   ]}
 />
 
-## §10 · 小练习
+## 附录：练习与复盘
+
+<details id="interview-drill">
+<summary>按需展开练习和十道复盘题</summary>
+
+### 练习
 
 1. **🟢 写一段 `/review` prompt**：5 个固定 section（overview、quality、suggestions、risks、coverage），让模型在主对话里把自己切到 reviewer 模式。验证：同一段 diff 跑两遍输出格式一致。
 2. **🟠 独立 reviewer sub-agent**：用 LangGraph、openai-agents 这类框架，建一个独立 thread。受约束 config（不能 spawn 子 agent、不能改文件）。把 review target 参数化（uncommitted、branch、commit、custom）。
 3. **🟠 结构化 findings**：让 reviewer 输出 JSON schema：`{findings: [{severity, file, line, message, suggestion}]}`，下游可解析后高亮 IDE。
 4. **🔴 agent 审 agent**：实现一个 guardian 中间层：主 agent 想跑某个工具时，先把 `{tool, args}` 发给 guardian sub-agent，让它判 risk level 加给 decision。加 5s timeout 加 3 次连续 deny 触发 circuit breaker。
 
-## §11 · 面试题：10 道带答案的高频考点
+### 复盘题
 
 <details>
 <summary>**Q1 · 概念**：为什么 Codex 的 reviewer 是独立 sub-agent，而不是在主对话里塞 prompt？</summary>
@@ -975,4 +1025,6 @@ console.log(result.findings);  // 结构化 findings
 **源码组合**：Codex `tasks/review.rs:94-138` 加 `guardian/review.rs:1-200` 加 Claude Code `commands/review.ts:9-31` 加 OpenClaw `tool-policy-pipeline.ts`。把四家精华抽出来组装，就是 review framework v0.1。
 
 **追问**：「这个框架如何防止 review 自己出 bug？」答：每个 reviewer 也要被 review。Codex guardian 已经在审主 agent，同理 reviewer 也该被 audit。具体：跑 50 个已知 finding 的 diff 当 regression test，每次改 reviewer prompt 跑一遍，命中率掉了就 rollback。
+</details>
+
 </details>

@@ -14,18 +14,21 @@ import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## §1 · TL;DR
+## A sandbox limits side effects
 
 <Verdict tldr="Sandboxing is one of the most underestimated complexities in agent engineering. It is not a single thing summed up by «security», but a stack of capabilities: restrict filesystem reads/writes, restrict outbound network, block privilege escalation, restrict syscalls, restrict what privileges child processes can inherit. If any layer fails, the whole isolation falls; so building a sandbox means either writing every layer yourself (high effort, full control) or delegating to existing isolation infrastructure (low effort, you have to trust it). The four systems make four very different trade-offs on this fundamental choice. Codex takes the heaviest «write every layer ourselves» route. On Linux it combines three independent kernel capabilities: `bubblewrap` (a userspace sandbox CLI built on Linux namespaces) for filesystem mount isolation, `seccomp` (kernel-level syscall filter) for blocking network-related syscalls, and `landlock` (a process-scoped filesystem access-control mechanism in newer Linux kernels) as a backup FS layer. On macOS it uses `seatbelt` (`sandbox-exec`) with `.sb` policy files (Scheme-syntax sandbox profiles); on Windows it ships a dedicated crate. The isolation policy is applied to the current thread only (via `PR_SET_NO_NEW_PRIVS` bound to the calling thread rather than the whole process), so child processes inherit a precise isolation boundary without contaminating the CLI process. Claude Code treats the sandbox as a configuration surface. Every sandbox dimension is a JSON schema so IT admins can configure it in `settings.json`, network and filesystem are split into two independent schemas, and the project is refreshingly honest about a few weaker-security escape hatches it deliberately offers. For example, `enableWeakerNetworkIsolation` exists so Go-ecosystem CLI tools can verify TLS through MITM proxies (primarily for local HTTPS debugging). Most strikingly, a code comment literally states «this undocumented setting was added to unblock NVIDIA enterprise rollout; they want to enable `autoAllowBashIfSandboxed` (auto-allow bash once the process is already sandboxed) on macOS only, since the Linux sandbox is newer and less battle-tested», a level of engineering transparency that is very rare. OpenClaw treats the sandbox as an abstraction, not a technology. It splits the execution environment into 3 tiers via an `ExecHost` enum (`sandbox` runs in an isolated container, `gateway` runs in the gateway process, `node` runs in the main process node) and leaves the actual enforcement to the deployer (wire Docker, Firecracker microVMs, AWS Lambda; OpenClaw does not prescribe). The benefit is total decoupling between agent logic and isolation tech; the cost is no out-of-the-box sandbox. Hermes goes the furthest: no application-layer sandboxing at all, delegating isolation to one of 6 containerisation options via a single `TERMINAL_ENV` environment variable (`local` with no isolation, `docker`, `singularity` HPC container, `modal` serverless cloud, `daytona` dev-as-a-service, `ssh`), each with its own independent image / CPU / memory / disk / persistence config knobs. Security-critical desktop agent? Codex's three-layer stack is the floor. Enterprise IDE deployment? Claude Code's schema is the reference. SaaS? OpenClaw / Hermes outsourcing the sandbox to containers or remote infrastructure is the engineering-grade choice." />
 
-## §2 · Reference architecture
+## Four isolation models
 
-:::tip[Key takeaways · 30-second read]
+<details>
+<summary>Before reading (optional)</summary>
+
 - **A sandbox is a stack, not a switch**: filesystem, network, privilege escalation, syscalls, child-process inheritance — if any layer fails, the whole isolation falls.
 - **Four positions on the in-house-vs-outsource spectrum**: Codex writes every layer itself (bubblewrap + seccomp + landlock, seatbelt on macOS); Claude Code makes it a JSON schema with honest escape hatches like `enableWeakerNetworkIsolation`; OpenClaw abstracts to 3 `ExecHost` tiers; Hermes delegates to 6 backends via one `TERMINAL_ENV` variable.
 - **Where you apply the policy determines what inherits it**: Codex binds `PR_SET_NO_NEW_PRIVS` to the calling thread only, so children get a precise boundary without contaminating the CLI process.
 - **Pick the spectrum position before writing code**: desktop security demands Codex's in-house three-layer floor; SaaS should outsource isolation to containers or remote infrastructure.
-:::
+
+</details>
 
 <Diagram
   src="/diagrams/13-sandbox-execution-base.svg"
@@ -40,18 +43,22 @@ How the four systems cover five sandbox-critical concerns:
     { label: 'Sandbox infrastructure', values: ['Linux: bubblewrap + seccomp + landlock; macOS: seatbelt; Windows: separate crate', 'macOS: seatbelt; Linux: newer (introduced for the NVIDIA enterprise rollout); optional `enabledPlatforms` restricts where sandbox starts', '`ExecHost` 3 backends: sandbox / gateway / node, with sandbox routed to an external container', '6 backends: local / docker / singularity / modal / daytona / ssh; toggled via TERMINAL_ENV'] },
     { label: 'Filesystem isolation', values: ['`PermissionProfile.file_system`: writable_roots / read_only / full; bubblewrap actually enforces', '`SandboxFilesystemConfig`: allowWrite / denyWrite / denyRead / allowRead / allowManagedReadPathsOnly', 'Decided by the backend process (sandbox host = container isolation)', 'Container isolation naturally separates the host fs; optional `TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE` maps cwd to /workspace'] },
     { label: 'Network isolation', values: ['seccomp filter blocks connect() / sendto(); managed proxy can be carved out', '`SandboxNetworkConfig`: allowedDomains / allowUnixSockets / httpProxyPort / socksProxyPort; macOS-only allowUnixSockets', 'Decided by backend / network policy', 'Container network-mode controls; ssh routes through real remote network'] },
-    { label: 'Permission model', values: ['`PR_SET_NO_NEW_PRIVS` + seccomp BPF; applied to the current thread, inherited by child', 'allowedDomains merge with permission rules; managed-only mode ignores user-layer rules', 'Per-binary `SafeBinProfile` (chapter 07 §3) + ExecHost isolation', 'Relies on backend isolation (container / VM / SSH); no app-level seccomp / landlock'] },
+    { label: 'Permission model', values: ['`PR_SET_NO_NEW_PRIVS` + seccomp BPF; applied to the current thread, inherited by child', 'allowedDomains merge with permission rules; managed-only mode ignores user-layer rules', 'Per-binary `SafeBinProfile` (covered in Shell Execution) + ExecHost isolation', 'Relies on backend isolation (container / VM / SSH); no app-level seccomp / landlock'] },
     { label: 'Failure handling', values: ['Sandbox failure -> SandboxErr; upstream decides fail_open / fail_closed', '`failIfUnavailable: true` -> fail at startup; false -> warn and run unsandboxed', 'Backend spawn failure -> falls back to approval', 'Backend unavailable -> prompt user to switch TERMINAL_ENV'] },
   ]}
   caption="How sophisticated each system treats sandboxing"
   dimensionLabel="Dimension"
 />
 
-## §3 · How each system does it
+## How four systems implement sandboxes
 
 ### Codex · On Linux, combining three independent kernel isolation capabilities, each doing what it does best
 
-Codex is the only system among the four that chooses the "write every layer yourself" route. Its reasoning: every operating system offers several distinct isolation capabilities, each focused on a different problem class (filesystem, network, syscalls), and combining them can be more precise than any single solution. The cost is having to write a separate code path for each platform (one for Linux, one for macOS, one for Windows); the payoff is a genuinely trustworthy isolation boundary.
+Codex is the only system among the four that chooses the "write every layer yourself" route.
+
+Its reasoning: every operating system offers several distinct isolation capabilities, each focused on a different problem class (filesystem, network, syscalls), and combining them can be more precise than any single solution.
+
+The cost is having to write a separate code path for each platform (one for Linux, one for macOS, one for Windows); the payoff is a genuinely trustworthy isolation boundary.
 
 On Linux, Codex stacks three independent kernel capabilities, each doing what it does best:
 
@@ -112,13 +119,21 @@ Each of the three layers plays a specific role:
 
 **landlock** is a Linux Security Module introduced in Linux 5.13+, also for filesystem access control, but a newer kernel mechanism than bubblewrap. Codex treats it as a legacy/backup layer, with the main path still on bubblewrap, mainly because bubblewrap also runs on older kernels, giving better compatibility coverage.
 
-There is a comment in the code about a trade-off that is worth reading carefully: the `PR_SET_NO_NEW_PRIVS` prctl is a hard prerequisite for enabling seccomp (the kernel requires it: "if you want to install a syscall filter, you must promise that this process and its descendants can never gain new privileges through setuid"), but that promise also defeats setuid promotion, and many bubblewrap deployments rely on setuid so unprivileged users can create namespaces. Codex handles this conservatively: it sets `PR_SET_NO_NEW_PRIVS` only when seccomp is genuinely needed or when landlock filesystem isolation is in play, and skips it otherwise so the bwrap setuid path still works. This is a textbook "security vs compatibility" engineering balance, handled with restraint.
+There is a comment in the code about a trade-off that is worth reading carefully: the `PR_SET_NO_NEW_PRIVS` prctl is a hard prerequisite for enabling seccomp (the kernel requires it: "if you want to install a syscall filter, you must promise that this process and its descendants can never gain new privileges through setuid"), but that promise also defeats setuid promotion, and many bubblewrap deployments rely on setuid so unprivileged users can create namespaces.
 
-For cross-platform breakdown: Linux uses the `linux-sandbox/` crate plus the bubblewrap binary; macOS uses `sandbox-exec` (the so-called "seatbelt") with `.sb` policy files, riding on the macOS native sandboxing mechanism; Windows ships a dedicated `windows-sandbox-rs/` crate paired with setuid user management.
+Codex handles this conservatively: it sets `PR_SET_NO_NEW_PRIVS` only when seccomp is genuinely needed or when landlock filesystem isolation is in play, and skips it otherwise so the bwrap setuid path still works.
+
+This is a textbook "security vs compatibility" engineering balance, handled with restraint.
+
+For cross-platform breakdown: Linux uses the `linux-sandbox/` crate plus the bubblewrap binary; macOS uses `sandbox-exec` (the so-called "seatbelt") with `.sb` policy files, riding on the macOS native sandboxing mechanism;
+
+Windows ships a dedicated `windows-sandbox-rs/` crate paired with setuid user management.
 
 ### Claude Code · Make the sandbox a JSON schema that IT admins can configure precisely
 
-Claude Code's trade-off on sandboxing is completely different from Codex. It argues the real hard part is not the low-level tech (reuse Codex's or the OS-native capability), but enabling IT admins to configure sandbox behaviour precisely in enterprise deployments. Concretely: model the whole sandbox as a JSON schema and let admins configure it declaratively in settings.json:
+Claude Code's trade-off on sandboxing is completely different from Codex. It argues the real hard part is not the low-level tech (reuse Codex's or the OS-native capability), but enabling IT admins to configure sandbox behaviour precisely in enterprise deployments.
+
+Concretely: model the whole sandbox as a JSON schema and let admins configure it declaratively in settings.json:
 
 <SourceBlock path="REF/claude-code-2.1.88-expanded/src/entrypoints/sandboxTypes.ts" lines="90-145" system="claude" summary="SandboxSettings top-level: enabled + failIfUnavailable + platform restrictions + weaker-mode fallbacks">
 
@@ -172,27 +187,55 @@ export const SandboxSettingsSchema = lazySchema(() =>
 
 Two annotations in this schema deserve special attention, because they show levels of engineering transparency rare in production code:
 
-The first is the `enabledPlatforms` field, with a comment that literally states: "This setting is undocumented, read via .passthrough(), and was added to unblock NVIDIA enterprise rollout; they want to enable autoAllowBashIfSandboxed on macOS first, since the Linux/WSL sandbox is newer and less battle-tested." Translation: NVIDIA's IT team approached the Claude Code team and said "we want to roll Claude Code out to engineers, but we are only confident in the macOS sandbox right now, the Linux one is too new; give us a knob to flip macOS on first and leave Linux off". The Claude Code team did not push back with "the Linux sandbox is fine, you should trust it". Instead they added a config knob, but on purpose did not document it (to avoid muddying the matrix for other users). This kind of "carve a path for a specific enterprise customer's specific concern" is exactly how real enterprise software works, but very rarely does the code admit it in plain text.
+The first is the `enabledPlatforms` field, with a comment that literally states: "This setting is undocumented, read via .passthrough(), and was added to unblock NVIDIA enterprise rollout; they want to enable autoAllowBashIfSandboxed on macOS first, since the Linux/WSL sandbox is newer and less battle-tested." Translation: NVIDIA's IT team approached the Claude Code team and said "we want to roll Claude Code out to engineers, but we are only confident in the macOS sandbox right now, the Linux one is too new; give us a knob to flip macOS on first and leave Linux off".
 
-The second is `enableWeakerNetworkIsolation`. The comment is honest to the point of bluntness: "Allow access to com.apple.trustd.agent in the sandbox. Needed for Go tools (gh, gcloud, terraform) to verify TLS via an MITM proxy with a custom CA. Reduces security, opens a potential data exfiltration vector through the trustd service. Default: false." Translation: lots of enterprises put corporate certs into an MITM proxy so they can inspect outbound traffic, but Go's TLS stack will not trust the cert unless it can talk to macOS's trustd service. So the Claude Code team added a knob to allow it, while explicitly noting "this weakens security and opens an exfiltration vector". It does not pretend this is "safe". It tells the user "you have made a security trade-off; make sure you know what it is".
+The Claude Code team did not push back with "the Linux sandbox is fine, you should trust it". Instead they added a config knob, but on purpose did not document it (to avoid muddying the matrix for other users).
 
-Beyond these two design highlights, Claude Code splits network and filesystem into two completely independent schemas: network has dimensions like `allowedDomains` (which domains are reachable), `allowManagedDomainsOnly` (only use the admin-set allowlist, ignore the user's), `allowUnixSockets` (whether Unix sockets are usable), `httpProxyPort` / `socksProxyPort` (proxy ports); filesystem has dimensions like `allowWrite` / `denyWrite` (writable / non-writable paths), `denyRead` / `allowRead` (readable / non-readable paths), `allowManagedReadPathsOnly` (the same admin-only attitude). These two "Managed Only" knobs carry a very stern management-plane stance: when they are on, every user-level setting is ignored, only the admin's `policySettings` count. This kind of "I, the IT admin, can rip the steering wheel out of the user's hands" capability is the floor of any enterprise deployment.
+This kind of "carve a path for a specific enterprise customer's specific concern" is exactly how real enterprise software works, but very rarely does the code admit it in plain text.
+
+The second is `enableWeakerNetworkIsolation`. The comment is honest to the point of bluntness: "Allow access to com.apple.trustd.agent in the sandbox.
+
+Needed for Go tools (gh, gcloud, terraform) to verify TLS via an MITM proxy with a custom CA. Reduces security, opens a potential data exfiltration vector through the trustd service.
+
+Default: false." Translation: lots of enterprises put corporate certs into an MITM proxy so they can inspect outbound traffic, but Go's TLS stack will not trust the cert unless it can talk to macOS's trustd service.
+
+So the Claude Code team added a knob to allow it, while explicitly noting "this weakens security and opens an exfiltration vector". It does not pretend this is "safe".
+
+It tells the user "you have made a security trade-off; make sure you know what it is".
+
+Beyond these two design highlights, Claude Code splits network and filesystem into two completely independent schemas: network has dimensions like `allowedDomains` (which domains are reachable), `allowManagedDomainsOnly` (only use the admin-set allowlist, ignore the user's), `allowUnixSockets` (whether Unix sockets are usable), `httpProxyPort` / `socksProxyPort` (proxy ports); filesystem has dimensions like `allowWrite` / `denyWrite` (writable / non-writable paths), `denyRead` / `allowRead` (readable / non-readable paths), `allowManagedReadPathsOnly` (the same admin-only attitude).
+
+These two "Managed Only" knobs carry a very stern management-plane stance: when they are on, every user-level setting is ignored, only the admin's `policySettings` count.
+
+This kind of "I, the IT admin, can rip the steering wheel out of the user's hands" capability is the floor of any enterprise deployment.
 
 ### OpenClaw · Sandbox is an abstract enum, not a specific technology; the deployer decides the implementation
 
-OpenClaw's trade-off is more radical than the previous two. It directly argues the sandbox should not be the agent framework's concern at all. Reasoning: different deployment environments use wildly different isolation technologies (Docker, Firecracker, gVisor, Lambda Functions, custom container runtimes), and an agent framework hard-coding one of them constrains its deployment flexibility. So OpenClaw introduces a single enum to abstract the execution environment:
+OpenClaw's trade-off is more radical than the previous two. It directly argues the sandbox should not be the agent framework's concern at all.
+
+Reasoning: different deployment environments use wildly different isolation technologies (Docker, Firecracker, gVisor, Lambda Functions, custom container runtimes), and an agent framework hard-coding one of them constrains its deployment flexibility.
+
+So OpenClaw introduces a single enum to abstract the execution environment:
 
 ```ts
 export type ExecHost = "sandbox" | "gateway" | "node";
 ```
 
-These three values represent three execution tiers: `sandbox` runs commands in an isolated execution environment (the deployer decides whether that means Docker, Firecracker, or Lambda; OpenClaw does not prescribe); `gateway` runs in the gateway process itself, suitable for very lightweight operations like reading a file; `node` runs directly on the host node, suitable for fully trusted operations like reading git info.
+These three values represent three execution tiers: `sandbox` runs commands in an isolated execution environment (the deployer decides whether that means Docker, Firecracker, or Lambda;
 
-This approach has clear benefits and costs. The benefit is total decoupling between sandbox implementation and agent logic: you can deploy OpenClaw inside Docker on a developer laptop, behind Firecracker microVMs on a serverless platform, in vanilla LXC on traditional servers; the agent logic itself does not care. The cost is that OpenClaw does not ship a working sandbox. The deployer has to bring their own isolation infrastructure, otherwise that `sandbox` execution mode is just an empty enum value with no actual isolation. This is a typical "framework vs product" trade-off: OpenClaw positions itself as a framework, leaving operational details to the deployer.
+OpenClaw does not prescribe); `gateway` runs in the gateway process itself, suitable for very lightweight operations like reading a file; `node` runs directly on the host node, suitable for fully trusted operations like reading git info.
+
+This approach has clear benefits and costs. The benefit is total decoupling between sandbox implementation and agent logic: you can deploy OpenClaw inside Docker on a developer laptop, behind Firecracker microVMs on a serverless platform, in vanilla LXC on traditional servers; the agent logic itself does not care.
+
+The cost is that OpenClaw does not ship a working sandbox. The deployer has to bring their own isolation infrastructure, otherwise that `sandbox` execution mode is just an empty enum value with no actual isolation.
+
+This is a typical "framework vs product" trade-off: OpenClaw positions itself as a framework, leaving operational details to the deployer.
 
 ### Hermes · Don't sandbox at all; delegate isolation entirely to one of 6 containerization options
 
-Hermes pushes "don't write your own sandbox" further than OpenClaw. It does not even try to do application-layer sandboxing, instead delegating all isolation to one of 6 containerization options via a single environment variable, `TERMINAL_ENV`. The user picks the right backend for their deployment scenario, and Hermes adapts. The six backends cover almost every realistic deployment shape:
+Hermes pushes "don't write your own sandbox" further than OpenClaw. It does not even try to do application-layer sandboxing, instead delegating all isolation to one of 6 containerization options via a single environment variable, `TERMINAL_ENV`.
+
+The user picks the right backend for their deployment scenario, and Hermes adapts. The six backends cover almost every realistic deployment shape:
 
 <SourceBlock path="REF/hermes-agent/tools/terminal_tool.py" lines="765-820" system="hermes" summary="TERMINAL_ENV 6 backends + per-backend config: image / cpu / memory / disk / persistent">
 
@@ -238,11 +281,17 @@ Each backend is good at something different and is the right answer for a differ
 
 **local** means no isolation at all: every command runs directly on the developer's machine, the fastest path, suitable when the developer trusts the agent fully (typically during development or experimentation). **docker** is local Docker. Hermes spins up a Docker container on the developer's machine and runs commands inside it, providing reasonable isolation (the agent cannot directly touch host files unless mounted explicitly) and reproducibility (the same image always gives the same environment); this is the most common deployment for production. **singularity** is the standard container format in HPC environments (research clusters). Singularity is preferred over Docker on academic clusters because it does not require root, and most research lab settings use this backend. **modal** is Modal.com's serverless container service. Hermes spins up modal containers on demand to run commands and shuts them down after, suited for burst workloads and pay-per-use cost. **daytona** is the Daytona.io dev-environment-as-a-service: every developer gets a remote-dev environment, agents run inside it. **ssh** is the most aggressive. Hermes connects to a remote machine over SSH and executes commands there, with even the agent itself running remotely.
 
-Each backend has 5 independent config dimensions: `image` (container image, defaults to a Python+Node base, covering most agent needs), `cpu` (CPU limit, defaults to 1 core), `memory` (memory limit, defaults to 5GB), `disk` (disk limit, defaults to 50GB), `persistent` (whether to persist the container between commands). That last one deserves special attention. When `TERMINAL_CONTAINER_PERSISTENT=true` (the default), one session reuses one container across multiple commands so startup cost is paid once; when `false`, every command spins up a fresh container, far stronger isolation (commands cannot influence each other's side effects), at the cost of paying startup overhead every time.
+Each backend has 5 independent config dimensions: `image` (container image, defaults to a Python+Node base, covering most agent needs), `cpu` (CPU limit, defaults to 1 core), `memory` (memory limit, defaults to 5GB), `disk` (disk limit, defaults to 50GB), `persistent` (whether to persist the container between commands).
 
-Another detail is `mount_docker_cwd`. It defaults to off, meaning by default Hermes does not mount the host's current working directory into the container, so the agent inside the container cannot directly touch the developer's working files. Only when the user explicitly sets `TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true` does the host's `/Users/xxx/repo` get mounted at `/workspace` inside the container. This is a textbook "secure-by-default + opt-in convenience" design: the safe behaviour is the default, and the convenient behaviour requires deliberate opt-in.
+That last one deserves special attention. When `TERMINAL_CONTAINER_PERSISTENT=true` (the default), one session reuses one container across multiple commands so startup cost is paid once; when `false`, every command spins up a fresh container, far stronger isolation (commands cannot influence each other's side effects), at the cost of paying startup overhead every time.
 
-## §4 · What the four systems agree on
+Another detail is `mount_docker_cwd`. It defaults to off, meaning by default Hermes does not mount the host's current working directory into the container, so the agent inside the container cannot directly touch the developer's working files.
+
+Only when the user explicitly sets `TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=true` does the host's `/Users/xxx/repo` get mounted at `/workspace` inside the container.
+
+This is a textbook "secure-by-default + opt-in convenience" design: the safe behaviour is the default, and the convenient behaviour requires deliberate opt-in.
+
+## What isolation layers already agree on
 
 Despite very different stances, there are three points all four systems agree on. These shared decisions reflect inescapable constraints of sandbox engineering; anyone trying to skip them eventually pays for it.
 
@@ -252,7 +301,7 @@ Despite very different stances, there are three points all four systems agree on
 
 **The third agreement is to be honest about platform differences.** None of the four systems pretends "the same sandbox code runs everywhere". Codex maintains three different code paths for Linux, macOS, and Windows; Claude Code introduces `enabledPlatforms` to let admins selectively enable per platform; Hermes covers different deployment shapes via 6 backends; OpenClaw delegates the platform problem to the deployer. The reason this matters: sandbox technology is deeply OS-specific (bubblewrap is Linux-only, seatbelt is macOS-only, Windows is yet another world entirely), and pretending it can be hidden behind a unified abstraction leads to "the macOS sandbox works in tests but a real Linux deployment surprises us" disasters. Confronting it head-on, with platform differences treated as first-class concerns, is far more robust.
 
-## §5 · Where the four diverge most sharply
+## Trade kernel primitives against configuration and backends
 
 <Diagram
   src="/diagrams/13-tradeoff.svg"
@@ -270,7 +319,7 @@ While the agreements above represent the floor, the divergences show how the fou
 
 **If you are building an agent framework rather than an agent product, OpenClaw's ExecHost abstraction is worth borrowing.** The reasoning: a framework cannot prescribe the deployer's isolation infrastructure. Different deployers will pick different technologies (Docker, Firecracker, Lambda, custom containers), and the framework's job is to provide a clean abstraction so all of these can plug in. OpenClaw's ExecHost is exactly this: a 3-tier enum, plug in whatever you have.
 
-## §6 · My takeaway
+## My take: isolate by default, open with evidence
 
 <ScoreCard
   rows={[
@@ -283,7 +332,7 @@ While the agreements above represent the floor, the divergences show how the fou
   headers={['System', 'Score', 'Strengths', 'Risks']}
 />
 
-## §7 · Build recipe
+## Build the smallest execution sandbox
 
 Below is the recipe distilled from the four systems for writing your own sandbox execution. Lay solid foundations first, then add production-grade features, finally avoid five common dead ends.
 
@@ -315,7 +364,7 @@ Below is the recipe distilled from the four systems for writing your own sandbox
   ]}
 />
 
-## §8 · Four sandbox approaches side by side
+## Four sandbox paths side by side
 
 <Diagram
   src="/diagrams/13-sandbox-flows.svg"
@@ -325,7 +374,7 @@ Below is the recipe distilled from the four systems for writing your own sandbox
 
 Lined up, the "who owns sandbox implementation" answer differs sharply: Codex builds it, Claude Code lets IT configure it, OpenClaw lets the host decide, Hermes ships it to containers / remote backends.
 
-## §9 · Further reading / source entry points
+## Follow isolation boundaries through source
 
 <SourceTrail
   title="Further reading / source entry points"
@@ -345,14 +394,19 @@ Lined up, the "who owns sandbox implementation" answer differs sharply: Codex bu
   ]}
 />
 
-## §10 · Exercises
+## Appendix: exercises and review
+
+<details id="interview-drill">
+<summary>Open the exercises and ten review questions</summary>
+
+### Exercises
 
 1. **Easy**: run `echo` under bubblewrap. Write a script using `bwrap --ro-bind /usr /usr --tmpfs /tmp -- echo hi` to verify basic isolation.
 2. **Medium**: block `connect()` via seccomp. Write a Python program using `python-prctl` + a seccomp filter to block `connect(2)`. Verify: `curl example.com` fails, `ls /tmp` succeeds.
 3. **Medium**: multi-backend dispatch. Implement `run_terminal(cmd, env_type)` with env_type in `{local, docker, ssh}`. docker uses `docker run`, ssh uses `ssh user@host`. Verify: when env_type=docker, `pwd` returns the container path.
 4. **Hard**: enabledPlatforms gating. Implement `should_enable_sandbox(settings)` so the sandbox is enabled only when the current platform is in `settings.enabledPlatforms`. Verify: enabledPlatforms=["macos"] returns false on Linux.
 
-## §11 · Interview drill: 10 questions with worked answers
+### Review questions
 
 <details>
 <summary>**Q1 · Concept**: bubblewrap, seccomp, and landlock - what's each tool's boundary?</summary>
@@ -385,7 +439,9 @@ Three layers stacked, each defends a different escape path. If bwrap is bypassed
 
 This is the classic "knob with a cost" design. Concrete scenario:
 
-Go tools (gh / gcloud / terraform / aws-cli) in a sandbox using MITM proxy + custom CA need `com.apple.trustd.agent` (macOS system service) to validate TLS certificates. But trustd itself can be abused for data exfiltration (forwarding malicious payloads through Apple system services).
+Go tools (gh / gcloud / terraform / aws-cli) in a sandbox using MITM proxy + custom CA need `com.apple.trustd.agent` (macOS system service) to validate TLS certificates.
+
+But trustd itself can be abused for data exfiltration (forwarding malicious payloads through Apple system services).
 
 **Claude Code's choice:**
 
@@ -396,7 +452,9 @@ Neither is perfect. So it ships as `enableWeakerNetworkIsolation` config + comme
 
 **The essence of this design:**
 
-Doesn't pretend "one config switch fixes everything." Acknowledges trade-offs exist, lets users make the call explicitly. The comment lives in the Zod schema; when docs auto-generate, the warning syncs into settings.json hover hints in the IDE.
+Doesn't pretend "one config switch fixes everything." Acknowledges trade-offs exist, lets users make the call explicitly.
+
+The comment lives in the Zod schema; when docs auto-generate, the warning syncs into settings.json hover hints in the IDE.
 
 Similar "weaker" knobs: `enableWeakerNestedSandbox` (allows nested sandboxes, bypassing some restrictions). Both prefixed with "weaker" so IDE auto-completion flags them as security-sensitive at a glance.
 
@@ -488,7 +546,9 @@ Other main-process threads (event loop / IPC / logging) aren't affected by secco
 
 **2. PR_SET_NO_NEW_PRIVS cost.**
 
-seccomp requires `PR_SET_NO_NEW_PRIVS` to be set first, which blocks setuid escalation. But bubblewrap itself is a setuid binary (depends on escalation for user namespace mount). So Codex must let bwrap run first, then apply seccomp in bwrap's child. If seccomp applies in main process:
+seccomp requires `PR_SET_NO_NEW_PRIVS` to be set first, which blocks setuid escalation. But bubblewrap itself is a setuid binary (depends on escalation for user namespace mount).
+
+So Codex must let bwrap run first, then apply seccomp in bwrap's child. If seccomp applies in main process:
 
 - main process can't setuid → bwrap fails to launch → chain breaks
 - or: main process starts bwrap later but bwrap already handled prctl
@@ -871,4 +931,6 @@ Borrow Claude Code `failIfUnavailable` + Codex `SandboxErr`.
 **Follow-up**: "Cross-language sharing?" Schema in JSON Schema, codegen types; backend implementations per-language (Rust writes Codex bubblewrap wrapper, Python writes Hermes docker wrapper). Protocol shared across languages, implementations stay independent.
 
 **Source mosaic**: Codex `linux-sandbox/` → Claude Code `entrypoints/sandboxTypes.ts` → OpenClaw `infra/exec-host.ts` → Hermes `tools/terminal_tool.py`. Combine all four = sandbox framework v0.1.
+</details>
+
 </details>

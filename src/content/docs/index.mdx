@@ -3,136 +3,114 @@ title: Harness Architecture
 description: 从 Codex、Claude Code、OpenClaw、Hermes 四个真实系统里，拆出做 agent 绕不开的两件事：循环工程和图工程
 template: splash
 hero:
-  tagline: 做 agent 绕不开两件事：一个循环怎么跑得稳（Loop Engineering），多个节点怎么组织起来干活（Graph Engineering）。这个站用 Codex、Claude Code、OpenClaw、Hermes 四个真实系统的源码来回答，不用玩具示例。
-  image:
-    alt: Codex、Claude Code、OpenClaw、Hermes 四个 agent harness 的并排对比图
-    file: ../../assets/homepage-editorial-proofwall.png
+  tagline: 别从选框架开始。先回答：循环怎么停，失败怎么恢复，多个节点怎么分工。这里用 Codex、Claude Code、OpenClaw、Hermes 四套真实系统的源码给答案。
   actions:
-    - text: 读 01 总览
-      link: /patterns/01-overview/
+    - text: 先看 Loop Engineering
+      link: /concepts/loop-engineering/
       icon: right-arrow
       variant: primary
-    - text: 23 · Loop Engineering
-      link: /concepts/loop-engineering/
-      variant: minimal
-    - text: 24 · Graph Engineering
+    - text: 再看 Graph Engineering
       link: /concepts/graph-engineering/
       variant: minimal
 ---
 
-import LandingKinetics from '@components/LandingKinetics.astro';
+import Diagram from '@components/Diagram.astro';
 
-<div className="aap-landing" data-world="editorial-interference">
-  <div className="aap-lens" aria-hidden="true">
-    <span data-home-theme>paper</span>
-  </div>
-
-  <section className="aap-home-strip" aria-label="首页状态">
-    <span>loop / graph / four systems</span>
-    <span data-home-theme>paper mode</span>
-    <span data-home-frame>frame 0000</span>
-    <span>scroll <b data-home-scroll>0%</b></span>
+<div className="aap-landing" data-world="field-notes">
+  <section className="aap-opening-note" aria-labelledby="aap-opening-title">
+    <div>
+      <p className="aap-kicker">先看失败</p>
+      <h2 id="aap-opening-title">Agent 的主循环十行就够。真正难的是让第十一轮仍然可信。</h2>
+      <p className="aap-lede">
+        模型会说自己做完了，也会在同一个错误上重试二十次。生产级 harness 的价值，不是再包一层 prompt，而是把停止、恢复、验证、权限和状态归属做成可以检查的工程事实。
+      </p>
+    </div>
+    <aside className="aap-thesis" aria-label="本站回答的三个问题">
+      <span>本站只追三个问题</span>
+      <ol>
+        <li><strong>怎么停</strong>谁来判断完成，预算耗尽时怎么办？</li>
+        <li><strong>怎么续</strong>进程挂掉以后，哪些状态能重放？</li>
+        <li><strong>怎么拆</strong>模型、代码和人分别拥有哪一段工作？</li>
+      </ol>
+      <a className="aap-text-link" href="/patterns/01-overview/">10 分钟看完整地图 →</a>
+    </aside>
   </section>
 
-  <section className="aap-signal-section" aria-labelledby="aap-signal-title">
-    <div className="aap-signal-copy">
-      <p className="aap-kicker">这个站讲什么</p>
-      <h2 id="aap-signal-title">Agent 的主循环只有十行，剩下的全是工程。</h2>
-      <div className="aap-copy-line">
-        写一个能跑的 agent 半小时就够。让它在生产环境活下来，要回答一串具体问题：循环什么时候停、错误塞什么回上下文、断电之后怎么续、活儿大了怎么拆给多个节点、人在哪一步进来审批。这个站不给"最佳实践"清单，给的是四个真实系统对这些问题的原始答案——源码、常量、注释里留下的线上事故数据。
-      </div>
-    </div>
-    <div className="aap-proof-card" aria-label="页面设计规则">
-      <span className="aap-proof-mark">02</span>
-      <p>两个方法章基于一手调研：clone 的代码库带 commit 号，论文带 arXiv 编号。</p>
-      <p>每条结论都能顺着链接找到出处：源码行号、论文或代码注释。</p>
-    </div>
-  </section>
-
-  <section className="aap-proof-section" aria-labelledby="aap-proof-title">
+  <section className="aap-route-section" aria-labelledby="aap-route-title">
     <div className="aap-section-head">
-      <p className="aap-kicker">阅读路线</p>
-      <h2 id="aap-proof-title">两个概念，一张地图，四份证据。</h2>
+      <p className="aap-kicker">按问题进入</p>
+      <h2 id="aap-route-title">不必从第一章顺着读。</h2>
+      <p>先选你正在撞的墙。方法章给判断框架，总览给全局地图，22 个专题留作遇到具体问题时查证。</p>
     </div>
-    <ol className="aap-magazine-contents">
-      <li>
-        <span className="aap-row-num">01</span>
-        <div>
-          <h3><a href="/patterns/01-overview/">22 章逐项拆解</a></h3>
-          <p>从总览开始，把 agent 工程拆成 22 个具体问题：loop 怎么停、patch 怎么打、shell 怎么隔离、权限怎么分层。每章四个系统横向对照。</p>
-        </div>
-        <i></i>
-        <strong data-count="22">00</strong>
-      </li>
-      <li>
-        <span className="aap-row-num">02</span>
-        <div>
-          <h3><a href="/concepts/loop-engineering/">23 · Loop Engineering</a></h3>
-          <p>一个 agent 内部：停止条件、预算、错误压缩、事件日志、验证器。裸循环的四种死法，和五个部件怎么救。</p>
-        </div>
-        <i></i>
-        <strong data-count="23">00</strong>
-      </li>
-      <li>
-        <span className="aap-row-num">03</span>
-        <div>
-          <h3><a href="/concepts/graph-engineering/">24 · Graph Engineering</a></h3>
-          <p>多个节点之间：哪段活给模型、哪段给代码、哪段给人，边上带什么、状态归谁、怎么防失控。重点是组织工作，不是某个图框架。</p>
-        </div>
-        <i></i>
-        <strong data-count="24">00</strong>
-      </li>
-      <li>
-        <span className="aap-row-num">04</span>
-        <div>
-          <h3><a href="/skill/">带走一份 Skill</a></h3>
-          <p>读完的结论压成可加载的工作手册：铁律、选型表、scaffold、诊断脚本。下次开工直接用，不用回来翻。</p>
-        </div>
-        <i></i>
-        <strong data-count="10">00</strong>
-      </li>
-    </ol>
+    <div className="aap-route-grid">
+      <a className="aap-route-card" href="/concepts/loop-engineering/">
+        <span>23 / 单个 Agent</span>
+        <h3>Loop Engineering</h3>
+        <p>停止条件、预算、错误压缩、事件日志和 verifier。适合「为什么它一直跑不稳」。</p>
+      </a>
+      <a className="aap-route-card" href="/concepts/graph-engineering/">
+        <span>24 / 多个节点</span>
+        <h3>Graph Engineering</h3>
+        <p>节点、边、状态所有权和人工审批。适合「为什么一拆成多 agent 就失控」。</p>
+      </a>
+      <a className="aap-route-card" href="/patterns/01-overview/">
+        <span>01 / 全局地图</span>
+        <h3>四系统总览</h3>
+        <p>Codex、Claude Code、OpenClaw、Hermes 的定位、边界和适用场景。</p>
+      </a>
+    </div>
   </section>
 
-  <section className="aap-system-section" aria-labelledby="aap-system-title">
+  <section className="aap-evidence-section" aria-labelledby="aap-evidence-title">
     <div className="aap-section-head">
-      <p className="aap-kicker">证据来源</p>
-      <h2 id="aap-system-title">四个真实系统，四种答案。</h2>
+      <p className="aap-kicker">一张图，一个判断</p>
+      <h2 id="aap-evidence-title">先决定你要可控，还是要自治。</h2>
+      <p>这不是排行榜。四个系统分布在同一条取舍轴上：越靠左，越强调每一步可审计；越靠右，越愿意用跨会话记忆换长期自治。</p>
     </div>
-    <div className="aap-system-grid">
-      <a className="aap-system-tile aap-system-codex aap-magnetic" href="/systems/codex/">
+    <Diagram
+      src="/diagrams/01-overview-base.svg"
+      alt="四个 Agent 系统在短期可控性到长期自治度轴上的分布"
+      caption="同一条轴，四种产品判断。没有综合最优，只有与你的失败成本相匹配。"
+      wide={true}
+      minWidth={720}
+    />
+  </section>
+
+  <section className="aap-systems-section" aria-labelledby="aap-systems-title">
+    <div className="aap-section-head">
+      <p className="aap-kicker">四份源码证据</p>
+      <h2 id="aap-systems-title">别学它们的外形，学它们的判断。</h2>
+    </div>
+    <div className="aap-system-list">
+      <a className="aap-system-row" href="/systems/codex/">
         <span>Codex</span>
-        <strong>循环拆成事件机，每步落盘可重放</strong>
-        <em>Rust workspace / local + cloud agent</em>
+        <strong>不信模型自评，把 loop 做成可重放事件机</strong>
+        <small>适合必须由测试和 patch 验证的 coding 场景</small>
       </a>
-      <a className="aap-system-tile aap-system-claude aap-magnetic" href="/systems/claude-code/">
+      <a className="aap-system-row" href="/systems/claude-code/">
         <span>Claude Code</span>
-        <strong>每次续跑都贴原因标签，压缩分四道</strong>
-        <em>TypeScript / Node developer tool</em>
+        <strong>给每次继续运行贴原因标签，把黑盒变成状态机</strong>
+        <small>适合需要精细上下文压缩与可观察性的 IDE agent</small>
       </a>
-      <a className="aap-system-tile aap-system-openclaw aap-magnetic" href="/systems/openclaw/">
+      <a className="aap-system-row" href="/systems/openclaw/">
         <span>OpenClaw</span>
-        <strong>最完整的 subagent 平台和会话路由</strong>
-        <em>personal agent control plane</em>
+        <strong>把 agent 当会话控制面，路由和 hook 都是一等能力</strong>
+        <small>适合多通道、多用户和插件化运行时</small>
       </a>
-      <a className="aap-system-tile aap-system-hermes aap-magnetic" href="/systems/hermes/">
+      <a className="aap-system-row" href="/systems/hermes/">
         <span>Hermes</span>
-        <strong>预算、深度上限、工具硬禁，全写死在代码里</strong>
-        <em>long-running Python agent</em>
+        <strong>把验证摊到时间轴上，用记忆和自评换长期收敛</strong>
+        <small>适合长期运行、跨会话学习的个人助理</small>
       </a>
     </div>
   </section>
 
   <section className="aap-skill-section" aria-labelledby="aap-skill-title">
     <div>
-      <p className="aap-kicker">读完之后</p>
-      <h2 id="aap-skill-title">结论不该躺在收藏夹里。</h2>
-      <div className="aap-copy-line">
-        <a href="/skill/">build-your-own-agent</a> 把全站内容压成一份能直接加载的 Skill：10 条铁律、8 维度选型表、Python scaffold、诊断脚本和安全检查清单。它假设你明天就要动手写自己的 harness。
-      </div>
+      <p className="aap-kicker">直接拿去用</p>
+      <h2 id="aap-skill-title">读完的判断，可以变成下一次开工的约束。</h2>
+      <p className="aap-lede"><a href="/skill/">build-your-own-agent</a> 把这些结论整理成 10 条铁律、8 维度选型表、Python scaffold、诊断脚本和安全清单。</p>
     </div>
-    <a className="aap-final-cta aap-magnetic" href="/skill/">打开配套 Skill</a>
+    <a className="aap-final-cta" href="/skill/">打开配套 Skill →</a>
   </section>
 </div>
-
-<LandingKinetics />

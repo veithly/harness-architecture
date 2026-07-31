@@ -3,7 +3,7 @@
  *
  * 设计哲学：
  *   - Swiss Modernism 2.0：mathematical spacing + 单一强调色 + grid system
- *   - Editorial typography：Playfair Display 标题 + Inter 正文（高对比 + 高可读性）
+ *   - Editorial typography：Newsreader 标题 + IBM Plex Sans 正文
  *   - 保留 hand-drawn SVG 作为视觉签名（图在内容里，UI 在外壳上）
  *
  * 颜色编码（贯穿全站）：
@@ -49,9 +49,9 @@
   /* ============================================================
    * 4. TYPOGRAPHY (Editorial Classic Elegant pairing)
    * ============================================================ */
-  --aap-font-display: 'Playfair Display', 'Source Han Serif SC', 'Noto Serif SC', Georgia, serif;
-  --aap-font-body: 'Inter', 'Source Han Sans SC', 'Noto Sans SC', system-ui, -apple-system, 'Segoe UI', sans-serif;
-  --aap-font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --aap-font-display: 'Newsreader', 'Source Han Serif SC', 'Noto Serif SC', Georgia, serif;
+  --aap-font-body: 'IBM Plex Sans', 'Source Han Sans SC', 'Noto Sans SC', system-ui, sans-serif;
+  --aap-font-mono: 'IBM Plex Mono', 'Fira Code', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
   --aap-font-hand: 'Excalifont', 'Virgil 3 YOFF', 'Comic Sans MS', var(--aap-font-display);
 
   /* type scale (modular 1.250 — Major Third) */
@@ -79,11 +79,11 @@
   /* ============================================================
    * 6. SURFACES (shadows / borders / radius)
    * ============================================================ */
-  --aap-radius-sm: 4px;
-  --aap-radius-md: 8px;
-  --aap-radius-lg: 12px;
-  --aap-shadow-soft: 0 1px 3px rgba(15, 23, 42, 0.06), 0 4px 12px rgba(15, 23, 42, 0.04);
-  --aap-shadow-card: 0 4px 12px rgba(15, 23, 42, 0.06), 0 1px 3px rgba(15, 23, 42, 0.05);
+  --aap-radius-sm: 2px;
+  --aap-radius-md: 4px;
+  --aap-radius-lg: 8px;
+  --aap-shadow-soft: 0 1px 0 rgba(15, 23, 42, 0.06);
+  --aap-shadow-card: 0 2px 8px rgba(15, 23, 42, 0.07);
   --aap-shadow-pop: 2px 2px 0 0 var(--aap-ink);
   --aap-shadow-pop-soft: 1.5px 1.5px 0 0 var(--aap-paper-line);
 
