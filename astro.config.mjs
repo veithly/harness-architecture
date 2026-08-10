@@ -23,6 +23,9 @@ export default defineConfig({
         { icon: 'github', label: 'GitHub', href: 'https://github.com/veithly/harness-architecture' },
       ],
       customCss: ['./src/styles/tokens.css', './src/styles/handdrawn.css', './src/styles/field-notes.css'],
+      components: {
+        PageTitle: './src/components/ArticlePageTitle.astro',
+      },
       head: [
         {
           tag: 'meta',

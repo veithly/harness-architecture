@@ -1,34 +1,25 @@
 ---
-title: 14 · Multi-Channel Entry
+title: 14 · How Multiple Entry Points Share State
 sidebar:
   order: 14
-description: TUI/CLI vs IDE-first + MCP Server vs ACP + 17 channel plugins vs 17 platform adapters - how the four systems let users come in through different doors
+description: Keep one traceable, upgradeable agent state across terminal, IDE, protocol, and chat entry points
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
 ## Channels differ; core state cannot fork
 
-<Verdict tldr="The same agent core has to face several very different callers at the same time: humans typing into a terminal, CI pipelines running non-interactive scripts, IDEs spawning the agent via plugins, external IDEs over a standardised protocol, users sending messages on Slack / Telegram / WeChat, and external systems pushing data in via webhooks. The four systems take wildly different approaches to organising this sprawl: Codex splits each calling mode into a separate binary (bare `codex` enters the TUI, `codex exec` runs scripts, `codex mcp-server` exposes MCP, `codex app-server` launches a long-running daemon) and uses a hidden `codex stdio-to-uds` bridge that forwards stdio over a Unix domain socket so the daemon can be upgraded without restarting the IDE; Claude Code goes one-binary-many-subcommands: everything lives in a single npm package organised by Node's commander library (REPL by default, `--print` for script mode, `mcp serve` / `server` / `auth` / `plugin` / `doctor` for each concern), plus a special `--bare` mode that disables every automation behaviour so CI / SDK callers have fully controllable auth and context loading; OpenClaw flattens 19 lazily-loaded sub-CLIs that are all RPC clients to one long-running gateway daemon, exposes ACP (Agent Control Protocol, OpenClaw's IDE integration protocol) for external IDEs, and ships Telegram / Discord / Slack as independently-published npm packages; Hermes folds 17 platform adapters (Telegram / Discord / Slack / Feishu / WeChat / Email / SMS / Webhook etc.) into a single GatewayRunner process behind a Python ABC base class with 6 required methods (connect, disconnect, send, send typing, send image, get chat info), and even models 'outbound HTTP API call' and 'inbound webhook' as platforms reusing the same message-handler pipeline. Bottom line: borrow from Codex / Claude Code for developer-tool agents, reuse Hermes's BasePlatformAdapter for ChatOps agents, reuse OpenClaw's channels-plugins for an open-ecosystem agent framework." />
+<Verdict tldr="How can terminal, IDE, protocol, and chat entry points share one run state? We follow the path from each adapter to the core: Codex subcommands and UDS, Claude Code's single-package command tree, OpenClaw's gateway and plugins, and Hermes adapters. Comparisons stay where deployment or upgrade choices diverge; no throughput or latency benchmark is claimed." />
 
-## Four entry topologies
-
-<details>
-<summary>Before reading (optional)</summary>
-
-- **One agent core, many callers**: terminals, CI scripts, IDE plugins, chat platforms, and webhooks all need different lifecycles and protocols.
-- **Four splits**: Codex separates binaries and bridges IDE to daemon via hidden `codex stdio-to-uds`; Claude Code is one binary with a `--bare` mode for CI/SDK; OpenClaw flattens 19 sub-CLIs as RPC clients to one gateway daemon; Hermes folds 17 platform adapters behind one Python ABC with 6 required methods.
-- **A stateless stdio-to-socket bridge determines upgradability**: the daemon can restart or upgrade without restarting the IDE, because the bridge holds no state.
-- **Match the pattern to the agent type**: developer tools borrow Codex / Claude Code; ChatOps reuses Hermes's adapter base class; open ecosystems reuse OpenClaw's channels-plugins.
-
-</details>
+## First fix one shared run state
 
 <Diagram
   src="/diagrams/14-multi-channel-entry-base.svg"
@@ -50,11 +41,11 @@ How the four systems cover multi-channel entry:
   dimensionLabel="Dimension"
 />
 
-## How four systems connect multiple channels
+## Source evidence: how each entry returns to the core
 
 ### Codex · Make every calling mode a separate subcommand, then bridge IDE and daemon over a Unix domain socket
 
-Codex's reasoning is clear: it has to serve callers with wildly different needs. A developer running bare in the terminal wants a full ratatui-rendered TUI. A CI script wants something that takes a prompt and produces JSON before exiting.
+Entry points have different lifecycles: a TUI stays interactive, CI should exit quickly, an IDE needs a bidirectional stream, and a daemon keeps state. Codex separates these modes into subcommands and connects IDE stdio to the daemon over UDS.
 
 An IDE integration wants a bidirectional streaming channel. A desktop app wants a stateful daemon. A remote client wants an HTTP/WS service with authentication.
 
@@ -135,7 +126,7 @@ The daemon can be restarted/upgraded at any time (the IDE only feels a reconnect
 
 ### Claude Code · Pack everything into one npm package, organised through a commander subcommand tree
 
-Claude Code's trade-off is the exact opposite of Codex. It assumes its users are developers who install with one `npm install -g @anthropic-ai/claude-code`; what it most wants to avoid is the user needing to remember "oh, you have to install another binary to get MCP mode".
+A single-package CLI optimises installation and upgrades. Claude Code uses commander for REPL, script, MCP, and server commands, with --bare for CI so automated callers skip interactive behaviour.
 
 So it picks "one binary, many subcommands": every feature lives in the same npm package's entry, dispatched by commander.js.
 
@@ -188,17 +179,17 @@ Compared with Codex, Claude Code chooses "the user installs one npm package" (si
 
 It depends on how the team weighs UX simplicity vs engineering modularity.
 
-### OpenClaw · 19 lazily-loaded sub-CLIs plus channels as independently-published npm packages
+### OpenClaw · 28 lazily-loaded sub-CLIs plus channels as independently-published npm packages
 
-OpenClaw's reasoning differs from both of the above. The scenario it serves is much more complex than an IDE tool.
+A multi-channel platform needs entry points decoupled from the gateway. OpenClaw lazy-loads sub-CLIs, publishes channels as plugins, and uses RPC and ACP to bring external calls back to one runtime.
 
 It is a ChatOps framework that must simultaneously connect to many chat platforms (Telegram, Discord, Slack), provide RPC interfaces for many local tools, support sandbox container isolation, and provide a standardised connect protocol for external IDEs.
 
 One CLI ends up having to cover "manage Telegram config", "start a sandbox container", "tail logs", "manage DNS resolution", and dozens of other functions at once.
 
-Its solution is to split the CLI into **19 independent sub-CLIs**: each sub-CLI corresponds to one function domain, and the organisation is neither Codex-style "each subcommand is its own entry mode" nor Claude Code-style "main entry with many small subcommands", but rather "the main program only dispatches, all heavy logic lives in the sub-CLIs".
+In the pinned commit used here, the `entries` array registers **28 sub-CLIs**. Each entry owns one function domain; the main program identifies the command and imports that module on demand.
 
-<SourceBlock path="REF/openclaw/src/cli/program/register.subclis.ts" lines="44-160" system="openclaw" summary="19 top-level sub-CLIs: acp / gateway / daemon / logs / system / models / approvals / nodes / devices / node / sandbox / tui / cron / dns / docs / hooks / webhooks / qr / clawbot / pairing / plugins / channels / directory / security / secrets / skills / update">
+<SourceBlock path="REF/openclaw/src/cli/program/register.subclis.ts" lines="44-310" system="openclaw" summary="28 top-level sub-CLIs from acp and gateway through update and completion; each entry lazily imports its registrar">
 
 ```ts
 const entries: SubCliEntry[] = [
@@ -224,7 +215,7 @@ This design lands as a clean four-layer runtime structure:
 
 **Layer 1 is the gateway daemon**: a long-running background process that holds every WebSocket connection, the global state, and the active sessions. This is the "heart" of the system, started with `openclaw gateway start`.
 
-**Layer 2 is the 19 sub-CLIs**: every `openclaw <subcli> <cmd>`-shaped command is actually an RPC client. It does no real business logic internally, just translates the command into an RPC request and sends it to the local gateway. This design buys one key engineering benefit: **lazy loading**. When the user runs a short command like `openclaw logs tail`, Node.js only has to `require` the `logs-cli.js` file; gateway, daemon, sandbox and the rest of the modules are never loaded. The result is sub-CLI startup latency in the tens of milliseconds, comparable to a long-running process.
+**Layer 2 is the 28 sub-CLIs**: `entries` first registers a lightweight action, then `import()` loads the selected module. The source proves that unselected modules are absent from the registration path. How much startup time this saves requires a benchmark on the same build, machine, and cache state.
 
 **Layer 3 is a standalone TUI app** (`openclaw tui`). It is a completely separate npm package from the sub-CLIs (called `ui-tui` in the repo), connecting to the gateway over WebSocket. That separation means the TUI can iterate independently, release independently, and even run on a different machine (TUI on the user's laptop, gateway on a company server).
 
@@ -260,7 +251,7 @@ This buys several important engineering wins: first, the main repo size does not
 
 ### Hermes · One gateway process pulling 17 platform adapters, with HTTP API modelled as a "platform" too
 
-Hermes's trade-off contrasts sharply with OpenClaw. Its goal is to be a ChatOps agent where "one pip install plus boot, you immediately have access to all 17 chat platforms", so it bundles every platform adapter into the main repo and runs them all inside the same gateway process.
+ChatOps cares about a consistent adapter contract. Hermes asks each platform adapter to connect, send, show typing, and query session details; HTTP and webhooks use the same layer.
 
 This looks heavy but is actually the most convenient for its target user (individual developers building a personal or family assistant bot): no plugin system to wrestle with, no extra npm packages, working out of the box.
 
@@ -356,90 +347,88 @@ A few design details deserve dedicated paragraphs:
 
 Beyond the 17 platform adapters, Hermes also ships several developer-and-toolchain entries: a simple `cli.py` for talking to the agent directly (mostly for development and testing), a `tui_gateway/` package providing a local TUI (connecting to the local gateway daemon), and an `mcp_serve.py` that wraps the entire Hermes as an MCP server so other agents can use it as a tool.
 
-## What multi-channel entry already agrees on
+## Invariants shared by channel adapters
 
-Despite the wildly different trade-offs in entry architecture, the four systems converge on four basics. Think of these as the minimum set for doing "multi-channel entry" well.
+Despite the wildly different trade-offs in entry architecture, four checks recur in the cited source snapshots. Treat them as this article's synthesis, not a mandatory set for every multi-channel product.
 
-**The first is accepting MCP (or a similar standardised agent protocol) as the de facto standard**. All four ship an MCP server entry: Codex makes it a separate binary (`codex mcp-server`), Claude Code makes it a subcommand (`claude mcp serve`), Hermes makes it a standalone Python module (`mcp_serve.py`), and OpenClaw goes with the same-spirit ACP protocol (`openclaw acp serve`). The logic: agent-to-agent calls, IDE-to-agent calls, and orchestrator-to-agent calls are growing rapidly, and every vendor making up a private protocol is a dead end. Convergence on a public standard is mandatory.
+**The first is to evaluate public agent protocols before inventing a private one.** These snapshots expose MCP or ACP entries: Codex uses a separate binary, Claude Code a subcommand, Hermes a Python module, and OpenClaw an ACP server. That demonstrates a real interoperability need, but four projects do not prove that one protocol is a universal de facto standard; check callers and version compatibility.
 
-**The second is splitting CLI and daemon into two layers**. OpenClaw makes this most explicit (a long-running gateway daemon plus sub-CLIs that are all RPC clients); Codex implements it implicitly through `app-server` plus the `stdio-to-uds` bridge; Claude Code provides it through the `server` subcommand (HTTP/Unix socket session server). The shared logic: interactive CLIs start slowly (loading config, connecting dependencies); if every short command re-launched a full agent, UX would be poor. Hosting state in a long-running daemon and making short commands do only RPC is where almost every "agent that is also a CLI tool" project ends up.
+**The second is to choose the CLI/daemon split from lifecycle needs.** OpenClaw uses a long-running gateway, Codex an `app-server` plus `stdio-to-uds`, and Claude Code a `server` subcommand. Long tasks or multi-client state benefit from a daemon; a short-lived single-process tool may not. This is a decision point, not an inevitable destination.
 
-**The third is that entries must do capability discovery**. Installing a channel/platform does not mean it can actually run: the SDK might be missing, credentials might be unset, the external service might be unreachable. All four implement capability discovery: Hermes's `check_<platform>_requirements()` family, OpenClaw's plugins catalog (describing each plugin's dependencies), Codex's feature flags (compile-time gating). The consensus: degrade gracefully on missing dependencies (warn and skip), never let one platform's dependency problem crash the whole agent.
+**The third is capability discovery at the entry boundary.** Installing a channel/platform does not mean it can run: an SDK, credential, or external service may be missing. Hermes, OpenClaw, and Codex expose different probes or declarations. Warning and skipping is one possible failure policy; products with a hard dependency may instead fail explicitly.
 
-**The fourth is that the protocols spoken are open standards: nobody invents private protocols**. MCP (used by Codex, Claude, Hermes), ACP (OpenClaw's bet), Telegram Bot API, Slack Bolt, Discord Gateway, IMAP/SMTP are all public. Nobody has built "a proprietary agent communication protocol", because public protocols come with existing SDKs and tooling, and private protocols would lock the ecosystem out, which would in turn limit the agent's own reachable scenarios.
+**The fourth is to reuse public protocols and isolate private extensions in adapters.** MCP, ACP, Telegram Bot API, Slack Bolt, Discord Gateway, and IMAP/SMTP have public specifications or SDKs. Reuse can lower integration cost, but versions, capability gaps, and provider limits still need to be documented; the sample does not prove that nobody uses private protocols.
 
-## Choose subcommands, adapters, or separate packages
+## Choose by deployment shape
 
 <Diagram
   src="/diagrams/14-tradeoff.svg"
   alt="Four multi-channel entries on channel count vs ecosystem openness"
-  caption="Codex multi-binary mid-left; Claude Code single-binary subcommand lower-left; OpenClaw 19 sub-CLI + channels-plugins most open; Hermes 17 platform highest count but bundled in main repo."
+  caption="Codex multi-binary mid-left; Claude Code single-binary subcommand lower-left; OpenClaw 28 sub-CLI + channels-plugins; Hermes 17 platforms bundled in the main repo."
 />
 
 Four typical scenarios:
 
 - **Dev-tool style agent**: borrow from Codex / Claude Code's CLI + IDE + MCP triad. Both ship complete answers.
-- **ChatOps style agent**: borrow from Hermes's BasePlatformAdapter + `check_<platform>_requirements()` pattern. 17 platforms are a real sample.
+- **ChatOps style agent**: borrow Hermes's BasePlatformAdapter + `check_<platform>_requirements()` pattern. The 17 platforms describe this snapshot, not a coverage target.
 - **Platform-style agent framework**: borrow from OpenClaw's channels-plugins + ACP design. Let the ecosystem build new channels.
 - **Both worlds (dev tool + ChatOps)**: borrow Hermes's "HTTP API as a platform" plus Codex's stdio-to-uds bridge. Reuse one message handler everywhere.
 
-## My take: channels should only translate
+## Choice: channels translate; the core owns state
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: 'Multi-binary lets every entry ship and upgrade independently. The stdio-to-uds bridge cleanly decouples the IDE from the daemon. app-server on axum handles HTTP1 + WS in one daemon for different clients.', risk: 'Too many entries hurts discoverability (codex vs codex exec vs codex mcp-server vs codex app-server). Multi-binary inflates packaging and distribution.' },
-    { system: 'Claude Code', value: '★★★★', reason: 'commander.js is used thoroughly with clean subcommand groups (mcp / auth / plugin / server). --bare mode gives CI and SDK a clean entry. The server subcommand supports Unix sockets for local multi-process clients.', risk: 'main.tsx is over ten thousand lines in one file. --ide auto-detect is ambiguous when multiple IDEs are open. Startup is heavy (plugins, LSP, hooks all load).' },
-    { system: 'OpenClaw', value: '★★★★★', reason: 'Lazy-loaded sub-CLIs have the smallest startup overhead. channels-plugins lets the ecosystem build new channels. ACP is a standardized protocol for external IDE integration. gateway daemon + RPC clients is the cleanest decoupling.', risk: 'Many entries are hard to grasp at once. Users must start the gateway daemon before most commands work. channels-plugins ecosystem is still mostly maintained by the core team.' },
-    { system: 'Hermes', value: '★★★★★', reason: '17 platform adapters is the widest coverage in the industry. BasePlatformAdapter is a clean abstraction (6 abstract methods). Modeling HTTP API and Webhook as platforms reuses the message handler. check_<platform>_requirements() enables graceful degradation.', risk: 'Every adapter lives in the main repo, bloating size and test matrix. Each new platform brings real code plus an SDK dependency. Not IDE-focused.' },
-  ]}
-  caption="Score basis: channel count + ecosystem openness + failure handling + maintenance cost"
-  headers={['System', 'Score', 'Strengths', 'Risks']}
-/>
+There is no star rating here. More entry points make a shared run state and event contract more important.
+
+| Deployment constraint | Start with | Cost or boundary |
+| --- | --- | --- |
+| Terminal, CI, and IDE need different lifecycles | Codex subcommands, app-server, and stdio-to-UDS | More binaries and protocol edges |
+| One CLI should serve interactive and scripted use | Claude Code commander tree and --bare | One package is simple to ship, but startup can grow |
+| Communities should publish channels around one gateway | OpenClaw lazy sub-CLIs, RPC, and channel plugins | Most commands depend on a running gateway |
+| The product is primarily multi-platform chat | Hermes BasePlatformAdapter and platform checks | Adapter and compatibility tests keep growing |
 
 ## Start with one entry and one core
 
-Below is the recipe distilled from the four systems for writing your own multi-channel entry. Lay solid foundations first, then add production-grade features, finally avoid five common dead ends.
+Below is a starting checklist from the cited implementations. Fix the shared state and call contract first, then add bridging, authentication, and upgrade behavior for each entry lifecycle.
 
 <BuildRecipe
   title="Build recipe"
   minimal={[
-    'Provide at least 3 entry modes: TUI (human interaction) / script mode (-p or exec for automation) / MCP server (stdio protocol). Covers humans, automation, and tool chains; missing one cuts off a class of users',
+    'Choose entry points from actual callers: TUI or REPL for people, -p / exec for automation, and an MCP server when an external toolchain needs it; do not maintain an unused mode just to complete a list',
     'Add --bare mode (borrow from Claude Code): skip all "automatic" behaviors (auto-update, welcome message, analytics opt-in, etc.) for CI / SDK use; these are friendly in interactive scenarios but noise in CI',
     'Put auth in dedicated subcommand (borrow from Claude Code\' auth / Codex\' login): login / status / logout as independent subcommands not main flags; this lets auth flow be independently testable / logged / UX-tuned',
     'Ship a doctor subcommand (borrow from Claude Code\' doctor): inspect deps / network / config / credentials; users on first error run doctor, avoiding the pain of "stuck on some step but don\'t know which"',
   ]}
   advanced={[
     'Multi-binary split (borrow from Codex): daemon (long-running service) / CLI (user entry) / mcp-server (MCP protocol endpoint) / stdio-to-uds (bridge) as separate binaries that upgrade independently; different parts upgrade at different speeds, separating into binaries enables fine-grained',
-    'stdio-to-uds bridge (borrow from Codex): IDE spawns child speaking stdio (the protocol IDEs expect), child internally goes UDS to daemon (high-performance IPC); IDE and daemon completely decoupled (daemon restart doesn\'t affect IDE, IDE upgrade doesn\'t affect daemon)',
+    'stdio-to-uds bridge (borrow from Codex): the IDE child speaks stdio and the bridge connects to the daemon over UDS. This separates process lifecycles, while throughput, reconnection, and upgrade behavior still need verification on the target IDE and daemon',
     'app-server on axum (borrow from Codex): one daemon supports both HTTP1 and WS (different clients pick protocol); axum is Rust ecosystem\'s most popular web server, performance + ecosystem mature',
-    'Lazy-loaded sub-CLIs (borrow from OpenClaw): each sub-CLI (auth / config / doctor / login etc.) one file, imported only on demand; CLI startup time is critical UX, importing all makes startup half a second slower',
+    'Lazy-loaded sub-CLIs (borrow from OpenClaw): keep each sub-CLI in its own file and import it on demand; verify the benefit with cold- and warm-start benchmarks instead of assuming a fixed millisecond gain',
     'channels-plugins catalog (borrow from OpenClaw): channels register as independent npm packages through catalog; this way new channels (e.g. new IM platform) only need npm package without changing main package, enterprises can publish their own private channel packages',
     'ACP protocol (borrow from OpenClaw): let external IDEs / orchestrators integrate through standard protocol; don\'t invent private protocols (external ecosystems won\'t adopt), ACP is OpenClaw-promoted standard',
-    'BasePlatformAdapter (borrow from Hermes): 6 abstract methods extracted (send_message / receive / parse / validate / authenticate / cleanup), one subclass per platform; new platform just implements these 6 methods',
+    'BasePlatformAdapter (borrow from Hermes): extract connect / disconnect / send / send_typing / send_image / get_chat_info as 6 abstract methods; a new platform also needs dependency, authentication, and compatibility tests',
     'check_<platform>_requirements() (borrow from Hermes): graceful degradation with warning on missing deps (e.g. "telegram lib not installed, telegram channel disabled"), not fatal; lets users gradually enable channels rather than installing all deps at once',
     'Model HTTP API / Webhook as platforms (borrow from Hermes): reuse same message handler; HTTP and Telegram in agent\'s view are both "received a message, send a message back", unified abstraction simplifies code',
     'Extras for platform deps (borrow from Hermes): main package without SDKs, install platform deps via hermes[slack] / hermes[discord] / hermes[telegram] extras; Telegram-only user shouldn\'t be forced to install discord.py / slack-sdk etc.',
   ]}
   avoid={[
-    'Don\'t pack everything in one main file. Past 5000 lines, split; Claude Code\'s cli.js single file is the cautionary tale (debugging extreme pain, single point of failure)',
+    'Don\'t pack every entry path into one main file: split registrars, adapters, and daemons by lifecycle and responsibility; use change coupling and test boundaries, not a fixed line threshold',
     'Don\'t make every platform a hard dependency: a Telegram-only user shouldn\'t be forced to install discord.py / slack-sdk and other platform SDKs; use extras to let users choose',
-    'Don\'t run long tasks inside an MCP request: MCP is request-response by design, use progress notifications (streaming updates) or split (split into multiple request-responses); long-running blows out stdio buffer',
-    'Don\'t rely on private protocols for IDE integration: MCP / ACP are public protocols, external IDEs naturally support; private protocols each IDE has to adapt separately, always behind',
+    'Don\'t hold an MCP request for a long task without progress or cancellation: use progress notifications, task handles, or segmented requests, and load-test stdio buffering and reconnect behavior',
+    'Don\'t invent a private IDE protocol when MCP or ACP expresses the need: otherwise every IDE adapter, compatibility layer, and document becomes your maintenance burden',
     'Don\'t tightly couple daemon and CLI: upgrading daemon shouldn\'t force every CLI client to restart (user\'s long-running session breaks); use stdio-to-uds bridge to decouple',
   ]}
 />
 
-## Four entry topologies side by side
+## Put entry differences back in deployment context
 
 <Diagram
   src="/diagrams/14-entry-topologies.svg"
   alt="Four entry topologies lined up side by side"
-  caption="Codex multi-binary independent; Claude Code single binary + commander subcommands; OpenClaw 19 sub-CLI + ACP + channels-plugins; Hermes 17 platform adapters in single process."
+  caption="Codex multi-binary independent; Claude Code single binary + commander subcommands; OpenClaw 28 sub-CLI + ACP + channels-plugins; Hermes 17 platform adapters in one process."
 />
 
 Placed side by side, "how does the user come in" lights up: Codex gives each caller a dedicated binary, Claude Code lets commander dispatch, OpenClaw lets the ecosystem build new channels, and Hermes packs 17 platforms into one process.
 
-## Follow channel adapters through source
+## How entry adapters return to one core
 
 <SourceTrail
   title="Further Reading / Source Pointers"
@@ -452,7 +441,7 @@ Placed side by side, "how does the user come in" lights up: Codex gives each cal
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/main.tsx', lines: '971-1006', desc: 'Top-level flags and default action' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/main.tsx', lines: '3894-3970', desc: 'mcp / server / auth / plugin subcommand registration' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/entrypoints/mcp.ts', desc: 'startMCPServer implementation' },
-    { system: 'OpenClaw', path: 'REF/openclaw/src/cli/program/register.subclis.ts', lines: '44-300', desc: '19 top-level sub-CLIs (lazy load)' },
+    { system: 'OpenClaw', path: 'REF/openclaw/src/cli/program/register.subclis.ts', lines: '44-310', desc: '28 top-level sub-CLIs in the pinned commit' },
     { system: 'OpenClaw', path: 'REF/openclaw/src/acp/server.ts', desc: 'serveAcpGateway entry (@agentclientprotocol/sdk)' },
     { system: 'OpenClaw', path: 'REF/openclaw/src/channels/plugins/catalog.ts', desc: 'channels-plugins catalog registration' },
     { system: 'Hermes', path: 'REF/hermes-agent/gateway/platforms/base.py', lines: '854-1060', desc: 'BasePlatformAdapter abstraction' },
@@ -485,7 +474,7 @@ Both choices reflect different ecosystem positioning:
 **Codex multi-binary**: each entry (tui / exec / mcp-server / app-server / stdio-to-uds / app / cloud) is a standalone Rust binary. Benefits:
 
 1. **Independent upgrades**: changing the TUI doesn't touch mcp-server. The VS Code extension can update stdio-to-uds without touching the TUI.
-2. **Minimal startup cost**: each binary only links its crates, startup overhead < 50ms.
+2. **Separate dependency surfaces**: each binary links only the crates it needs. Actual startup time still depends on the build mode, machine, and initialization path.
 3. **Clear responsibility**: `codex-app-server` says "daemon"; `codex` says "TUI" at a glance.
 4. **Distribute through different channels**: app can be on macOS App Store / Windows Store.
 
@@ -502,17 +491,17 @@ Cost: main.tsx is ten thousand lines in one file; heavy startup (plugin / LSP / 
 
 **Which to pick?**
 
-- **Rust agent + heavy multi-entry**: Codex multi-binary is right
-- **Node / Python agent + npm/pip one-shot install**: Claude Code single-binary is right
+- **Rust agent + heavy multi-entry**: Codex multi-binary fits when release and lifecycle boundaries are genuinely separate
+- **Node / Python agent + npm/pip one-shot install**: Claude Code single-binary fits a one-command distribution path; validate it against entry count and upgrade policy
 - **Rust agent + few entries**: single binary + clap subcommand works (mini-Codex)
 
-**Follow-up**: "Hybrid approach?" Possible: Codex is 80% multi-binary, but main `codex` binary embeds 90% of TUI code and invokes subcommands when needed; OpenClaw goes hybrid: "main binary + lazy-load sub-CLI modules."
+**Follow-up**: "Hybrid approach?" Yes. Codex combines standalone binaries with subcommand dispatch in the main CLI; OpenClaw uses a main CLI plus lazily loaded sub-CLI modules. Split another binary only when its lifecycle or release boundary warrants it.
 
 **Source**: [`codex/codex-rs/cli/src/main.rs:105-182`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/cli/src/main.rs#L105-L182) + `claude-code/src/main.tsx:971-1006`.
 </details>
 
 <details>
-<summary>**Q2 · Concept**: MCP and ACP are public protocols. Why do all four systems adopt them?</summary>
+<summary>**Q2 · Concept**: When should an entry use a public protocol, and when does it need a private extension?</summary>
 
 The "public vs private protocol" cost analysis is clear:
 
@@ -522,27 +511,27 @@ The "public vs private protocol" cost analysis is clear:
 - Docs / SDK / version compat maintained alone
 - Users locked in → switching hard → ecosystem closed
 
-**Public protocol (MCP / ACP) benefits:**
+**Potential benefits of public protocols such as MCP or ACP:**
 
-- Implement once, all protocol-supporting IDEs / orchestrators work
-- Protocol design iterated by multiple parties, corner cases covered
-- Docs / SDK / version mgmt maintained by protocol org
+- Reduce repeated integration for compatible clients
+- Reuse existing documentation, SDKs, and version negotiation
+- Keep private extensions limited to capability gaps instead of replacing the transport
 
-**MCP and ACP positioning:**
+**Entry points in these snapshots:**
 
-- **MCP (Model Context Protocol)**: Proposed by Anthropic, primary scenario is "LLM client calls external tools." Codex / Claude Code / Hermes expose themselves as MCP servers to Cursor / VS Code / Cline.
-- **ACP (Agent Client Protocol)**: Proposed by OpenClaw, primary scenario is "Agent-to-agent communication." OpenClaw acts as ACP server, external orchestrator as ACP client to schedule multiple agents.
+- **MCP (Model Context Protocol)**: the cited Codex, Claude Code, and Hermes paths expose MCP server entries; clients, capabilities, and protocol versions still need per-product verification.
+- **ACP (Agent Client Protocol)**: the cited OpenClaw path exposes an ACP server. Its client relationship differs from MCP, so the two are not one interchangeable protocol.
 
-**All four adopt:**
+**Four entries do not mean one shared protocol:**
 
 - Codex `mcp-server` binary
 - Claude Code `claude mcp serve`
 - OpenClaw `openclaw acp` subcommand
 - Hermes `mcp_serve.py`
 
-**Real effect:** users can mount Codex, Claude Code, and Hermes as MCP servers simultaneously in Cursor, without three-way adaptation. Classic case of "public protocols produce network effects."
+**Verify the actual effect:** integration becomes thinner only when the client supports the same protocol version, transport, and required capabilities. This article has not tested all three MCP servers simultaneously in Cursor.
 
-**Follow-up**: "Wait until protocol matures before adopting?" No. Early MCP / ACP have breaking changes, but "follow an early public protocol" beats "invent a private one" by far.
+**Follow-up**: "Wait until the protocol matures?" Check callers, version stability, and missing capabilities. Early adoption buys ecosystem compatibility but also carries breaking changes and compatibility testing; isolate private fields in adapters to reduce migration cost.
 
 **Source**: [`codex/codex-rs/mcp-server/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/mcp-server/), [`openclaw/src/acp/server.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/acp/server.ts), [`hermes-agent/mcp_serve.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/mcp_serve.py).
 </details>
@@ -574,7 +563,7 @@ stdio-to-uds connects to UDS internally (Unix domain socket)
 agent-daemon listens on UDS (independent long-running process)
 ```
 
-The bridge itself is a lightweight process (< 5MB memory), exits when user closes IDE, but daemon doesn't exit. Next IDE start launches new stdio-to-uds, connects to same daemon → session state / cache intact.
+The bridge only forwards and reconnects; when the user closes the IDE, stdio-to-uds exits, while daemon and session/cache retention follow the daemon lifecycle policy. Measure memory on the target build; the source gives no portable `<5MB` benchmark.
 
 **Bridge's specific responsibilities:**
 
@@ -585,9 +574,9 @@ The bridge itself is a lightweight process (< 5MB memory), exits when user close
 
 **Windows?** UDS supported on Windows 10+. Or use named pipe (`\\.\pipe\agent`) equivalent.
 
-**Follow-up**: "Without bridge, can IDE connect to UDS directly?" VS Code Extension API doesn't support direct UDS connection, only subprocess with stdio. So bridge is required. Cursor / Cline / others have same constraint.
+**Follow-up**: "Can the IDE connect to UDS without a bridge?" It depends on the target extension API and deployment. A bridge is necessary when the client can only launch a stdio subprocess while the service must remain independent; otherwise a direct socket, HTTP, or WebSocket connection may be simpler.
 
-**Codex is the only agent that explicitly does this**: `stdio-to-uds` is a standalone crate. The other three also face the same problem for IDE integration but haven't extracted it yet.
+Codex is the clearest cited example of extracting this bridge as a standalone crate; whether the other systems need the same extraction depends on their IDE lifecycle and transport contracts.
 
 **Source**: [`codex/codex-rs/stdio-to-uds/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/stdio-to-uds/).
 </details>
@@ -617,9 +606,9 @@ Each platform adapter self-manages `_active_sessions: Dict[str, asyncio.Event]`.
 2. **Auth modes completely different from chat platforms**: Telegram uses token, HTTP uses API key / JWT. Forcing same abstraction increases coupling.
 3. **Protocol assumption drift**: HTTP is request-response, Telegram is event-driven. Forcing same abstraction requires adapter-side bridging.
 
-**Why is Hermes's approach right?**
+**When does Hermes's approach fit?**
 
-Hermes positions as "ChatOps-first." HTTP API and Webhook are secondary entries, no need to architect around them. Reusing platform adapter keeps code small, maintenance simple.
+Hermes positions as "ChatOps-first." When HTTP API and Webhook are secondary entries, reusing the platform adapter can limit additional maintenance surface. If HTTP API becomes the primary entry, evaluate the reverse design (HTTP-first, chat platforms as adapters).
 
 If HTTP API were the main entry, design should be reverse (HTTP-first, chat platforms as adapters).
 
@@ -631,7 +620,7 @@ If HTTP API were the main entry, design should be reverse (HTTP-first, chat plat
 <details>
 <summary>**Q5 · Engineering**: How does OpenClaw implement lazy-load sub-CLI?</summary>
 
-OpenClaw has 19 sub-CLIs (acp / gateway / tui / channels / plugins / sandbox / ...). Importing all of them would drag startup to over 1 second. The lazy-load approach:
+The pinned OpenClaw commit registers 28 sub-CLIs (acp / gateway / tui / channels / plugins / sandbox / ...). Eager imports enlarge the startup path. This article has no reproducible timing result, so the section focuses on the lazy-load structure.
 
 **Implementation:**
 
@@ -660,12 +649,9 @@ program
 2. **Dynamic `import('./...')`**: only loaded when user runs that subcommand.
 3. **Each subcommand in own file**: implementation split, each file only imports its own deps.
 
-**Startup time comparison:**
+**How to measure the startup benefit:**
 
-- Full import: `openclaw --help` 600ms (19 files + their deps)
-- Lazy-load: `openclaw --help` 50ms (only register.subclis.ts + commander)
-
-**Real gap of 10x+**. CLI users feel it instantly.
+On the same commit and production build, toggle `OPENCLAW_DISABLE_LAZY_SUBCOMMANDS`, then run `openclaw --help` and one real subcommand repeatedly. Report cold starts, warm starts, and percentiles. Without those results, we can say lazy loading shortens the import path, not that it is 10x faster.
 
 **Costs:**
 
@@ -684,9 +670,9 @@ program
 <details>
 <summary>**Q6 · Real-world**: Adding multi-channel entry to your agent, zero to production?</summary>
 
-Four phases: **core CLI → MCP → IDE integration → chat platforms**.
+Advance through four entry scopes: **core CLI → MCP → IDE integration → chat platforms**. Gate each scope with protocol, lifecycle, and dependency fixtures.
 
-**Week 1 · core CLI**
+**Stage 1 · core CLI**
 
 ```python
 # main.py
@@ -717,7 +703,11 @@ if __name__ == "__main__":
 
 Borrow Codex `codex` + `codex exec` thinking.
 
-**Week 2 · MCP server**
+**Acceptance gate**: interactive, one-shot, and doctor fixtures return structured results and actionable errors when dependencies are missing.
+
+**Stage 2 · MCP server**
+
+**Prerequisite**: the core CLI state and exit-code contracts are stable.
 
 ```python
 # mcp_serve.py
@@ -740,7 +730,11 @@ if __name__ == "__main__":
 
 Borrow Hermes `mcp_serve.py`.
 
-**Week 3 · IDE integration (hardest)**
+**Acceptance gate**: list/call, argument validation, version negotiation, and error mapping pass an independent MCP client fixture.
+
+**Stage 3 · IDE integration**
+
+**Prerequisite**: an MCP protocol trace is replayable and the stdio/daemon lifecycle boundary is explicit.
 
 Take the MCP route: Cursor / VS Code / Cline all support MCP server. Users configure `mcp_servers.json`:
 
@@ -757,7 +751,11 @@ IDE spawns subprocess, stdio communicates with agent. All IDEs share same protoc
 
 Don't invent private protocols.
 
-**Week 4-5 · chat platforms**
+**Acceptance gate**: IDE close/restart, daemon reconnect, and session recovery replay correctly without hanging the client.
+
+**Stage 4 · chat platforms (when needed)**
+
+**Prerequisite**: a concrete platform caller exists and adapter lifecycle, authentication, and redaction rules are defined.
 
 Borrow Hermes `BasePlatformAdapter`:
 
@@ -777,12 +775,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
 `check_telegram_requirements()` checks if `python-telegram-bot` is installed, degrade gracefully if missing.
 
+**Acceptance gate**: each platform has connect, send, receive, disconnect recovery, and dependency-diagnostic fixtures; missing dependencies cannot report a false connection.
+
 **Key takeaways:**
 
-1. **First week only CLI, don't gold-plate**: make one user able to use it first
-2. **Second week MCP**: IDE integration solved by MCP alone, don't make protocols
-3. **Third week don't add more channels**: get CLI + MCP stable
-4. **Fourth week add Telegram / Discord / etc.**: each channel is a PR, not bulk add
+1. **Start with CLI, don't gold-plate**: make one user able to use it first
+2. **Reuse MCP for the protocol entry**: don't invent a private protocol
+3. **Add channels after CLI + MCP fixtures pass**: stabilize the core path first
+4. **Add Telegram / Discord / etc. from real demand**: each channel is a reversible change
 
 **Follow-up**: "Daemon vs process model?" First phase doesn't need daemon, every start fresh state. Only when session crosses processes (IDE close+open) do you add daemon + UDS. Simple before complex.
 </details>
@@ -825,7 +825,7 @@ Real CI issues when running claude:
 
 > --bare: Skip all "automation" behavior. Useful for CI / SDK.
 
-**Follow-up**: "Should this flag default on or off?" Default off, explicit on. Reason: users spend 90% of time in dev env, should default to plugin / LSP / hook conveniences. CI / SDK are edge cases, let user explicitly turn `--bare` on.
+**Follow-up**: "Should this flag default on or off?" Interactive entry points can keep plugins, LSP, and hooks by default; CI and SDK callers opt into `--bare`. That default follows entry-point semantics, not an unmeasured claim about how users divide their time.
 
 **Similar designs:**
 
@@ -876,12 +876,12 @@ export const CHANNELS: Record<string, ChannelInfo> = {
 
 **vs Hermes approach:**
 
-Hermes bundles all 17 platforms in main repo. Benefits: quality unified, OpenClaw fixes breaking changes in one place, simplest user experience. Costs: large repo, third-party contribution hard.
+Hermes bundles all 17 platforms in the main repo. Compatibility fixes can land centrally and users do not have to discover plugins. The cost is a growing repository and platform-test matrix, while third-party adapters are harder to release independently.
 
 **Two approaches' fits:**
 
 - **OpenClaw model**: expect dozens of channels long-term, mostly ecosystem-maintained
-- **Hermes model**: expect 10-20 channels, all maintained by you / your team
+- **Hermes model**: expect a fixed set of channels and accept ownership of their adapters and compatibility tests
 
 **Follow-up**: "Can both legs walk?" Yes. Hermes main repo carries 17 core platforms while providing plugin API for third-party platforms. OpenClaw's current channels-plugins is actually "official core + third-party space." Hybrid mode.
 
@@ -957,15 +957,15 @@ all = ["python-telegram-bot", "discord.py", "slack-bolt", ...]
 
 User uses `pip install hermes[telegram]` or `pip install hermes[all]`. Main package without platform SDKs, extras install them.
 
-**Follow-up**: "Why not force all SDK install?" User may only use Telegram, no need to be forced into discord.py (200MB dep + completely unused). pip extras lets users choose on demand.
+**Follow-up**: "Why not force all SDK install?" A user may only use Telegram and should not have to install unused platform SDKs; dependency size varies by version and platform. pip extras lets users choose on demand.
 
-**Similar designs:** TensorFlow has `tensorflow[gpu]`, PyTorch has `torch[cu118]`, numpy doesn't force SciPy. "Main package + extras" best practice.
+**Similar designs:** TensorFlow and PyTorch expose optional dependency sets. Whether "main package + extras" is right depends on installation UX, release matrix, and runtime probing.
 
 **Source**: [`hermes-agent/gateway/run.py:2663-2820`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/gateway/run.py#L2663-L2820) + each platform's `check_xxx_requirements`.
 </details>
 
 <details>
-<summary>**Q10 · Open-ended**: Synthesize the strengths into a universal multi-channel entry framework.</summary>
+<summary>**Q10 · Open-ended**: Design a shared-state framework from entry lifecycles and provide compatibility tests.</summary>
 
 5-layer architecture:
 
@@ -1000,7 +1000,7 @@ acp_server = AcpServer(handler)
 acp_server.serve()
 ```
 
-Borrow all 4 systems' public protocol entries.
+Choose one verified protocol entry from actual callers; MCP and ACP above are different examples.
 
 **Layer 3 · Platform adapter abstraction (optional, scenario-dependent)**
 
@@ -1065,24 +1065,22 @@ Borrow Claude Code `doctor` subcommand.
 - OpenClaw: sub-CLI lazy-load + channels-plugins catalog + ACP
 - Hermes: BasePlatformAdapter + `check_xxx_requirements` + 17 platform implementations
 
-**Engineering effort:**
+**Evaluate by entry scope**:
 
-- Layer 1-2: 1 week (mandatory)
-- Layer 3: 2 weeks (optional)
-- Layer 4: 2 weeks (IDE integration needs it)
-- Layer 5: 3 days
-
-4-6 weeks v0.1.
+- **Layers 1-2 · core CLI and automation entry**: fix shared state, exit-code, and diagnostic contracts first. **Gate**: interactive and one-shot fixtures start, return structured results, and expose actionable errors when dependencies are missing.
+- **Layer 3 · protocol entry**: add MCP/ACP only when there is a concrete external caller. **Prerequisite**: the core API is stable; **gate**: list/call, version negotiation, and error mapping pass an independent-client fixture.
+- **Layer 4 · IDE bridge**: add only when bidirectional streaming, reconnects, or cross-process sessions are required. **Prerequisite**: an end-to-end protocol trace exists; **gate**: IDE close/restart, daemon reconnect, and state recovery are replayable.
+- **Layer 5 · chat platforms**: add platforms one at a time from real demand. **Prerequisite**: adapter lifecycle, authentication, and redaction contracts are explicit; **gate**: connect, send, receive, disconnect recovery, and dependency diagnostics each have a fixture.
 
 **Key decisions:**
 
-1. **CLI + MCP day one**: every agent should have these two entries
+1. **Ship one human entry and one automation entry first**: add MCP to v0.1 only when an external toolchain is a concrete caller
 2. **Don't rush chat platforms**: wait for actual user demand
 3. **Don't invent private protocols**: MCP / ACP good enough
 4. **doctor early**: user triage entry
-5. **Lazy-load early**: CLI startup < 100ms is standard
+5. **Lazy-load early**: define an SLO on a target machine, then verify it with cold- and warm-start benchmarks
 
-**Follow-up**: "Microservices better?" For small projects (< 10K LoC) multi-binary / microservices are over-engineering. Codex's multi-binary isn't required; it works because the 50+ Codex team has someone dedicated to app-server. MVP single binary + subcommand is right.
+**Follow-up**: "Are microservices better?" Neither line count nor team size answers that alone. Split a process when an entry point needs an independent lifecycle, permission boundary, or release cadence; otherwise a single binary with subcommands is usually easier to start with.
 
 **Source mosaic**: [`codex/codex-rs/cli/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/cli/) + [`codex/codex-rs/stdio-to-uds/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/stdio-to-uds/) + `claude-code/src/main.tsx` + [`openclaw/src/cli/program/register.subclis.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/cli/program/register.subclis.ts) + [`hermes-agent/gateway/`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/gateway/).
 </details>

@@ -34,8 +34,8 @@
     <text x="90" y="269" class="lbl">lazy verifier</text>
     <text x="90" y="287" class="t">model decides to stop on its own</text>
     <text x="90" y="304" class="t-s">finish_reason / no tool_use &#x00B7; trust depends entirely on the model</text>
-    <text x="90" y="319" class="note">Fallback  all systems have it, but unreliable on its own</text>
+    <text x="90" y="319" class="note">Fallback: every system exposes a self-stop signal, but it is unreliable on its own</text>
   </g>
 
-  <text x="380" y="355" class="t-s" text-anchor="middle">Production needs at least hard + soft two layers; lazy as fallback</text>
+  <text x="380" y="355" class="t-s" text-anchor="middle">For high-risk flows, pair hard and soft checks; treat self-stop as a fallback</text>
 </svg>

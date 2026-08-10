@@ -1,64 +1,107 @@
 ---
-title: 17 · Skills (from experience to reusable workflow)
+title: "17 · Skills: When Should They Trigger?"
 sidebar:
   order: 17
-description: Freeze a recurring workflow into a markdown file so the agent can recognise the situation next time and run it again. This chapter explains how four systems design, load, trigger and distribute that "reusable workflow" layer.
+description: "Write an auditable SKILL.md by testing its trigger, dependency preflight, install scan, and revocation path."
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
-import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## A skill is behavior loaded on demand
+## When should a skill trigger automatically?
 
-<Verdict tldr="A skill is the idea of «taking a workflow you do over and over again, writing it in a markdown file, and attaching a frontmatter block (the YAML header wrapped in --- at the top of the file) that tells the agent when to reach for it and which tools it may use». The four systems pull this idea in four very different directions: Codex treats it as a platform problem and breaks loading, injection, dependency resolution and distribution into independent modules so skills can be shipped per user / per project / per organization (three stacking scopes); Claude Code treats it as a user-experience problem and provides skillify, a four-round wizard that automatically extracts a reusable workflow from the conversation the user just finished; OpenClaw treats it as a software-supply-chain problem and wires download, extract and static scanning (frontmatter compliance, shell-command risk, external URLs) into one auditable install pipeline; Hermes treats it as a trust problem and combines 4 origins (builtin / trusted / community / agent-created) × 3 verdicts (safe / caution / dangerous) into a 12-cell INSTALL_POLICY matrix that decides whether each skill is allowed, blocked, or has to be confirmed by the user. In one sentence: study Codex if you want a platform, Claude Code if you want users to actually write skills, OpenClaw if you need a marketplace, Hermes if you need compliance-friendly install." />
+<Verdict tldr="Automatic invocation is first a matching problem: a broad trigger pulls irrelevant instructions and tool declarations into the turn; a narrow one misses work that needs the workflow. This chapter follows trigger rules, dependency preflight, install scanning, and human approval. Prompt loading, declared tools, runtime authority, and cross-session persistence are separate actions; these are source observations, not a security proof or shared benchmark."/>
 
-## Four skill systems
+The hardest failure to diagnose is not a skill that stays dormant. It is a near-match that enters the context, interrupts the user with an unnecessary approval, or nudges the agent toward a side effect. Measure the trigger boundary before discussing file format or distribution.
+
+This is not a feature inventory. Start with false-trigger and missed-trigger costs, then open the source notebook for the implementation you need.
+
+## Five layers before a trigger
+
+| Question | Evidence to inspect | Do not conflate it with |
+| --- | --- | --- |
+| Does this request match? | `when_to_use`, positive and negative examples, implicit invocation | Record false positives and false negatives; do not invent an accuracy target |
+| What enters the prompt? | `name` and `description` in the listing; full body at invocation | Metadata helps selection; it does not execute the skill |
+| Which tools does the skill declare? | `allowed-tools` and `dependencies` | A declaration is an input or constraint, not a grant of authority |
+| What can the runtime actually do? | Host policy, approvals, sandbox, and OS identity | Only the enforced runtime boundary decides whether a call succeeds |
+| Does the file persist? | Install path, scope, registry, version, and revocation record | Writing a file or making it visible next session is a separate lifecycle |
+
+These questions predict maintainability better than a count of metadata fields, and they expose the real cost of a false trigger.
+
+## Compare only at the decision forks
+
+### When dependencies must be ready up front: Codex
+
+Codex puts scope, policy, interface, and tool dependencies in metadata. Before a turn starts it collects missing environment variables and asks for them together. That avoids a mid-run failure; it does not grant extra authority.
+
+### When a session should become a file: Claude Code
+
+`skillify` cannot be launched by the model. The user starts it, then confirms the name, steps, success criteria, tools, and save location before a `SKILL.md` is written. The approval boundary is the feature worth copying.
+
+### When installing third-party packages: OpenClaw and Hermes
+
+OpenClaw records a rule id, severity, file, line, and evidence snippet before installation. Hermes crosses origin with scan result to choose allow, block, or ask the human.
+
+Both paths make the same point: a scan is evidence, not a trust verdict by itself. Scanner errors need a visible, auditable outcome.
+
+## A small auditable SKILL.md
+
+Start with a narrow trigger and explicit success criteria:
+
+```yaml
+---
+name: release-check
+description: Use when a release candidate needs repository checks and a recorded diff.
+allowed-tools:
+  - Bash(git diff:*)
+  - Bash(pnpm check:*)
+when_to_use: "Only after the user names a release candidate."
+---
+
+# Release check
+
+## Success criteria
+- The check command exits 0.
+- The diff and command output are recorded.
+```
+
+Keep `allowed-tools` at subcommand level. Put external URLs, scripts, and credential requirements in the audit record. Without an installation run, do not claim a scanner detection rate.
+
+Before shipping, ask:
+
+- Can a reader give one example that triggers and one that does not?
+- Are missing dependencies surfaced before execution?
+- Can the generated or installed file be previewed, revoked, and traced to its origin?
+- Does the source trail point to a pinned commit?
+
+## Source notebook: implementation details
 
 <details>
-<summary>Before reading (optional)</summary>
-
-- **A skill freezes a recurring workflow into markdown**: a frontmatter block tells the agent when to reach for it and which tools it may use.
-- **Four framings of the same idea**: Codex builds a platform with per-user / per-project / per-organization scopes; Claude Code ships skillify, a four-round wizard extracting skills from finished conversations; OpenClaw scans installs for frontmatter compliance, shell risk, and external URLs; Hermes gates installs with a 12-cell INSTALL_POLICY.
-- **Skill origin determines install treatment**: Hermes crosses 4 origins (builtin / trusted / community / agent-created) with 3 verdicts (safe / caution / dangerous) to decide allow, block, or confirm.
-- **Pick your study target by goal**: Codex for a platform, Claude Code to make users actually write skills, OpenClaw for a marketplace, Hermes for compliance-friendly install.
-
-</details>
+<summary>Source notebook: implementation details</summary>
 
 <Diagram
   src="/diagrams/17-skills-base.svg"
   alt="Four skill models: codex 8 crate + scope + policy vs claude code 17 bundled + skillify 4 round vs openclaw scanner + install + plugin sandbox vs hermes trust 4 level + verdict 3 level + lazy load"
-  caption="Same 'help users write skills', from a metadata schema all the way to a full supply chain."
+  caption="The same skill lifecycle, with four implementations emphasising schema, authoring, scanning, and trust decisions."
 />
 
 The four systems on skill discovery, injection, execution, and install:
-
-<CompareTable
-  rows={[
-    { label: 'Skill file format', values: ['`SKILLS.md` + `agents/{name}/scripts/` directory + structured frontmatter (name / description / interface / dependencies / policy)', 'SKILL.md + 5 frontmatter fields (name / description / allowed-tools / when_to_use / arguments / context: inline/fork)', 'SKILL.md + manifest (workspace skill vs bundled skill double layer)', '`SKILL.md` + frontmatter (name <=64 / description <=1024 / platforms / prerequisites / metadata.hermes)'] },
-    { label: 'Implicit trigger', values: ['`SkillPolicy.allow_implicit_invocation` defaults to true + `detect_implicit_skill_invocation_for_command`', '`when_to_use` frontmatter field ("Use when..." description)', '`workspace skill prompt` injection; agent decides', '`description` becomes progressive-disclosure tier 1 (<=1024 char summary)'] },
-    { label: 'Dependency management', values: ['`SkillDependencies.tools` + env var auto RequestUserInput', '`allowed-tools: ["Bash(gh:*)"]` precise to sub-command', 'Workspace skill carries install steps + brew dependency check', '`prerequisites: { env_vars: [API_KEY], commands: [curl, jq] }`'] },
-    { label: 'Install source', values: ['Local + remote skill (`remote.rs` for marketplace) + plugin system', 'Local `.claude/skills/` + `~/.claude/skills/` + bundled', '`skills-install-download` + tar verbose + scanner', '4 trust levels x 3 verdicts = 12-cell INSTALL_POLICY'] },
-    { label: 'Execution', values: ['Body runs through ExecutorFileSystem (sandboxed) + scope-limited', 'SkillTool runs inline or fork (Task agent / Teammate)', '`pi-embedded-runner/skills-runtime` isolation', 'env_type backend (local / docker / modal / ssh / daytona)'] },
-  ]}
-  caption="Skill system = file format x trigger model x dependency x install source x execution"
-  dimensionLabel="Dimension"
-/>
 
 ## How four systems discover and load skills
 
 ### Codex · build it like a platform
 
-Codex slices the problem of "load a skill" the most finely of any system in this book. It does not treat skill-loading as "read a file, paste it into the prompt".
+Codex splits "load a skill" into eight responsibility areas instead of treating it as "read a file, paste it into the prompt". The modules cover data, lifecycle, rendering, injection, remote sync, and dependency preflight.
 
 It treats it as a small internal product pipeline, and deliberately splits that pipeline into eight pieces, each owning one concern: one module reads SKILL.md from disk or remote storage, one keeps an in-memory registry of which skills are alive, one defines the data structure that describes "what a skill looks like", one renders SKILL.md into a prompt fragment, one decides whether the current turn should pull a particular skill in, one handles remote install and sync, one checks whether the environment variables a skill requires are actually present, and one parses the policy that decides where a skill is allowed to be visible.
 
-The reason for cutting things this finely is to let each concern evolve independently: changing the remote protocol does not touch the injection logic, changing the injection logic does not touch the dependency check.
+The split aims to keep changes in the remote protocol, injection strategy, and dependency checks from being entangled. Whether it improves maintenance or parallel work should be checked against the dependency graph, build times, and team workflow.
 
 It also lets several engineers work in parallel: someone iterating on the marketplace protocol does not block someone tightening the env-var resolver.
 
@@ -109,9 +152,9 @@ pub struct SkillToolDependency {
 
 </SourceBlock>
 
-The point of this structure is not the field names. The point is that everything an agent might want to know about a skill is made explicit: not just its name and description, but also who owns it (private to a user, shared in a project, distributed by an organization, or shipped with the binary), how it should look in the UI (icons, brand color, default prompt for IDE rendering), which tools or MCP endpoints it depends on (so the agent can know up-front that this skill needs `git` and a GitHub token), and which product surfaces are allowed to show it (the same skill can be visible in the CLI but hidden in the cloud product).
+Read this structure by separating its concerns. A name and description are metadata that can be loaded during listing so the model can select a candidate. `dependencies` and `allowed-tools` are declarations or constraints, not a grant of authority. The host's runtime policy, approvals, sandbox, and operating-system identity still decide whether a call can run. `scope`, paths, and plugin origin describe visibility, installation, and persistence; they do not describe execution power.
 
-When everything is described in metadata like this, a skill stops being "a piece of prompt" and starts looking more like a listing in an app store.
+With those boundaries explicit, a skill is more than "a piece of prompt": it is a workflow entry that needs its own lifecycle and audit trail. Metadata helps selection and review, but it cannot replace an enforced runtime boundary.
 
 The next problem this design tackles is one of the most common pain points in skill systems: many skills actually need external credentials to run.
 
@@ -168,41 +211,35 @@ First, every skill belongs to one of four **visibility scopes**: private to the 
 
 The same SKILL.md in different physical locations means different propagation radii: drop it under the user's home directory and only that user sees it; check it into a repository and every collaborator inherits it; publish it as an organization distribution and everyone in that org gets it; or compile it into the binary and it ships with the next release.
 
-Second, skills are implicitly invocable by default unless the author opts out, which avoids the unhappy state where someone writes a skill and the model never picks it up.
+Second, skills are implicitly invocable by default unless the author opts out. That is a trigger policy, not a permission policy.
 
-Third, disabling a skill does not delete it; the system marks its metadata as "disabled" so re-enabling later is one toggle.
+Third, disabling a skill does not delete it; the system marks its metadata as "disabled" so re-enabling later is one toggle. Whether the file remains on disk or becomes visible in a later session is still controlled by the install and registry lifecycle.
 
 Fourth, when a user types a command, Codex first does cheap textual reverse-matching against known skill triggers (see `detect_implicit_skill_invocation_for_command` in the source, which looks up which skills a given command name directly matches) instead of paying for a full LLM intent-recognition pass on every keystroke; only when local matching is ambiguous does it ask the model.
 
-These four choices, stacked together, give Codex a very "productized" feel: scopes act like file permissions, enable/disable acts like an app switch, triggers act like keyboard shortcuts, and distribution acts like an app store.
+These four choices, stacked together, give Codex a very "productized" feel: scopes act like directory visibility, enable/disable acts like an app switch, triggers act like keyboard shortcuts, and distribution acts like an app store. None of those labels is a runtime authority grant.
 
 ### Claude Code · put "people will actually write one" first
 
-Claude Code goes the opposite direction. It treats the skill problem not as a structure problem but as a user-experience problem.
+Claude Code puts the emphasis on authoring experience. Its design bet is that users may not want to write a SKILL.md from scratch but may be willing to preserve a workflow they just completed. It ships more than a dozen built-in skills as both tools and examples; whether that bet holds needs completion and return-use data.
 
-Its key insight is: **most users will never sit down and write a SKILL.md from scratch, but they will happily "save the thing we just figured out together"**.
-
-So it ships more than a dozen example skills as built-ins, partly as working tools, partly as a teaching gallery: one for telling the model how to drive a careful step-by-step loop, one for verifying its own claims before reporting back, one for asking for help when it is stuck, one for recording facts, several for opening specific interfaces, and so on.
-
-Each is also a "look, this is what a skill can look like" demonstration.
-
-The most important of them is a meta-skill whose only job is to **turn the conversation you just finished into a reusable skill**. It does not dump a wall of fields on the user.
+One important example is a meta-skill whose job is to **turn the conversation you just finished into a reusable skill**. It does not dump a wall of fields on the user.
 
 Instead it splits the extraction process into four small question rounds: first, summarize in one sentence what the session was about. That becomes the skill's description.
 
-Then lay out the steps in order and ask the user to confirm or edit them. Then list the tools the session actually used and ask the user to tick which ones the skill should be allowed to call.
+Then lay out the steps in order and ask the user to confirm or edit them. Then list the tools the session actually used and ask the user to tick which ones the skill should declare.
 
 Finally ask one architectural question: should the skill run inline in the main conversation, or be spawned off into its own sub-process?
 
-With those four taps, the user has produced a SKILL.md complete with metadata, trigger description, and tool whitelist, and dropped it onto disk.
+With those four taps, the user has produced a SKILL.md with metadata, a trigger description, and a tool declaration, and asked the system to write it to disk. Installation, runtime authority, sandboxing, and cross-session visibility remain separate decisions.
 
-Why four rounds instead of a single form? Because of a very practical observation: ask a user to fill out seven fields at once and most will quit; ask them one short multiple-choice question per round and almost everyone finishes.
+Why four rounds instead of a single form? Each round keeps the next decision small. That is a design intention, not a published completion benchmark; measure it in the product's own labeled flow.
 
 This is what makes the difference between "a skill format you have in theory" and "skills people actually write".
 
-Below is the prompt that drives that wizard. It is itself a skill file. Read it not for its string details but for the choreography it imposes: first understand what happened in the session, then ask the user four targeted questions, then emit a polished SKILL.md.
+Below is the prompt that drives that wizard. It analyses the session, asks four targeted questions, and emits a SKILL.md draft; the useful part to study is the interaction order and output boundary.
 
-<SourceBlock path="REF/claude-code-2.1.88-expanded/src/skills/bundled/skillify.ts" lines="22-90" system="claude-code" summary="The prompt that lets the model crystallise a finished session into a SKILL.md: analyse what happened, run four short interview rounds, then write out a complete skill file.">
+<SourceBlock path="REF/claude-code-2.1.88-expanded/src/skills/bundled/skillify.ts" lines="22-90" system="claude-code" summary="The prompt that lets the model crystallise a finished session into a SKILL.md: analyse what happened, run four short interview rounds, then write out a skill file.">
 
 ```ts
 const SKILLIFY_PROMPT = `# Skillify {{userDescriptionBlock}}
@@ -278,9 +315,9 @@ Clearly stated goal.
 
 A few details in this design deserve a second look.
 
-One is the rule that the **trigger description must start with "Use when…"** and must list concrete trigger phrases together with sample user messages.
+One is the rule that the **trigger description starts with "Use when…"** and lists concrete trigger phrases together with sample user messages.
 
-The reason is that the model's judgment about whether to invoke this skill is based entirely on that description. The more specific and example-rich the description, the lower both the false-positive and false-negative rates.
+In an implicit-invocation path, the description is a major input to the model's decision. Whether more examples lower false positives and false negatives is a testable hypothesis, not a general rate claim.
 
 If you only write "for git-related tasks" the model will hesitate every time someone mentions git.
 
@@ -290,7 +327,7 @@ Forcing a "what proves this step is complete" line acts as a checkpoint after ea
 
 Another is the **sub-command-level scoping of tool permissions**. A release-workflow skill should not be allowed to run any shell command; it should be limited to a narrow whitelist like `git cherry-pick`, `gh pr` and similar.
 
-This granularity is the difference between "a prompt injection causes localised damage" and "a prompt injection wipes the system".
+This granularity can reduce the blast radius if a prompt injection or model mistake reaches a tool, provided the host enforces it.
 
 Finally there is the very practical knob: **inline vs forked execution**. Inline means the skill runs directly inside the main conversation: the user sees every step and can intervene.
 
@@ -302,7 +339,7 @@ The second suits clean, self-contained tasks (writing a release note) and keeps 
 
 OpenClaw frames skills differently again. It views them as **third-party code that will be downloaded, unpacked and executed**, and therefore handles them with software-supply-chain hygiene: download, extract, statically scan, install, with audit trails at each step and a path to roll back.
 
-The first stage of that pipeline is a **static scanner**. When the user decides to install a skill, the scanner reads every code file inside the package, applies file-type-specific rule sets (dynamic execution in scripts, hard-coded credentials in config files, "ignore the previous instructions" templates in documentation), and records a finding whenever a rule fires.
+The first stage of that pipeline is a **static scanner**. When the user decides to install a skill, the scanner reads the file types it supports, applies file-specific rule sets (dynamic execution in scripts, hard-coded credentials in config files, "ignore the previous instructions" templates in documentation), and records a finding whenever a rule fires. Unsupported files and patterns outside the rule set remain out of scope.
 
 Each finding carries a rule ID, a file/line locator, a snippet of evidence, and a severity (info, warn, critical). By the time the installer has to decide "go or no go", it has a structured risk inventory in front of it.
 
@@ -389,7 +426,7 @@ async function collectSkillInstallScanWarnings(entry: SkillEntry): Promise<strin
 
 </SourceBlock>
 
-A few other engineering choices on this pipeline stand out. Scan results are cached for up to several thousand files, with the cache keyed on file size and modification time, meaning a file that hasn't changed since the last scan is not re-scanned, saving a lot of repeated regex work.
+A few other engineering choices on this pipeline stand out. Scan results are cached for up to several thousand files, with the cache keyed on file size and modification time, so unchanged files can skip repeated scans.
 
 Bundled skills follow a separate audit path that does not block user-installed workspace skills, which avoids a single built-in skill tripping a rule and bricking the whole install system.
 
@@ -425,17 +462,15 @@ VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 
 </SourceBlock>
 
-Two cells in this table are especially worth dwelling on. The "trusted origin + dangerous verdict" cell is set to *block*, meaning even a skill from the official vendor repository will be refused if the scanner finds something genuinely dangerous in it; vendors are held to their own promises.
+Two cells in this table show the policy boundary. The "trusted origin + dangerous verdict" cell is set to *block*, so an official source is not an execution grant when the scanner finds a dangerous pattern.
 
 The "agent-created + dangerous" cell is set to *ask*, meaning if the model writes itself a skill that looks risky, the system trusts neither the model (which may have been tricked) nor blanket-blocks it (the user may legitimately need that power); instead it hands the decision back to a human.
 
-Those two cells together let the table cover both straightforward and adversarial cases without overstepping.
+These cells describe install decisions for two source/verdict combinations; they do not establish security coverage or runtime authority.
 
-Alongside the trust matrix, Hermes also makes a very "progressive-disclosure" choice: every skill, regardless of origin, lives under one root directory in the user's home, and the metadata fields have hard character limits: names cap at 64 characters and descriptions at 1024.
+Alongside the trust matrix, Hermes puts every skill under one root directory in the user's home and caps the metadata: names at 64 characters and descriptions at 1024. These are schema limits in that implementation, not a universal agent standard.
 
-These look arbitrary but they are calibrated: a 64-character name fits on one terminal line; a 1024-character description is roughly 200 tokens, which is enough for the model to know "what this skill is and when to use it" but small enough that a directory of dozens of skills does not blow up the prompt.
-
-The full SKILL.md body (which can be thousands of characters) is only loaded into the prompt the moment the model decides to invoke that particular skill.
+How many tokens 1024 characters represent varies with the tokenizer, language, and model, so it is not a fixed conversion or context guarantee. The longer SKILL.md body is loaded only when the model decides to invoke that particular skill.
 
 <SourceBlock path="REF/hermes-agent/tools/skills_tool.py" lines="28-100" system="hermes" summary="A SKILL.md metadata schema that is compatible with the emerging cross-agent standard yet leaves room for vendor-specific extensions: hard caps on name and description, optional platform/dependency declarations, and a private metadata sub-tree.">
 
@@ -477,9 +512,7 @@ _PLATFORM_MAP = {
 
 </SourceBlock>
 
-This schema is also "ecosystem-friendly" in another way: it aligns with the cross-agent skill standard that is starting to emerge in the industry, meaning the same SKILL.md can be loaded by multiple agent runtimes without forking.
-
-At the same time it keeps a dedicated extension slot for Hermes's own metadata (tags, related skills) so vendor-specific information does not contaminate the public schema and is not overwritten by upstream upgrades.
+This schema aligns several public fields with `agentskills.io`, so multiple runtimes may be able to read the same SKILL.md; actual interoperability still depends on each parser. It keeps a dedicated extension slot for Hermes metadata such as tags and related skills.
 
 ## Structured depth versus authoring ease
 
@@ -493,13 +526,13 @@ The four systems sit on two axes that pull against each other: "how structured i
 
 In principle the deeper the structure, the better you can evolve and govern it long-term, but the higher the up-front cost; conversely, easy authoring gets you participation but makes permission control, ecosystem interop and supply-chain auditing harder.
 
-Codex sits at the deep-structure end: it slices the problem finely, but at the cost of expecting authors to understand scope, policy, dependencies and injection timing.
+Codex separates scope, policy, dependencies and injection timing, so authors have more boundaries to understand.
 
-Claude Code sits at the opposite end: it ships built-ins as samples and turns "saving a workflow" into a wizard, so users do not need to learn any concept to produce a working skill, at the cost of less rigorous permission boundaries and trust governance than Codex.
+Claude Code ships built-ins as samples and turns "saving a workflow" into a wizard, reducing the concepts needed for first authoring. Its permission and trust boundaries need to be evaluated separately for the target deployment.
 
-OpenClaw doesn't compete on author experience at all; instead it makes the *download → extract → scan → install* pipeline very strict, which is exactly what an IT-administered environment needs.
+OpenClaw focuses on the *download → extract → scan → install* pipeline, a path that can fit centrally audited environments.
 
-Hermes sits between these: its compact 12-cell matrix lets even non-technical users understand why one skill is installable and another is not.
+Hermes uses a compact 12-cell matrix to expose how origin and scan verdict map to an install decision.
 
 Lined up side by side, the four take-points along the same "author → load → inject → distribute → install" pipeline become clearer:
 
@@ -513,11 +546,11 @@ Lined up side by side, the four take-points along the same "author → load → 
 
 ### Mistake 1: longer skill equals better skill
 
-A common first instinct when writing a skill is to put everything in: two thousand lines of prompt, thirty steps, dozens of clarifications under each step. It feels "thorough" but it almost always fails in practice.
+A common first instinct when writing a skill is to put everything in: two thousand lines of prompt, thirty steps, dozens of clarifications under each step. That can increase model-reading and maintenance cost and make the execution path harder to inspect.
 
 The model loses focus in long middle sections and starts dropping context; and the longer the skill, the harder it is to maintain and to reuse.
 
-The skills that hold up well in production do two things: they describe "when to trigger" and "what success looks like" in the smallest number of words possible, and they reveal execution detail progressively rather than dumping it.
+For a skill that needs to remain maintainable, describe "when to trigger" and "what success looks like" concisely, then reveal execution detail progressively. Whether that holds in production depends on the workload and should be checked with task records.
 
 The two-stage loading idea (show a short description in the listing, only pull the full body in when the skill is actually invoked) exists precisely to defeat the "more is better" temptation.
 
@@ -525,21 +558,17 @@ The two-stage loading idea (show a short description in the listing, only pull t
 
 A brute-force way to make all skills "automatically available" is to concatenate every SKILL.md into the system prompt at start-up.
 
-The problem is arithmetic: with a hundred skills averaging five thousand characters each, the prompt budget is gone before the user has even said hello.
+For illustration, a catalogue of one hundred skills averaging five thousand characters would consume a large prompt budget before the user has said hello; actual impact depends on the provider and the catalogue format.
 
-The right structure is two stages: at start-up the model only sees a catalogue (one line per skill with a description capped at maybe a thousand characters); only when the model actually decides to invoke a skill is its full SKILL.md pulled in.
-
-That way the steady-state cost barely changes whether you have ten skills or ten thousand.
+The right structure is two stages: at start-up the model only sees a catalogue of names and short descriptions; only when the model actually decides to invoke a skill is its full SKILL.md pulled in. Catalogue size, cache behavior, and latency need to be measured on the target provider; a hypothetical file count does not establish a fixed saving.
 
 Codex adds an extra filter on top of this so that the catalogue only contains skills the current user and current product surface are actually allowed to implicitly trigger, keeping the listing from becoming noise of its own.
 
 ### Mistake 3: setting tool permissions to "allow Bash"
 
-If a skill's frontmatter says "this skill is allowed to use Bash", it effectively has root: anything the shell can do, the skill can do. One prompt injection later, all bets are off.
+An `allowed-tools` entry in frontmatter is not a Bash grant and certainly not root. It is a declaration or constraint. The host's tool policy, approvals, sandbox, and operating-system identity decide what actually runs. Keep the declaration narrow, such as `git cherry-pick`, `git status`, or a small set of `gh pr` operations, and enforce it again at runtime; otherwise a narrow declaration is only documentation.
 
-The correct posture is to confine tool permissions to specific sub-commands: a cherry-pick skill is allowed `git cherry-pick`, `git status` and `gh pr` and nothing else.
-
-Codex goes further and structures dependencies as typed declarations ("I need this category of tool, over this transport, calling this endpoint") so that permission checks can run statically rather than after the fact.
+Codex goes further and structures dependencies as typed declarations ("I need this category of tool, over this transport, calling this endpoint"). That supports preflight checks, but it does not grant authority or replace a runtime denial path.
 
 ### Mistake 4: treating every source of skill the same
 
@@ -551,46 +580,24 @@ Letting unreviewed third-party content execute is equivalent to opening the door
 
 The 12-cell trust matrix and the static scanner that this chapter described are both ways of saying: **origin matters as much as content**.
 
-An unknown origin plus a faint hint of suspicion is enough to refuse; a model-written skill that scans dangerous must go via the user; a definitely-dangerous skill is refused even if it came from an official source.
+In the Hermes matrix, a community origin with a caution verdict is blocked, an agent-created dangerous skill goes to the user, and a dangerous skill is blocked even when its origin is trusted.
 
 Both layers together let you keep an open ecosystem without an open door.
 
-## My take: trigger rules matter more than file length
-
-<ScoreCard
-  systems={[
-    {
-      name: 'Codex',
-      scores: { 'Structure': 5, 'Implicit trigger': 5, 'Dependency mgmt': 5, 'Install chain': 3, 'Distillation flow': 2 },
-    },
-    {
-      name: 'Claude Code',
-      scores: { 'Structure': 3, 'Implicit trigger': 4, 'Dependency mgmt': 4, 'Install chain': 3, 'Distillation flow': 5 },
-    },
-    {
-      name: 'OpenClaw',
-      scores: { 'Structure': 4, 'Implicit trigger': 3, 'Dependency mgmt': 4, 'Install chain': 5, 'Distillation flow': 2 },
-    },
-    {
-      name: 'Hermes',
-      scores: { 'Structure': 4, 'Implicit trigger': 2, 'Dependency mgmt': 3, 'Install chain': 5, 'Distillation flow': 3 },
-    },
-  ]}
-  caption="Five dimensions (1 = weakest, 5 = strongest)."
-/>
+## Trigger boundaries decide whether a skill helps
 
 ## Start with one auditable skill
 
 <BuildRecipe
   steps={[
-    { title: '1. Pick an interoperable SKILL.md schema', detail: 'Do not invent your own frontmatter. Adopt the field set the industry is already converging on: name, description, version, license, platform constraints, prerequisites, allowed tools, optional private metadata. The benefit is that the same SKILL.md becomes loadable across multiple agent runtimes, and you do not have to rewrite skills the day someone wires up cross-agent interop. Keep any private extension fields in a dedicated metadata sub-tree so they stay isolated from the public schema.' },
-    { title: '2. Add progressive disclosure', detail: 'Do not load every SKILL.md into the prompt at once. Keep an in-memory catalogue of just names and short descriptions; only when the model decides to invoke a specific skill does the full content get pulled in. Putting hard character limits on name and description (64 and 1024 are sound empirical numbers) forces authors to compress "what is it and when to use it" into one or two sentences, which is exactly what the model needs to make accurate invocation decisions.' },
-    { title: '3. Write triggers like a product spec', detail: 'Have a single house style for "when do I apply?", with concrete trigger phrases and sample user messages, and ideally a "do not use when …" list. This is the entire input to the model\'s implicit-invocation decision; the more concrete it is, the lower the false-positive and false-negative rates. A vague abstract description is far worse than even a slightly clumsy concrete one.' },
-    { title: '4. Constrain tool permissions to sub-commands', detail: 'Never give a skill broad shell access. Spell out which specific sub-commands it can call ("only git cherry-pick", "only these few gh pr sub-commands") and refuse the rest. Going further, structure the permission as a typed declaration ("I need this category of tool, over this transport, calling this endpoint") so the check can happen at load time rather than at execution time.' },
+    { title: '1. Pick an interoperable SKILL.md schema', detail: 'Start from a schema documented by the runtimes you need to support; the agentskills.io field set is one candidate. Check name, description, version, license, platform constraints, prerequisites, allowed tools, and private metadata against each target before relying on cross-runtime loading. Keep private extension fields in a dedicated metadata sub-tree.' },
+    { title: '2. Add progressive disclosure', detail: 'Do not load every SKILL.md into the prompt at once. Keep an in-memory catalogue of names and short descriptions; load the body only when a specific skill is invoked. Hermes uses 64 and 1024 as schema caps; token counts vary by tokenizer, and any effect on invocation accuracy needs a request-set evaluation.' },
+    { title: '3. Write triggers like a product spec', detail: 'Use a consistent "when do I apply?" format with concrete trigger phrases, sample user messages, and ideally a "do not use when …" boundary. These fields inform implicit-invocation decisions; whether specificity lowers false positives and false negatives is a hypothesis to measure.' },
+    { title: '4. Constrain tool declarations to sub-commands', detail: 'Write `allowed-tools` at sub-command granularity to reduce the misuse surface, then enforce it again through the host runtime policy, approvals, and sandbox. Dependency fields help with preflight; they do not grant execution authority.' },
     { title: '5. Distinguish in-conversation vs spawned execution', detail: 'Let the author declare whether this skill should run inside the main conversation (so the user can see each step and intervene) or be spawned into its own sub-process (so the result comes back as a summary and the main conversation stays clean). The first suits workflows that need a human in the loop (release work where conflicts may need a human); the second suits clean tasks that should run end-to-end (auto-generating a release note).' },
-    { title: '6. Treat skills as third-party code and scan them', detail: 'A SKILL.md is content that will be loaded into a prompt or interpreted; that is not categorically different from installing an npm package. Build a static scanner that applies file-type-specific rule sets (dynamic execution in scripts, hard-coded credentials in configs, prompt-injection templates in docs) and classifies findings as info / warn / critical. Block critical findings, prompt on warnings, and cache scan results by file size and mtime so unchanged files are not re-scanned.' },
+    { title: '6. Treat skills as external input and scan them', detail: 'The SKILL.md body can influence the prompt, while bundled scripts may be executed; scan those risk paths separately. Check dynamic execution, hard-coded credentials, and prompt-injection templates by file type, and record info / warn / critical findings as install evidence. A scan does not replace runtime policy or sandboxing.' },
     { title: '7. Make origin part of the decision', detail: 'Scanning the contents is not enough; you also have to ask "where did this come from?". Tag every skill with an origin label (built-in, vendor-trusted, community, model-generated), then cross "origin × verdict" into a decision table whose cells explicitly say allow / block / ask-the-user. This is the other half of defence in depth and catches whole classes of risk the scanner alone will miss.' },
-    { title: '8. Give users a shortcut for distilling workflows', detail: 'After a finished session, users should be able to crystallise what just happened into a skill with one short command. Do not ask them to sit down and write a SKILL.md from scratch; give them a three-to-five-step wizard: summarise what we just did, define what should re-trigger it next time, tick the tools that should be allowed, choose inline-or-spawn. Completion rate beats from-scratch authoring by a wide margin, and it is the single most effective way to turn lived experience into a reusable asset.' },
+    { title: '8. Give users a shortcut for distilling workflows', detail: 'After a finished session, let users keep the workflow through a short wizard: confirm the task, add trigger boundaries, choose which tools to declare, and select inline or spawned execution. Whether this is easier than hand-authoring must be checked with your own completion records and follow-up, not an unpublished comparison.' },
   ]}
 />
 
@@ -599,16 +606,14 @@ Both layers together let you keep an open ecosystem without an open door.
 Whether you actually need to add a skill subsystem to your agent can be self-diagnosed against the following seven questions:
 
 1. **Is this workflow genuinely recurring?** If something like backporting a fix to release, writing release notes, or running a code review happens several times a week, it is worth crystallising. If it is a one-off, a plain prompt template is enough; there is no need to stand up a subsystem for it.
-2. **Can the people who will write skills write Markdown?** Engineer-heavy audiences are usually fine writing SKILL.md directly. Products aimed at non-engineers must ship a "distill a skill from this session" wizard, otherwise nobody will actually create one.
-3. **Do you need a skill marketplace or external distribution?** If skills only live inside your product or your organisation, then local files plus shipped-with-binary defaults are enough. If users can install skills from the outside, you must have origin tagging and static scanning in place; otherwise you are accepting third-party code with no review.
-4. **Do you want the model to decide on its own when to invoke?** Implicit invocation feels great when it works, but it requires every skill's trigger description to be very concrete. If you can't enforce that, fall back to explicit invocation (`/name`): much less impressive but far more predictable.
-5. **Will skills depend on external credentials or commands?** If yes, declare those dependencies in metadata and resolve them up-front so the agent can confirm everything is in place before the run starts. Leaving it in documentation and hoping the user reads it is a recipe for frustration.
+2. **Can the people who will write skills write Markdown?** Engineer-heavy audiences are usually fine writing SKILL.md directly. Products aimed at non-engineers will often need a "distill a skill from this session" wizard; measure whether it reduces authoring friction.
+3. **Do you need a skill marketplace or external distribution?** If skills only live inside your product or organisation, local files plus shipped defaults may be enough. If users can install skills from outside, add origin tagging, static scanning, and an explicit review/failure path.
+4. **Do you want the model to decide on its own when to invoke?** Implicit invocation may reduce explicit commands, but it requires concrete trigger boundaries. If those boundaries cannot be enforced, explicit invocation (`/name`) is a simpler fallback; compare both paths with labeled requests.
+5. **Will skills depend on external credentials or commands?** If yes, declare those dependencies in metadata and resolve them up-front so the agent can confirm the environment before the run starts. Whether this improves completion depends on the credential flow and task mix.
 6. **Does the workflow need a human in the loop?** Workflows that need intervention are better off running in the main conversation; clean, self-contained workflows are better off spawned into a sub-process so they do not pollute the main conversation with hundreds of tool calls.
 7. **How will skills come into existence?** If authors are happy to write them by hand, a template and some examples are enough. If you want users to distill skills from conversations they just finished, you need to build a guided wizard: non-trivial, but the highest return on investment.
 
-Rule of thumb: one or two yeses means a prompt template plus a few examples is plenty.
-
-Five or more yeses, and it is worth treating the skill subsystem as its own engineering project: borrow structure from Codex, authoring experience from Claude Code, install and scan from OpenClaw, trust matrix from Hermes.
+Do not choose a full subsystem from a yes-count. Start with a template, explicit command, and a few examples when the workflow is stable but distribution and auditing are out of scope; add the corresponding loader, dependency, or trust pieces when those become recurring constraints.
 
 ## Follow the skill loader through source
 
@@ -628,6 +633,8 @@ Five or more yeses, and it is worth treating the skill subsystem as its own engi
     { label: 'Hermes · SKILL.md schema', path: 'REF/hermes-agent/tools/skills_tool.py', system: 'hermes', lines: '28-100' },
   ]}
 />
+
+</details>
 
 ## Where to continue
 
@@ -650,8 +657,8 @@ Four concepts, going from fine to coarse granularity:
 
 **tool**: one atomic operation. bash / file_read / git_status. Stateless, single call, returns a result.
 **prompt template**: a string + variables. User actively fills variables to invoke. No trigger mechanism, no metadata.
-**skill**: a workflow + trigger conditions + dependencies. SKILL.md + frontmatter. Model can invoke implicitly, can carry allowed-tools / dependencies.
-**agent**: an independent loop + multi-tool coordination + persistent state. Owns its system prompt + tool box + memory.
+**skill**: a workflow + trigger conditions + dependencies. SKILL.md + frontmatter. The file can carry `allowed-tools` / `dependencies` declarations, while the runtime decides what is actually permitted.
+**agent**: an independent loop + multi-tool coordination + persistent state. Owns its system prompt + tool set + memory.
 
 **Why have a skill layer?**
 
@@ -663,12 +670,12 @@ Prompt templates are too weak (no trigger), agents too heavy (each spawn is a ne
 
 **Concrete forms**:
 
-- `cherry-pick-to-release`: frequent and multi-step, must be a skill
+- `cherry-pick-to-release`: frequent and multi-step, a good candidate for a skill
 - `write-changelog`: semi-frequent, skill or prompt template both work
 - `git status`: single step, it's a tool
 - `data-scientist`: independent persona + long state, it's an agent
 
-**Follow-up**: "Can a skill call a tool?" Yes. A skill is prompt + tool list + when_to_use. At execution time it still uses the main agent's tool box.
+**Follow-up**: "Can a skill call a tool?" It can request a tool. A skill is prompt + tool declaration + `when_to_use`; the host runtime policy, approvals, and sandbox still decide whether the request runs.
 
 **Follow-up**: "Difference between skill and sub-agent?" Sub-agent spawns a new process + independent context window; skill shares main agent context (unless `context: fork`).
 
@@ -703,7 +710,7 @@ Claude Code puts skill logic in `src/skills/` + `src/tools/SkillTool/`, single T
 **Why the difference?**
 
 - Rust + Cargo workspace encourages multi-crate
-- TS / Node single-package costs less
+- TS / Node single-package layouts can reduce repository-level module boundaries; the actual refactor effort depends on interfaces, tests, and toolchain constraints
 - Codex plans for skill as a platform capability (marketplace + plugin)
 - Claude Code skill is an IDE-embedded feature
 
@@ -711,11 +718,11 @@ Claude Code puts skill logic in `src/skills/` + `src/tools/SkillTool/`, single T
 
 - Team work-split: 8 crates can be worked on by 8 people in parallel
 - Code navigation: skill injection logic → `injection/`
-- Refactor safety: crate boundaries are natural API contracts
+- Refactor safety: crate boundaries can serve as API contracts, with tests and review
 
 **Follow-up**: "Downsides?" High engineering overhead, cross-crate calls need explicit exports. Changing a common type means changing 8 imports.
 
-**Follow-up**: "Will Claude Code's monolithic structure cause problems when it expands?" TS refactor cost is lower than Rust; split later if needed. MVP first.
+**Follow-up**: "Will Claude Code's monolithic structure cause problems when it expands?" A split may become useful as ownership or dependency boundaries grow. Compare the migration effort against the existing interfaces and test coverage; the source does not establish that TypeScript refactors cost less than Rust refactors.
 
 **Source**: [`codex/codex-rs/core-skills/Cargo.toml`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core-skills/Cargo.toml) + [`codex/codex-rs/core-skills/src/lib.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core-skills/src/lib.rs).
 </details>
@@ -770,7 +777,7 @@ def install_decision(level, verdict):
     return INSTALL_POLICY[level][VERDICT_INDEX[verdict]]
 ```
 
-Zero runtime cost, fully checked at compile time.
+This function only looks up the install decision. Whether execution is possible still depends on the install flow, tool policy, approvals, and sandbox; the snippet does not establish runtime overhead or compile-time enforcement.
 
 **Follow-up**: "How is a skill's trust level decided?" By install source:
 - bundled directory → builtin
@@ -778,7 +785,7 @@ Zero runtime cost, fully checked at compile time.
 - user-initiated URL install → community
 - model write_file → agent-created
 
-**Follow-up**: "Matrix not fine enough?" Add more trust levels (enterprise / paid), keep NxM small. Hermes's 12 cells already cover 95% of cases.
+**Follow-up**: "Matrix not fine enough?" Use real install records to find missing origins or verdicts before adding trust levels (enterprise / paid). Hermes's 12 cells describe its current policy; they do not prove coverage.
 
 **Source**: `hermes-agent/tools/skills_guard.py:INSTALL_POLICY + VERDICT_INDEX`.
 </details>
@@ -786,7 +793,7 @@ Zero runtime cost, fully checked at compile time.
 <details>
 <summary>**Q4 · Concept**: How does progressive disclosure apply in a skill system?</summary>
 
-Progressive disclosure = "give the summary first; load detail on demand." Hermes's `MAX_NAME_LENGTH=64` + `MAX_DESCRIPTION_LENGTH=1024` is a classic application.
+Progressive disclosure = "give the summary first; load detail on demand." Hermes's `MAX_NAME_LENGTH=64` and `MAX_DESCRIPTION_LENGTH=1024` are limits in that implementation, not a universal agent standard.
 
 **Two-phase loading**:
 
@@ -795,30 +802,23 @@ Progressive disclosure = "give the summary first; load detail on demand." Hermes
 - description (≤1024 char)
 - platforms / prerequisites
 
-The model sees a 10-skill list, each ~1100 char summary = 11000 char total prompt footprint.
+The listing metadata enters the prompt; the footprint depends on the number of skills, actual descriptions, and the host's list format.
 
 **Phase 2 (invocation)**: load full SKILL.md
 - prompt body
 - example code
 - detailed steps
 
-Only when the model decides to invoke a skill does it pull the entire SKILL.md content into the prompt.
+Only when the model decides to invoke a skill does it pull the body into the prompt. Tool declarations may be parsed earlier for candidate selection or dependency preflight, but they do not grant runtime authority; the host policy, approvals, and sandbox still decide what executes.
 
-**Benefit**:
-
-For 100 skills, each SKILL.md averaging 5000 char:
-
-- Without progressive disclosure: load all = 500K char = ~125K tokens. Blows context.
-- With progressive disclosure: list 110K char ≈ 28K tokens. Invoke one skill +5K char ≈ 1.25K tokens.
-
-100x savings.
+Do not turn an assumed skill count and average file size into a fixed token-savings claim. Record the listing and invocation prompts, cache behavior, and latency on the target provider.
 
 **Why 64 / 1024?**
 
 - 64 char name: fits one terminal row + screen-width friendly
-- 1024 char description: about 200 tokens; model reads "what this skill does" in a sentence chunk
+- 1024 char description: token count varies by tokenizer, so characters are not a fixed context-capacity conversion
 
-**Anthropic's skill docs recommend**: name ≤64, description ≤1024, fact standard across products.
+Those two limits come from the Hermes source; other runtimes need their own schema check.
 
 **Codex equivalent**:
 
@@ -883,8 +883,8 @@ context: <Round 4 choice>
 
 **Why 4 rounds + AskUserQuestion instead of one-shot prompt?**
 
-- One prompt with 4 questions → user burden too high → high drop rate
-- 4 rounds, one choice each → completion rate is high
+- A single form can make the next decision too heavy
+- Separate rounds keep each decision small; completion still needs to be measured in the product's own flow
 - AskUserQuestion provides choices, reduces typing
 - session context auto-fills defaults (allowed-tools auto-lists already-used tools)
 
@@ -894,9 +894,9 @@ context: <Round 4 choice>
 - Inline / fork is a UX choice; model can't guess accurately
 - User participation = user owns the generated skill, will actually use it next time
 
-**Eval data**:
+**Evidence boundary**:
 
-Source comments cite skillify vs hand-written SKILL.md eval: user completion rate 85% vs 35% (writing from scratch).
+Source comments mention an internal skillify evaluation, but do not publish the sample, procedure, or aggregation. Treat the wizard as a design that lowers authoring effort; do not generalize an unpublished completion comparison.
 
 **Compared with other systems**:
 
@@ -904,7 +904,7 @@ Source comments cite skillify vs hand-written SKILL.md eval: user completion rat
 - OpenClaw goes skills-install for external skills, doesn't sediment local sessions
 - Hermes occasionally lets the agent write under the agent-created path, no UI wizard
 
-**Claude Code's skillify is unique**, fitting given Claude Code's team is prompt-design heavy.
+Claude Code's skillify is a distinctive choice in the reviewed source. Whether it fits another product depends on whether users will confirm trigger boundaries and the persistence location.
 
 **Follow-up**: "Auto-extract trigger phrases?" Let Claude read the session, propose top-3 trigger candidates, let user pick / edit. Semi-automatic.
 
@@ -918,9 +918,9 @@ Source comments cite skillify vs hand-written SKILL.md eval: user completion rat
 
 5-phase roadmap:
 
-**Week 1 · Pick SKILL.md standard**
+**Phase 1 · Pick a SKILL.md schema**
 
-Borrow agentskills.io: `name / description / version / license / metadata`. Don't invent your own frontmatter.
+Use the public agentskills.io fields as a reference, then verify which fields the target runtime actually parses.
 
 ```yaml
 ---
@@ -933,7 +933,7 @@ metadata:
 ---
 ```
 
-**Week 2 · Add progressive disclosure**
+**Phase 2 · Add progressive disclosure**
 
 ```python
 def list_skills_for_prompt() -> str:
@@ -945,7 +945,7 @@ def load_skill_body(name: str) -> str:
 
 Borrow Hermes 64+1024 char limits.
 
-**Week 3 · Add trigger description**
+**Phase 3 · Add trigger descriptions**
 
 ```yaml
 when_to_use: |
@@ -955,9 +955,9 @@ when_to_use: |
   - Example: "fix critical bug in release-2.5"
 ```
 
-Borrow Claude Code `when_to_use` golden formula.
+Use Claude Code's `when_to_use` format as a reference, then test its boundary with negative examples.
 
-**Week 4 · Tighten allowed-tools**
+**Phase 4 · Tighten allowed-tools**
 
 ```yaml
 allowed-tools:
@@ -969,7 +969,7 @@ allowed-tools:
 
 Don't allow `Bash` globally.
 
-**Week 5-6 · Add trust + scanner (if marketplace)**
+**Phase 5 · Add trust + scanner (if there is external installation)**
 
 ```python
 TRUST_LEVELS = ["builtin", "trusted", "community", "agent-created"]
@@ -992,7 +992,7 @@ def scan_skill(skill_path: Path) -> str:
 
 Borrow Hermes 12-cell + OpenClaw scanner.
 
-**Week 7-8 · Add skillify sedimentation (optional)**
+**Phase 6 · Add a skillify flow (optional)**
 
 ```python
 @cli.command()
@@ -1008,7 +1008,7 @@ def skillify():
 
 Borrow Claude Code 4-round wizard.
 
-**Week 9+ · Add implicit invocation (optional · advanced)**
+**Phase 7 · Add implicit invocation (optional)**
 
 ```python
 def detect_implicit_skill(user_msg: str) -> Optional[Skill]:
@@ -1022,11 +1022,11 @@ Borrow Codex `detect_implicit_skill_invocation_for_command`.
 
 **Key decisions**:
 
-1. **agentskills.io is the de facto standard, don't invent your own**
-2. **Progressive disclosure is mandatory, otherwise prompt explodes**
+1. **Check agentskills.io fields against the target runtime before extending them**
+2. **Use progressive disclosure as the catalogue grows**
 3. **Trust + scanner only when shipping a marketplace**
-4. **skillify has the best UX, but most engineering work**
-5. **Implicit invocation is dessert, start with explicit invocation**
+4. **skillify may lower authoring friction, but needs completion data to justify the work**
+5. **Treat implicit invocation as an experiment after an explicit-invocation baseline**
 
 **Follow-up**: "What to skip for MVP?" Skip trust + scanner + implicit. Start with SKILL.md + progressive disclosure + allowed-tools.
 
@@ -1067,17 +1067,17 @@ Per-extension danger patterns:
 - Hermes: 11 regex patterns + 10 invisible unicode
 - OpenClaw: multi-file-type + 3-severity + 5000-entry cache
 
-OpenClaw fits marketplaces better (multi-file skill packs); Hermes fits inline content (single-text scan).
+OpenClaw's scan path covers multi-file skill packages; Hermes's example focuses on single-text memory. Fit for a marketplace or inline content depends on the install format and threat model.
 
 **What's the 5000 cache for?**
 
-Scanning a 5000-char content takes ~50ms (many regexes). Cache prevents rescans. `LRU(5000)` ≈ 50MB memory, acceptable.
+The source gives cache entry bounds, not a scan-time or memory measurement for this site. Do not infer ~50ms or ~50MB from the value 5000; record the cost on the target machine.
 
 **Follow-up**: "How to scan Python skills?" Add `.py` extension + Python-specific patterns (`exec`, `eval`, `__import__`, `subprocess.run`).
 
 **Follow-up**: "Binary files?" Default skip, or check file header for executable. Don't go deep.
 
-**Follow-up**: "How to prevent scanner bypass?" Can't fully prevent. Attackers can obfuscate (base64 / string concat). So scanner reduces false-install rate, not "100% block." Combine with trust level for full defense.
+**Follow-up**: "How to prevent scanner bypass?" You cannot fully prevent it. Attackers can obfuscate (base64 / string concatenation). A scanner only covers risks expressed in its rule set; combine it with origin, human confirmation, and runtime isolation.
 
 **Source**: [`openclaw/src/security/skill-scanner.ts:10-53`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/security/skill-scanner.ts#L10-L53).
 </details>
@@ -1089,7 +1089,7 @@ Claude Code SKILL.md has a `context: inline | fork` field:
 
 **inline**: shares prompt with main agent
 - skill loads into main agent's prompt
-- skill's tool calls use main agent's tool box
+- tool requests remain subject to the main agent's runtime policy, approvals, and sandbox
 - skill results go directly into main conversation
 - user sees skill execution
 
@@ -1103,13 +1103,13 @@ Claude Code SKILL.md has a `context: inline | fork` field:
 
 - Workflows needing user intervention (cherry-pick might hit conflicts to resolve)
 - Tightly-coupled context with main agent (continue what we were doing)
-- Short single-execution (< 5 turns)
+- Short execution where the user may redirect the work
 
 **fork suits**:
 
 - Self-contained workflows (write changelog runs to completion, main agent doesn't need to participate)
 - Heavy context pollution (lots of tool calls you don't want in main conversation)
-- Long execution (> 10 turns)
+- Long execution where the main conversation does not need to intervene step by step
 - Parallel (run multiple reviews concurrently, each in its own fork)
 
 **Examples**:
@@ -1124,7 +1124,7 @@ Claude Code SKILL.md has a `context: inline | fork` field:
 **Compared to Codex / OpenClaw**:
 
 Codex has no explicit inline / fork field; it implicitly decides via `SkillScope` (the skill's visibility) and `SubAgentSource` (whether to spawn a dedicated subagent for it).
-OpenClaw uses `skills-runtime` (an isolated skill execution runtime process), similar to fork but lighter to spawn.
+OpenClaw uses `skills-runtime` (an isolated skill execution runtime process), semantically similar to fork; its actual isolation and startup cost depend on the host implementation.
 
 **Claude Code's inline / fork is the user-friendly explicit API**:
 
@@ -1132,7 +1132,7 @@ The skill author sets `context: fork`, execution environment is settled.
 
 **Follow-up**: "How are arguments passed to fork?" Pack relevant context from main agent into a prompt segment. Claude Code's `Task` tool takes a `prompt` parameter.
 
-**Follow-up**: "How does fork call tools?" Subagent has its own tool box (constrained by skill.allowed-tools). Cannot use main agent's tools.
+**Follow-up**: "How does fork call tools?" A subagent usually receives its own tool set, still constrained by `allowed-tools`, host policy, approvals, and sandbox. The SKILL.md alone cannot prove which tools it can or cannot share with the main agent.
 
 **Source**: `claude-code/src/tools/SkillTool/SkillTool.ts` + Claude Code Task tool.
 </details>
@@ -1140,7 +1140,7 @@ The skill author sets `context: fork`, execution environment is settled.
 <details>
 <summary>**Q9 · Engineering**: Is LLM-extracted trigger phrase accurate? How to improve accuracy?</summary>
 
-The better `when_to_use` is written, the more accurate implicit invocation.
+More specific `when_to_use` text may affect implicit invocation, but precision, recall, and review cost need a labeled request-set evaluation.
 
 **Pain points of hand-writing when_to_use**:
 
@@ -1168,18 +1168,15 @@ def extract_triggers(skill_path: Path, sample_sessions: list[Session]) -> str:
 
 1. **Positive + negative samples**: show LLM "should-trigger" + "shouldn't-but-looks-similar" pairs
 2. **Eval feedback loop**: run test dataset, check precision/recall, iterate trigger phrases
-3. **Multi-model voting**: claude / gpt / gemini all extract, take intersection
+3. **Multi-model voting (to test)**: ask several models for candidates, then measure whether their intersection reduces false triggers
 4. **User feedback**: false trigger → user marks → add to negative samples
-5. **Tier triggers**: must-trigger ("backport this fix") + may-trigger ("apply to release"), different confidence
+5. **Tier triggers**: separate high-confidence ("backport this fix") and candidate ("apply to release") phrases, then measure thresholds
 
 **Claude Code's eval pattern**:
 
-Source comments use `H1 0/2 → 3/3` tags throughout. Each prompt section was eval'd:
-- H1-H5 = 5 capability cases
-- 0/2 = baseline pass rate
-- 3/3 = post-optimization pass rate
+Source comments include labels such as `H1 ...`, but do not publish the complete sample, runtime, or aggregation method. Treat them as case-level notes attached to prompt literals, not as a benchmark for this site or across products.
 
-Eval-driven prompt design is production-grade.
+To reuse the method, keep each case's input, expected behavior, runtime version, and raw output beside the edit, then compare the before/after runs.
 
 **Anti-pattern · don't do this**:
 
@@ -1209,7 +1206,7 @@ when_to_use: |
 
 Includes positive + negative samples and multiple trigger expressions.
 
-**Follow-up**: "How to test trigger accuracy?" Write 50 sample user messages (25 should-trigger, 25 shouldn't), run implicit detection, check P/R. Production rec: P/R > 0.9.
+**Follow-up**: "How to test trigger accuracy?" Start with a labeled set of requests, mark which should and should not trigger, and record false positives and false negatives. Choose sample size and any release threshold from the cost of an interruption and the results of human review; this chapter does not set a universal numeric target.
 
 **Follow-up**: "How to auto-learn from false triggers?" Sessions where user skipped a skill become negative samples. Next eval run includes these to verify new triggers don't false-fire.
 
@@ -1221,7 +1218,7 @@ Includes positive + negative samples and multiple trigger expressions.
 
 5-layer architecture:
 
-**Layer 1 · SKILL.md standard (mandatory · agentskills.io compat)**
+**Layer 1 · SKILL.md schema (when cross-runtime reuse matters)**
 
 ```yaml
 ---
@@ -1250,7 +1247,7 @@ metadata:
 
 Borrow Hermes agentskills.io compat + Claude Code when_to_use.
 
-**Layer 2 · Progressive Disclosure (mandatory)**
+**Layer 2 · Progressive Disclosure (when the catalogue grows)**
 
 ```python
 class SkillRegistry:
@@ -1304,7 +1301,7 @@ def scan_skill(skill_path: Path) -> str:
 
 Borrow OpenClaw skill-scanner 8 extensions + critical/warn/info.
 
-**Layer 5 · Skillify Sedimentation (recommended · DX killer)**
+**Layer 5 · Skillify flow (optional when authors will not write files directly)**
 
 ```python
 @cli.command()
@@ -1342,26 +1339,19 @@ Borrow Codex `detect_implicit_skill_invocation_for_command`.
 
 **Core design principles**:
 
-1. **agentskills.io is the de facto standard**: don't invent your own frontmatter
-2. **Progressive disclosure mandatory**: otherwise prompt explodes
-3. **Inline is default**: fork is optimization
-4. **Scanner isn't 100% protection**: combine with trust level
-5. **skillify is the DX killer**: but heavy engineering
+1. **Prefer compatibility with public SKILL.md conventions**: check the target runtime before adding fields
+2. **Use progressive disclosure when the catalogue grows**: keep metadata in the listing and load bodies on demand
+3. **Choose inline or fork explicitly**: their context, observability, and runtime boundaries differ
+4. **A scanner only covers known rules**: combine it with origin, human confirmation, and a runtime sandbox
+5. **Skillify can lower the authoring barrier**: users still need to confirm triggers and persistence
 
-**Replication cost**:
+Scope and delivery time depend on the existing loader, runtime policy, install channel, and verification coverage; this chapter does not estimate a schedule.
 
-- Layer 1-2: mandatory, 2-3 weeks
-- Layer 3-4: recommended if marketplace, 3-4 weeks
-- Layer 5: recommended, 2-3 weeks
-- Layer 6: optional, 2-3 weeks
-
-Total v0.1 (Layer 1-2) one month, v1.0 (Layer 5) three months.
-
-**Follow-up**: "How do skills share across agents?" agentskills.io compat: any supporting agent can read.
+**Follow-up**: "How do skills share across agents?" Reuse is possible only when the target runtimes agree on schema, body format, and tool semantics; verify compatibility field by field.
 
 **Follow-up**: "How to version skills?" SemVer + immutable distribution. Upgrade = reinstall.
 
-**Source mosaic**: All four systems' best parts layered together.
+**Source mosaic**: Components from the four implementations combined by need; this is not a unified architecture benchmarked by this site.
 </details>
 
 </details>

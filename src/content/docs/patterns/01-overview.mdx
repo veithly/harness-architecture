@@ -1,6 +1,9 @@
 ---
-title: 01 · Agent 设计：四系统总览
-description: Codex、Claude Code、OpenClaw、Hermes 各自是什么定位，本站为什么把它们放一起对比
+title: 01 · Agent 设计：先按失败成本选骨架
+description: 用失败成本和可验证性选择 Agent 运行时骨架，沿着四个源码入口定位该借什么、该避开什么。
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 sidebar:
   order: 1
 ---
@@ -8,27 +11,15 @@ sidebar:
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
-## 为什么把这四个系统放在一起
+## 从失败成本开始选 Agent 骨架
 
-<Verdict tldr="挑这四家，是因为它们刚好覆盖现代 agent 工程的四种代表形态，加起来就是 agent 架构的四种不同形态。Codex 是硬约束的 coding 闭环：把 loop 拆成 submit（外部动作进入 loop 的入口）、event（loop 每步输出的事件）、turn（一次「模型说话加工具执行」叫 turn）、goal（跨多个 turn 的任务目标）四层事件机器，4 个客观 verifier（独立判定模型是否完成任务的检查器，verifier 即审计器）串联兜底，根本不信模型自评。Claude Code 是 Anthropic 协议的 reference 实现（参考实现，给生态对齐用）：用 7 种 transition.reason（每次 loop continue 时贴的原因标签，让状态机最显式）标签把 loop 状态机做到最显式，4 道上下文压缩管线加 60 行 TOKEN_BUDGET（按 token 收敛速率判退的软 verifier 算法）防 OOM（Out Of Memory，context 撑爆）。OpenClaw 把 agent 当会话控制面做：唯一一家把 loop 写成官方文档，session lane（会话通道，每个 session 一条 lane 串行执行）串行化加十几个 plugin hook（插件钩子，在 loop 关键节点注入自定义逻辑）让 verifier 完全中间件化。Hermes 是长跑加自改进的 Python agent：单 loop 不严格，靠 insights（loop 结束后跑一遍自评写回 memory）跨会话累积加注入前 prompt injection 扫描兜底。四家一起看才能形成 agent 架构的完整认知。" />
+<Verdict tldr="你要先决定：Agent 的失败是改错一次就不能接受，还是允许一次任务不完美但要跨会话继续学？本章用这个约束读取四个源码样本。Codex 持久化 rollout 并检查 coding 产物；Claude Code 记录重试与压缩原因；OpenClaw 把 session 运行暴露成可观察任务；Hermes 把反馈带到下一次任务。这些是场景选择，不是通用排名。" />
 
-## 短期可控与长期自治
-
-<details>
-<summary>读前提示（按需展开）</summary>
-
-- **四家 = 四种形态**：Codex 硬约束 coding 闭环，Claude Code 协议参考实现，OpenClaw 会话控制面，Hermes 长跑自改进。合起来才是四种不同形态。
-- **最深的分歧在信任**：Codex 根本不信模型自评（4 个外部 verifier 串联），Hermes 反而靠模型自评（insights 写回 memory）——信任度决定架构重量。
-- **选型第一问**：你的 agent 偏"短期可控"还是"长期自治"？答案直接决定该抄哪家。
-- **别平均**：四家没有"综合最优解"，混搭之前先检查两套机制的状态假设是否兼容。
-
-</details>
+## 两种失败成本，四个可借鉴的边界
 
 <Diagram
   src="/diagrams/01-overview-base.svg"
@@ -51,26 +42,26 @@ import AgentLoopSVG from '@components/AgentLoopSVG.astro';
   dimensionLabel="维度"
 />
 
-## 四套系统各自在防什么
+## 只在决策分叉处看源码
 
-### Codex · 不信模型自评，loop 走 4 个客观 verifier 兜底
+### Codex · 用 patch、策略和目标状态提供可复核信号
 
 Codex 是 OpenAI 官方的 coding agent，核心是 Rust 写的 `codex-rs` workspace，外加 TypeScript 写的 CLI 包装层 codex-cli。它最先处理的问题是：模型说自己做完了，在生产环境基本不能信。模型经常没完成但觉得完成（改了一个文件就以为整个 bug 修好；跑一次测试通过就以为修好，但是测试覆盖不全）。
 
-所以 Codex 不让模型自评决定 loop 停不停，用 4 个客观 verifier 串联兜底：
+因此 Codex 源码把几类可复核信号分开处理；它们是否组成某个项目的完成门禁，由宿主工作流配置：
 
 - `apply_patch` 校验：patch 必须符合 V4A 语法。
-- `run tests` 退出码：exit code 非 0 即任务未完成。
-- `goals.rs` 收敛检测：每个 Goal 的子目标必须全部触达。
+- `run tests` 退出码：宿主若配置测试，exit code 可作为失败信号。
+- `goals.rs` 收敛检测：跟踪 Goal 的子目标状态，不能单独证明业务完成。
 - `execpolicy` 命令审查：每条 shell 命令过 Allow、Prompt、Forbidden 三态决策器。
 
-「task done」做成机器可判断的事，loop 完全脱离模型自评。
+这些信号让部分状态可以机器复核，但不等于所有任务都有自动完成证明。
 
 loop 结构上 Codex 不写 `while True`（那样跑挂了状态全丢），而是拆成 submit、event、turn、goal 四层事件机器。外部动作（用户输入、超时、中断）通过 `submit(Op)` 进入。loop 每步事件通过 `next_event()` 输出给外部观察者。Turn 是一次「模型说话 → 工具执行 → 模型再说话」的最小循环。Goal 是 Turn 之上的更长周期任务目标。
 
 每步通过 `flush_rollout()` 写进 rollout JSONL，这个文件就是 loop 的物理时间线。机器重启读 rollout 重建状态，用户看历史回放 rollout，行为分析聚合多份 rollout，跨 agent 通信也走这套机制。
 
-代价是硬约束只在 coding 场景生效。所有抽象（Turn、Goal、patch、tests）都围绕 coding 设计。让 Codex 写 PRD 或做调研，4 个 verifier 全部失灵（没 exit code 可看，没 patch 要打，Goal 收敛判断没意义）。
+代价是这些信号主要服务 coding 场景。PRD 或调研任务没有 patch 和测试，Goal 状态也不能替代内容评审；宿主必须另接来源核验、人工复核或领域检查。
 
 ### Claude Code · 用 7 种 transition.reason 把 loop 状态机做到最显式
 
@@ -91,15 +82,15 @@ loop 状态机变成带原因注释的状态机。
 工程亮点几个：
 
 - **4 道上下文压缩管线**：`applyToolResultBudget` 按工具上限砍返回值（便宜）走 `snipCompact` 加 `microcompact` 做局部裁剪（便宜）走 `contextCollapse` 把已确认的历史折叠成 view 引用（开始变贵）走 `autocompact` 越阈值就 fork 独立 agent 总结整段历史（最贵）。任一档失败连续 3 次走断路器。注释直接写线上数据：「1,279 sessions had 50+ consecutive failures (up to 3,272) in a single session, wasting ~250K API calls/day globally」。
-- **TOKEN_BUDGET 软 verifier**：`query/tokenBudget.ts` 用 60 行算法定义 diminishing returns（90% 阈值加 500 token 增量阈值加 3 轮连续低增量）。用 token 增量趋势而不是绝对 token 数判退，算法对所有任务通用。
+- **TOKEN_BUDGET 软 verifier**：`query/tokenBudget.ts` 用 60 行算法定义 diminishing returns（90% 阈值加 500 token 增量阈值加 3 轮连续低增量）。它只说明 Claude Code 采用了这组启发式；换模型或任务前，要用自己的 stop/continue 记录重新校准。
 - **Task.ts 多 agent 模型**：7 种 TaskType（`local_bash`、`local_agent`、`remote_agent`、`in_process_teammate`、`local_workflow`、`monitor_mcp`、`dream`），queryTracking 追踪 subagent 调用链。
 - **Memory prefetch**：TS 5 `using` 关键字让 loop 任何路径退出都自动 dispose，省掉手动 finally。
 
 代价是 1729 行所有路径耦合在单文件，没有插件钩子。想给 verifier 加自定义中间件、替换压缩策略、接外部观测器，只能 fork 整个 query.ts。这是 Claude Code 在二开友好度上的明显短板。
 
-### OpenClaw · 唯一把 loop 文档化的开源 agent，verifier 和工具栈完全中间件化
+### OpenClaw · 把 loop 写进公开文档，并用中间件承载 verifier
 
-OpenClaw 是四家里唯一把整个 loop 写成官方文档的（`docs/concepts/agent-loop.md` 18-148 行）。外部开发者读文档就能理解 loop，不用读源码。
+在这四个样本里，OpenClaw 把整个 loop 写进了公开文档（`docs/concepts/agent-loop.md` 18-148 行）。文档能先给出运行边界，源码仍然是核对细节的入口。
 
 它最先处理的问题是：作为同时支持 Telegram、Slack、Web、IDE 多通道入口的开源 agent，loop 不能是函数调用式（同步等到结果才返回），必须是可观察的后台 job：用户调用 `agent` RPC 立即返回 runId，job 在后台跑，外部任何时候都可以通过 runId 订阅事件流看进度。这让 loop 变成一等公民的后台资源，对接多通道、多用户场景天然适配。
 
@@ -116,11 +107,11 @@ OpenClaw 是四家里唯一把整个 loop 写成官方文档的（`docs/concepts
 最值得参考的两件事：
 
 - **session lane**：同 session 内多个 run 强制串行化（不并发），避免工具状态和历史消息的竞态。Codex 和 Hermes 都没显式做这一层，默认假设单用户单 session，并发场景容易出问题。
-- **工具栈拆分**：`tool-policy-pipeline` 把权限、审计、缓存做成中间件链（`before_tool_call`、`after_tool_call`、`tool_result_persist` 三个 hook 都可插），`tool-loop-detection` 4 种 detector（generic_repeat、known_poll_no_progress、ping_pong、global_circuit_breaker）专门防死循环，`tool-fs-policy` 是文件系统专用的二级权限层。这十几个文件构成了 OpenClaw 工具中间件能力的天花板，二开友好度最高。
+- **工具栈拆分**：`tool-policy-pipeline` 把权限、审计、缓存做成中间件链（`before_tool_call`、`after_tool_call`、`tool_result_persist` 三个 hook 都可插），`tool-loop-detection` 4 种 detector 处理不同循环形态，`tool-fs-policy` 是文件系统专用的二级权限层。OpenClaw 的可扩展性主要来自这组 hook，代价是调用链更长。
 
-### Hermes · verifier 摊到时间轴上，靠跨会话累积变聪明
+### Hermes · verifier 摊到时间轴上，靠跨会话记录反馈
 
-Hermes 是 Python 写的、跑在用户本机的长期助理。它最先处理的问题是：长跑 agent（陪伴用户几个月几年）的 verifier 不该是「单次 loop 内一定要严格判对错」。这种严格性会让 agent 太死板没法处理多样性场景，反而损害用户体验。正确的做法是把 verifier 摊到时间轴上：单次 loop 不严格，每次结束后做事后分析写回 memory，下次类似任务 prefetch 注入 context，agent 越来越聪明。
+Hermes 是 Python 写的、跑在用户本机的长期助理。它选择不把所有验收都塞进单次 loop，而是用事后分析和 memory prefetch 记录反馈。这样适合需要跨会话积累上下文的场景，但是否改善结果要用任务样本和人工复核验证。
 
 具体实现：
 
@@ -130,33 +121,33 @@ Hermes 是 Python 写的、跑在用户本机的长期助理。它最先处理�
 - `agent/insights.py` 在 loop 结束后调一次 LLM 看「这次跑得怎么样」（4-5 个维度评分加改进建议），结果写回 memory。
 - 下次类似任务 `memory_manager.prefetch_all()` 在 loop 开始前一次性把跨会话偏好和经验注入 context。批量预取省掉 N 次 RAG 延迟。
 
-短期不严格但长期收敛。同一个用户用一个月之后，Hermes 比第一天聪明得多。
+短期验收不严格，长期效果取决于 memory 质量、触发条件和任务分布；源码本身没有给出跨会话收益评测。
 
 最独有的工程动作是注入前对外部文件做 prompt injection 扫描。其他三家默认本地仓库 `AGENTS.md` 和 `CLAUDE.md` 可信（假设是开发者自己写的）。Hermes 假设用户可能 clone 了一个带恶意 AGENTS.md 的 repo（攻击者通过 PR 投毒），把不信任边界拉到文件读取层。
 
 `_scan_context_content` 扫 9 类危险 pattern（`ignore previous instructions`、`do not tell the user`、假冒系统消息的 `system: ...` 等）加 10 类不可见 Unicode 字符（U+200B 零宽空格、U+202E 右到左覆盖等藏指令的字符），命中就把整个文件替换成 `[BLOCKED]` 占位符。
 
-这种偏执是长跑 agent 必备。单次会话被劫持还能容忍（用户立刻就发现），长跑场景下劫持可能潜伏很久（agent 长期低频泄露数据），必须从源头堵住。`SUMMARY_PREFIX` 防摘要劫持的文案也值得直接沿用到生产（防止 agent 被攻击者诱导以「这是上次会话的摘要」名义注入恶意指令）。
+这层扫描可降低一类来自外部文件的注入风险，但不是完整的安全边界；短会话也可能发生泄露。`SUMMARY_PREFIX` 是可复用的提示隔离做法，接入生产前仍应配合权限、来源标记和对抗测试。
 
-## 已经形成共识的工程底线
+## 先保住共同底线，再谈取舍
 
-四家在取舍上分歧巨大，但在最底层的设计认知上有 7 条共识。这是现代 agent 该遵循的工程底线，不做就不算生产级：
+四家在取舍上分歧很大，但源码里能看到 7 条共同约束。它们适合做设计检查表，不是上线认证标准：
 
-**1. agent 跑成多步状态机，不是单轮问答**（详见 02 章）。一次问答完成不了真实任务（修 bug 要 Read 文件、Grep 类似 pattern、Edit 改代码、Bash 跑测试、看结果再 Edit），必须是循环。4 家的 loop 都长得像「Observe → Plan → Act → Verify」，区别在每一节的实现深度。
+**1. 需要多次行动的任务通常要有状态机**（详见 02 章）。修 bug 往往要 Read、Grep、Edit 和测试；简单问答则未必需要完整 loop。四个样本都能映射到 Observe、Plan、Act、Verify，但实现边界并不相同。
 
-**2. 给「模型自信不等于真实状态」留 verifier 兜底**（详见 05 章）。模型说「我做完了」基本不能信。4 家都意识到这点，区别在 verifier 严格度：Codex 4 个硬 verifier 串联最严，Claude Code 60 行算法判 diminishing returns，OpenClaw 中间件化 verifier，Hermes 摊到时间轴。完全没有 verifier 的 agent 放进生产环境迟早会出事故。
+**2. 给「模型自信不等于真实状态」留可复核信号**（详见 05 章）。Codex 暴露 patch、测试、策略和 Goal 状态，Claude Code 用 token 预算判断是否还值得继续，OpenClaw 提供 hook 与循环检测，Hermes 把反馈写回跨会话记忆。它们解决的是不同问题；宿主仍要按任务风险决定哪些信号组成完成门禁。
 
-**3. 必须有明确的循环结束条件**（max_steps、token_budget、goal_done）。loop 必须能停。4 家都有自己的硬上限：Codex 的 Goal token_budget、Claude Code 的 maxTurns、OpenClaw 的 30 次 global circuit breaker、Hermes 的 IterationBudget 90 加 50。没硬上限的 agent 一旦死循环就烧光 quota。Claude Code 注释里的「线上一天浪费 250K API 调用」就是反面教材。
+**3. 有副作用或有成本的 loop 要有明确结束条件**（max_steps、token_budget、goal_done）。四个样本各自提供上限；OpenClaw 的 global circuit breaker 在源码中默认关闭，不能当作每个 session 都启用的保护。Claude Code 注释里的 API 调用数字是来源方的案例，不是通用事故率。
 
-**4. context 必须分静态、动态层便于缓存**（详见 03 章）。agent 跑久了 prompt 越来越长，每次推理都重新 process 几千 token 不可接受。必须把不变的部分（identity、tools）和会变的部分（cwd、时间、项目文件）分开，让 LLM API 的 prompt caching 命中静态部分。4 家在缓存边界的精细度上有差异，但都做了分层。
+**4. 可以把稳定 context 和运行时 context 分层**（详见 03 章）。这样有机会改善缓存命中和更新成本，但 provider 的缓存规则不同，是否值得拆分要用 token、延迟和命中日志验证；四个样本也不是同一套缓存实现。
 
-**5. 工具签名用 JSON schema，不是自然语言**（详见 04 章）。模型对 JSON schema 的解析准确率显著高于自然语言（schema 是结构化约束，模型不用猜参数类型和是否必填），工具调用失败率能从 10% 降到 1% 以下。即使是 Codex 的 apply_patch 这种 DSL，schema 槽位也保留（参数是 `diff` 字符串）。
+**5. 工具签名用 JSON schema，不是自然语言**（详见 04 章）。schema 把参数类型和必填关系写成机器可读的约束，减少模型猜测；具体失败率要按模型、工具集和任务记录，不能从这四个源码样本推导一个通用百分比。即使是 Codex 的 apply_patch 这种 DSL，schema 槽位也保留（参数是 `diff` 字符串）。
 
-**6. 必须有显式权限层**（不论实现方式）。4 家都有 permission 层：Codex execpolicy 三态、Claude Code canUseTool 钩子、OpenClaw tool-policy-pipeline 中间件、Hermes per-tool check 加 skills_guard。从不让工具直接执行而没有任何拦截。一个能 `rm -rf /` 的 agent 在生产环境是定时炸弹。
+**6. 高影响工具应有显式权限层**。四个样本都在工具执行前提供某种策略或审批入口，但默认模式和覆盖范围不同；低风险、只读工具是否需要同样的门禁由威胁模型决定。
 
-**7. 所有事件必须可观察**（用于审计和调试）。4 家都把工具调用做成可观察的事件流：rollout、trajectory、tool stream、event stream。每次工具调用是一个独立事件（哪个工具、什么参数、什么结果、什么时间）。企业生产环境的硬要求：出问题必须能追溯。
+**7. 有副作用的事件要可检索**（用于审计和调试）。四个样本提供 rollout、trajectory 或 tool events 的不同组合；是否另建事件流取决于部署。至少保留工具、参数摘要、结果状态和时间，并处理敏感数据。
 
-## 选型从失败成本开始
+## 把场景映射到可验证信号
 
 <Diagram
   src="/diagrams/01-tradeoff.svg"
@@ -166,30 +157,24 @@ Hermes 是 Python 写的、跑在用户本机的长期助理。它最先处理�
 
 四家的核心分歧是「短期严格性对比长期累积性」的取舍。不同产品形态需要不同取舍点，没有通用最优解。
 
-**让模型改真实 repo 加每一步可 review 加任务完成有客观信号**：选 Codex 路线。硬 verifier 做得很深（4 件套串联），loop 做成可重放可恢复的事件机器（rollout 物理时间线）。适合「必须保证正确性」的 coding 场景。代价是离开 coding 失效。客服、写作、调研场景没有 tests 和 lint 这些客观信号，Codex 这套 verifier 全部用不上。
+**让模型改真实 repo，并让每一步可 review**：可以先看 Codex。patch 解析、测试退出码、命令策略和 Goal 状态分别提供可复核信号，rollout 记录则支持回放与恢复。宿主只有把其中适用的信号接成完成门禁，才能约束具体 coding 工作流；它们本身不保证业务正确。客服、写作和调研需要另一套验收依据。
 
-**在 Anthropic 生态里、想参考一份 production-grade 实现作为 reference**：选 Claude Code 路线。Anthropic 协议（tool_use block、Messages API、prompt caching）用到极致，loop 状态机用 transition.reason 做到最显式，4 道压缩管线加 60 行 TOKEN_BUDGET 算法是工程化典范。源码可通过 sourcemap 反编译看（4756 个源文件），学习 modern agent 工程最好的 reference。代价是商用 license 限制加单文件 1729 行没有插件钩子，想定制只能 fork。
+**在 Anthropic 生态里、想拆一份完整实现**：可以从 Claude Code 路线开始。它把 `tool_use`、Messages API、prompt caching、`transition.reason` 和 4 道压缩管线放在同一套运行时里，适合研究耦合点；源码快照显示 `query.ts` 仍是单文件主循环，外部扩展要付出 fork 或包裹的维护成本。
 
-**agent 要接 Telegram、Slack、Web、WhatsApp 加处理多用户并发请求**：选 OpenClaw 路线。把 agent 当会话控制面做，session lane 串行化解决并发抢锁，十几个 plugin hook 让 verifier、权限、压缩、工具拦截全部中间件化，PromptMode 三档适配主 agent、subagent、外部调用方。开源里二开友好度最高的方案。代价是 hook 链路长，调试链路也长（一个工具调用过 5-6 层中间件出问题难定位），没有内建 coding verifier（要自己用 plugin 加）。
+**agent 要接 Telegram、Slack、Web、WhatsApp 加处理多用户并发请求**：可以重点看 OpenClaw。session lane 串行化同一会话的运行，plugin hook 承载 verifier、权限和工具拦截，PromptMode 区分主 agent 与 subagent。代价是 hook 链路会拉长调试路径，而且 coding verifier 需要另行接入。
 
-**agent 要在电脑上长期跑加记住偏好加自评加跨任务学习**：选 Hermes 路线。verifier 摊到时间轴上（单 loop 不严格但跨会话累积变好），`memory_manager.prefetch_all()` 加 `insights` 自评加 skill 触发，让 agent 从通用助手变成越用越懂你的私人助理。注入前 prompt injection 扫描是长跑场景的安全必备。代价是 compaction 改变 loop 表现，没有结构化硬 verifier，强依赖 skill 自评，不适合「单次必须保证正确性」的工作流。
+**agent 要在电脑上长期运行，并尝试保留偏好或跨任务反馈**：可以评估 Hermes 路线。`memory_manager.prefetch_all()`、`insights` 和 skill 触发提供了跨会话记录机制；收益和污染风险需要按任务评测。文件扫描可作为一层防注入措施，但不能替代权限和隔离。
 
-## 我的判断：不要拼平均答案
+## 按失败代价，而不是框架名做选择
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: '硬约束加 rollout 物理可恢复加 Rust 内核可信赖，是工业级 coding agent 的 reference', risk: '强绑定 repo 加 tests 加 coding 场景，loop 离开 coding 后没有等价的 verifier。服务后端闭源' },
-    { system: 'Claude Code', value: '★★★★★', reason: '把所有 loop 状态建模为 7 种 transition.reason 加 4 道上下文压缩加 7 种 TaskType 多 agent，是单文件 agent 的天花板', risk: 'query.ts 单文件 1729 行无插件钩子，外部接 verifier 中间件得 fork。商用许可证限制' },
-    { system: 'OpenClaw', value: '★★★★★', reason: '唯一把 loop 文档化的开源 agent。session lane 加十几个 plugin hook 等于二开友好度最高', risk: 'hook 多了调试链路长。没有内建的 coding verifier' },
-    { system: 'Hermes', value: '★★★★', reason: '90 加 50 IterationBudget 加 grace call 加 memory.prefetch 加注入前 injection 扫描，长期跑加自改进的最完整方案', risk: 'compaction 改变 loop 表现。没有结构化硬 verifier，强依赖 skill 自评' },
-  ]}
-  caption="评分依据：定位完整度加真实可用性加二开友好度加风险"
-  headers={{ system: '系统', value: '评分', reason: '亮点', risk: '风险' }}
-/>
+| 场景约束 | 先看哪条源码 | 代价 |
+| --- | --- | --- |
+| 改错一次就不可接受，且有 tests 或 patch 信号 | Codex 的 rollout、goals、execpolicy | 只适合可机器验证的 coding 任务 |
+| 需要解释重试和压缩原因 | Claude Code 的 transition.reason 与 compaction | 定制要跟随单文件实现 |
+| 多用户、多通道，需要异步观察 | OpenClaw 的 session lane 与 hooks | 中间件链需要自己的 trace |
+| 任务跨会话，价值在持续积累 | Hermes 的 checkpoint、memory、insights | 单次结果缺少硬证据 |
 
-打五星不是说完美，意思是在自己的定位上做到了开源或半开源生态能看到的最好水平。
-
-## 按你的目标继续读
+## 下一条源码路线
 
 <BuildRecipe
   title="按你的目标读"
@@ -217,7 +202,7 @@ Hermes 是 Python 写的、跑在用户本机的长期助理。它最先处理�
 
 <AgentLoopSVG nodes={['Observe','Plan','Act','Verify']} caption="四家都跑这同一个最小循环。差别在每个节点怎么实现。" />
 
-## 源码从这里读
+## 支撑这条选择的源码
 
 <SourceTrail
   title="延伸阅读、官方入口"
@@ -252,11 +237,11 @@ Hermes 是 Python 写的、跑在用户本机的长期助理。它最先处理�
 
 不是。Agent 模型指 LLM 本身（GPT-4、Claude、Gemini 这一类参数加解码器）。Agent Harness 指模型之外的全部支撑系统：主循环、上下文系统、工具系统、沙箱、verifier、memory、observability、安全。本书拆的是 Harness，不是模型。
 
-为什么这层值得专门拆？现在 90% 的 agent 工程问题不是模型不够强，而是 harness 设计不到位。loop 写糟会浪费 10 倍 token，工具协议设计不当会让模型连续报错。同一个模型套不同 harness，跑出来的表现差异比换模型还大。
+为什么这层值得专门拆？不少 agent 故障发生在模型周围：loop 没有明确的退出信号，工具协议让模型反复重试，或上下文把错误状态带进下一轮。差异需要用同一模型、同一任务集和运行日志测量，不能凭一句“换 harness 就好”下结论。
 
-四家被拆系统都属于成熟生产级 harness：Codex 是 OpenAI 的工程参考，Claude Code 是 Anthropic 的官方实现（解包看），OpenClaw 是开源代表，Hermes 是研究性长跑 agent。覆盖了从企业级到 hobbyist 的光谱。
+四个系统的定位不同：Codex 是 OpenAI 的工程参考，Claude Code 是 Anthropic 的闭源实现快照，OpenClaw 是开源控制面，Hermes 偏研究型长跑 agent。读者应按自己的失败代价和部署边界选择借鉴对象。
 
-**源码**：见本章的[源码入口](#源码从这里读)。
+**源码**：见本章的[支撑这条选择的源码](#支撑这条选择的源码)。
 **追问**：「LangChain、AutoGPT 算 harness 吗？」算，但属于框架级 harness（给开发者拼装）；本书拆的是产品级 harness（最终用户跑得起来的成品）。
 </details>
 
@@ -269,7 +254,7 @@ Hermes 是 Python 写的、跑在用户本机的长期助理。它最先处理�
 
 多用户 ops 场景：参考 OpenClaw 的 session lane（一个 session 对应一个用户或对话），每个 session 自己跑 loop。memory 模块独立做（参考 Hermes 的 memory_manager）。
 
-不要从头照搬任何一家。每家都有约 40k 行二级代码（plugin、channel、cron），先抽取系统画像里的骨架，再按 Verifier 和 Memory 章节补齐。
+不要从头照搬任何一家。插件、channel 和 cron 等外围代码会显著扩大维护面；先抽取系统画像里的骨架，再按 Verifier 和 Memory 章节补齐。
 
 **源码**：[`openclaw/src/config/sessions/`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/config/sessions/)、[`hermes-agent/agent/memory_manager.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/memory_manager.py)、`claude-code/src/services/compact/compact.ts`。
 **追问**：「为什么不直接用 LangChain？」知识库小可以。规模上去后 LangChain 的工具协议过抽象，调试痛苦，可以参考[工具系统](/patterns/04-tool-system/)自行拼装。
@@ -280,7 +265,7 @@ Hermes 是 Python 写的、跑在用户本机的长期助理。它最先处理�
 
 Turn 的标准定义：从模型一次回复（含可能的工具调用）到下一次模型回复之间的时间段。但「turn 内能塞几次工具」差异很大：
 
-- **Codex**：一个 turn 一个 tool（serial）。每个 tool 后等 verifier 检过再放下一个，loop 形状最稳。
+- **Codex**：一个 turn 一个 tool（serial）。每个 tool 后等 verifier 检过再放下一个，loop 形状更可预测，但吞吐会受串行等待影响。
 - **Claude Code**：一个 turn 可 dispatch 多个 tool_use block 真并行执行（`dispatchToolUseBlocks` 用 Promise.all），turn 末 stop_hooks 统一 verify。
 - **OpenClaw**：turn 设计成 event 流，tool 是其中的 event，外部可以看到每个 event 决定是否暂停。
 - **Hermes**：一个 turn 一个 tool。trajectory 是单线性的，并发会让 memory 注入逻辑混乱。
@@ -296,7 +281,7 @@ Turn 的标准定义：从模型一次回复（含可能的工具调用）到下
 
 工程选择。原因有 4 个：
 
-1. **模型训练偏 markdown**：所有主流 LLM 在预训练阶段见过比 JSON 多得多的 markdown。让模型读 markdown 错误率更低。
+1. **格式先做实测**：markdown 便于人读、追加和 diff，但不能从未知训练语料推断模型一定更少出错。用目标模型比较 markdown、JSON 和 XML 的格式成功率与维护成本。
 2. **人类可读**：debug 时直接看 prompt 就能读懂。JSON 嵌套层级深，看 system prompt 还得来回折叠展开。
 3. **可流式追加**：markdown 的 section（`##` `###`）天然支持「再加一段」。JSON 要重排整个对象。
 4. **diff 友好**：prompt 文件入仓后 git diff 易读。
@@ -319,10 +304,10 @@ Turn 的标准定义：从模型一次回复（含可能的工具调用）到下
 - **OpenClaw**：工具就是 plugin（`PluginEntry`），通过 hook 注册，最少。
 - **Hermes**：工具叫 skill（`skill_loader.py` 加载）。一个 skill 可包含多个 tool function，按需开启。
 
-工具粒度直接影响 prompt size 和模型决策准确率。粗粒度（一个 tool 干很多事）prompt 短但模型容易选错；细粒度（每个动作一个 tool）prompt 长但准确率高。Claude Code 选了细粒度（12 工具）加长 prompt 路线，准确率最好。
+工具粒度直接影响 prompt size 和模型决策。粗粒度（一个 tool 干很多事）提示较短，但参数语义更宽；细粒度（每个动作一个 tool）约束更清楚，也会增加工具列表。Claude Code 采用细粒度工具集；是否更准，要用目标任务集验证。
 
 **源码**：见 [第 04 章 工具系统](/patterns/04-tool-system/)。
-**追问**：「tools 越多越好吗？」不是。超过 15 个工具后模型选错率上升，最佳区间是 8-15 个原子工具。
+**追问**：「tools 越多越好吗？」不是。工具列表越长，schema 和选择负担通常越高；错误率和可用区间要用目标模型、工具集和任务日志测量。
 </details>
 
 <details>
@@ -367,7 +352,7 @@ Codex 的 verifier 思路有 3 个核心：
 不要直接照搬 Codex 的 Rust 代码。goals.rs 假设 coding 场景，「goal 触达」判断基于代码文件被改过。客服场景要重写判断逻辑（基于 tool call 和回复内容）。
 
 **源码**：[`codex/codex-rs/core/src/goals.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/goals.rs)、参考 [第 05 章 Verifier](/patterns/05-verifier/)。
-**追问**：「客服 agent 要不要加 token budget 软退？」要，但阈值放 50%（不像 coding 那样跑长）。超阈值时 nudge「用户问题是否已解决？」触发提前结束。
+**追问**：「客服 agent 要不要加 token budget 软退？」可以把较低阈值作为实验起点，并把“用户问题是否已解决”作为提示信号；阈值和提前结束率应由客服任务日志校准。
 </details>
 
 <details>
@@ -379,9 +364,9 @@ Codex 的 verifier 思路有 3 个核心：
 2. **这次 loop 在哪一步偏离了预期？**（transition reason、verifier 输出、错误堆栈）
 3. **同样的 prompt 上次跑 vs 这次跑差异在哪？**（rollout diff、行为漂移检测）
 
-四家都有但实现差异很大：Codex 的 codex-otel 加 codex-analytics 最完整（OpenTelemetry 加 20 多种 TrackEvent），Hermes 用 trajectory 文件（每步一行 JSONL），OpenClaw 走 plugin（`onEvent` hook 给外部观察），Claude Code 用 transition 标签加 token budget 日志。
+四家都有但实现差异很大：这个 Codex 快照暴露了较多 `codex-otel`、`codex-analytics` 事件类型；Hermes 用 trajectory 文件（每步一行 JSONL），OpenClaw 走 plugin（`onEvent` hook 给外部观察），Claude Code 用 transition 标签加 token budget 日志。这里比较的是源码形状，不是在给可观测性做完整度排名。
 
-单独一章的原因：可观测性是 agent 上生产的最大 gap。demo 跑得好 vs 生产稳定，差一个 30-40% 的工程工作量，主要在 observability 这层。本书 15 章详细对比四家做法，给出自己实现该参考哪些。
+单独一章的原因：demo 与长期运行之间，常见差距来自可观测性、恢复和成本控制。具体工作量取决于部署环境；本书第 15 章把这些运行信号拆开，方便你按需实现。
 
 **源码**：见 [第 15 章 观测、成本与日志](/patterns/15-observability-cost/)。
 **追问**：「一行日志够吗？」不够。最少需要 3 层：step-level（每个 tool call 一条）、turn-level（每次模型调用一条）、session-level（一次完整对话一条）。
@@ -392,13 +377,13 @@ Codex 的 verifier 思路有 3 个核心：
 
 3 类项目用轻路线（直接 OpenAI 或 Anthropic 官方 SDK 加自写 200 行 loop），不沿用重 harness：
 
-1. **POC、hackathon、一次性脚本**：3 天内要演示给 BD 看，200 行单文件 loop 就够。加 harness 反而拖慢。
+1. **POC、hackathon、一次性脚本**：如果只需要快速验证一个窄流程，官方 SDK 加一个小 loop 往往足够；先确认失败后是否需要恢复和审计。
 2. **超细分场景且工具 ≤ 3 个**：比如 PDF 提取关键字段返回 JSON。不需要 agent loop，单次 prompt 就 OK。
 3. **要求绝对确定性的工作流**：比如金融对账，应该是 workflow（每步定死）加 LLM 当其中一个节点，不该是 agent（每步模型决定）。
 
-什么时候开始上重 harness：项目超过 3 个月寿命，tool ≥ 5 个，跨会话状态需要保留，多用户，有明显的「loop 偏离」问题。
+什么时候开始上重 harness：当恢复、跨会话状态、多用户并发或审计的维护成本已经超过自写 loop，再引入相应模块；不要用固定月份或工具数做门槛。
 
-本书 4 家系统都至少 2 万行核心代码加 1 年以上演化。需求换 1 天就能写完的，不用照搬它们。
+这些系统的源码规模和演化历史都远超一个小型 POC；具体规模随快照变化，不能用它们推导你的项目工期。
 
 **源码**：可参考 OpenAI 的 [Building Agents with Function Calling](https://platform.openai.com/docs/guides/function-calling)、Anthropic 的 [Claude Tool Use](https://docs.anthropic.com/en/docs/tool-use)。
 **追问**：「langchain 算重还是轻？」中等偏轻。LangChain 的工具协议好，但没有本书讲的 verifier、memory、observability 这些深层东西。适合中等复杂度且团队不想自己写 harness。
@@ -415,7 +400,7 @@ Codex 的 verifier 思路有 3 个核心：
 
 3. **Agent UX 模式**：14 章讲了多通道入口（CLI、IDE、Slack），但没讲 UX。比如 thinking 怎么 stream、tool call 怎么可视化、cancel 怎么实现。Claude Code 的 ink REPL 加 Codex 的 ratatui TUI 各有一套，值得拆。
 
-只让我选一个的话：选 1。多 agent 系统是下一波 agent 工程的必经之路，4 家现有 subagent 模式都太简单。
+只选一个，我会先研究 1，因为四家的 subagent 都暴露了状态隔离、恢复和验收问题；这个判断来自本书样本，不代表所有 Agent 产品的路线。
 
 **源码**：可关注 [AutoGen](https://github.com/microsoft/autogen)、[CrewAI](https://github.com/joaomdmoura/crewAI) 等多 agent 框架的演化。
 **追问**：「只能再加一章，加哪一章？」现在第 22 章已经补了 execution state surfaces。下一章我会把第 15 章的「成本」部分单独抽出来叫「Agent 经济模型」，讲清四家怎么用 model、cache、tool 和并发策略拼出可控的使用成本。对企业 agent 落地最有用。

@@ -1,34 +1,25 @@
 ---
-title: 10 · Subagents
+title: 10 · When Is a Subagent Worth It
 sidebar:
   order: 10
-description: Typed SubAgentSource with service inheritance vs 7-variant TaskType vs full subagent platform vs delegate with 5 hard-blocked tools. Four ways to spawn child agents.
+description: Decide when delegation pays back its handoff, shared-state, duplicate-work, and merge costs
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
 ## When a subagent is worth the handoff
 
-<Verdict tldr="Subagents (subagent: a thread- or process-level child session the current agent spawns for a separate task) look simple on paper but turn into a minefield in production. Anyone who has actually shipped subagents has watched every failure type appear: a subagent calls itself recursively and burns tokens, a subagent ends up with tools the parent did not have (privilege escalation), a subagent runs its own approval flow and confuses the user with parallel popups, a subagent posts replies cross-platform and creates duplicates, a subagent writes to the parent's long-term memory and poisons it. So the real question this chapter answers is «in the face of those failure modes, what hard boundaries must the framework enforce». And the four systems give wildly different answers. Codex takes the «type every subagent use case» route: every spawn entry must carry a `SubAgentSource` enum (Rust algebraic data type: the caller picks one concrete variant and cannot omit the field) declaring the purpose (`Review` for user-triggered code review, `Compact` for context compression, `ThreadSpawn` for user-configured templates, `MemoryConsolidation` for periodic memory promotion, `Other` for plugin / experimental escape hatches), and each source routes to a different prompt / permission / telemetry path. The critical engineering discipline is that subagents must inherit 7 core services from the parent session (`exec_policy`, `plugins`, `mcp_manager`, `skills_manager`, `environment_manager`, `agent_control`, …) and can never be more permissive than the parent. There is no «spawn a subagent to bypass execpolicy» escape route. Approvals are forced back to the parent session, and subagents never own UI. Claude Code goes the opposite way and unifies subagents with every other async execution: a generic `Task` abstraction covers everything «runs in the background and returns later», with 7 `TaskType` variants (`local_bash` for shell commands, `local_agent` for local subagents, `remote_agent` for remote endpoints, `in_process_teammate` for same-process teammates, `local_workflow`, `monitor_mcp` for long-running MCP monitors, `dream` for background prefetch) and a clean `TaskStatus` state machine (`pending` / `running` / `completed` / `failed` / `killed`). Every tool self-reports `isConcurrencySafe()` (a boolean method on the tool instance) so the dispatcher decides whether to parallelise with the rest of the turn's tool calls. OpenClaw built the most complete subagent platform, one subsystem split across 6 files (`spawn`, `registry`, `depth` for cross-process depth persistence, `announce` for completion push, `attachments` for file passing, `lifecycle-events`), and `SpawnSubagentParams` carries 13 configuration fields (task, label, agentId, model, timeout, mode, cleanup, sandbox, attachments, …). The most distinctive bit: the anti-pattern warning «do not poll, wait for the push event» is literally written into the spawn tool's return-value text so the model reads it as it decides what to do next. This is an engineering fix for the «subagent mode burns tokens polling» failure mode. Hermes takes the most restrained route: a single `delegate_task` function (parameters: `goal`, `context`, `toolset` whitelist, `max_iterations`), with the critical safety constraints baked into constants. `MAX_DEPTH=2` is a hard-coded ceiling (parent 0 → child 1 → grandchild rejected); 5 tools are hard-blocked from recursive spawning (`delegate_task` / `clarify` / `memory` / `send_message` / `execute_code`, removed from any subagent's toolset); the parent uses `ThreadPoolExecutor` (Python stdlib thread-pool) to synchronously block on all children; a heartbeat fires every 30 seconds so the UI knows the run is alive. Building an orchestration framework? Borrow from OpenClaw. Building an agent product where subagent use cases are clear? Borrow from Codex. Unifying async execution? Borrow from Claude Code. Want the simplest reliable delegation? Borrow from Hermes." />
+<Verdict tldr="Why can eight agents be slower than one? Parallel work does not erase handoff, shared-state, duplicate-read, or merge costs. We use the source snapshots to show how Codex, Claude Code, OpenClaw, and Hermes bound permissions, depth, and completion notices. This site has no 1/2/4/8-agent measurement yet, so the article gives an experiment plan and keeps vendor evals in their stated scope." />
 
-## Four delegation abstractions
-
-<details>
-<summary>Before reading (optional)</summary>
-
-- **A production minefield**: recursive self-spawns, privilege escalation, parallel approval popups, cross-platform duplicates, and memory poisoning all happen; the real question is what hard boundaries the framework must enforce.
-- **Four spawn models**: Codex types every spawn with a `SubAgentSource` enum and forces children to inherit 7 core services from the parent; Claude Code unifies async work under 7 `TaskType` variants with `isConcurrencySafe()`; OpenClaw ships a 6-file platform with 13-field `SpawnSubagentParams`; Hermes exposes one `delegate_task` with `MAX_DEPTH=2` and 5 hard-blocked tools.
-- **Inheritance beats configuration**: children inheriting the parent's `exec_policy` / `plugins` / `mcp_manager` determines whether "spawn a subagent to bypass execpolicy" is even possible.
-- **Kill the polling habit**: OpenClaw writes "do not poll, wait for the push event" into the spawn tool's return text—polling subagents is the token-burning failure mode to design against.
-
-</details>
+## Price the handoff first
 
 <Diagram
   src="/diagrams/10-subagents-base.svg"
@@ -50,15 +41,15 @@ How the four systems cover the five concurrency-critical concerns:
   dimensionLabel="Dimension"
 />
 
-## How four systems spawn child agents
+## Source evidence: permissions, depth, and return paths
 
 ### Codex · Split "spawn subagent" into 5 typed sources, each routing to a different permission and prompt path
 
-Codex's starting point on subagents is this: "spawn a subagent" should not be an undifferentiated function call but a set of semantically distinct behaviours.
+Codex first asks why a child agent exists, then records that purpose in SubAgentSource. Each source carries its own prompt, permissions, and telemetry path; the child inherits parent services instead of opening a privilege escape.
 
 Even though "user manually triggers /review for code review", "context exceeded so trigger summarisation", "user invokes their own ThreadSpawn template", and "system periodically consolidates memory" are all 'spawn a subagent', they use different prompts, allow different tools, expect different output shapes, may or may not show in the UI, and emit different telemetry.
 
-If they all funnel through one generic spawn function, every caller has to manually configure these differences themselves, and the configuration will drift as call sites multiply.
+If they all funnel through one generic spawn function, every caller has to configure these differences. As call sites multiply, missing permissions and diverging configuration become more likely.
 
 So Codex forces every spawn to carry a SubAgentSource enum value that explicitly tells the system what kind of subagent this is:
 
@@ -160,7 +151,7 @@ This is the same idea as the review sub-agent's `AskForApproval::Never` in chapt
 
 ### Claude Code · Unify subagents with every other async execution into one Task abstraction
 
-Claude Code thinks about subagents very differently from Codex. It observes a fact: "spawn a subagent to do work" is really a special case of "asynchronously execute something that takes time", and the IDE scenario has many more async-execution cases than just subagents.
+Async work in an IDE is broader than child agents. Claude Code uses Task for local commands, remote agents, workflows, and teammates, then combines a state machine with isConcurrencySafe to decide whether work can queue or run together.
 
 Running a local bash command is async, calling a remote agent service is async, collaborating with another teammate agent in the same process is async, running a workflow is async.
 
@@ -223,7 +214,7 @@ Every task writes its output to disk via outputFile, keeping the main process fr
 
 ### OpenClaw · Build subagents as a complete subsystem: 6 modules + 13 fields + anti-polling warning
 
-OpenClaw does the most on subagents, building it as an independent subsystem rather than just a tool call.
+OpenClaw treats delegation as a persistent run object. Spawn, registry, depth, announce, attachments, and lifecycle events each own a boundary, and completion returns to the parent through a push event.
 
 Open the source and you see a coordinated set of files: `subagent-spawn.ts` handles creation, `subagent-registry.ts` handles tracking active subagents, `subagent-depth.ts` handles cross-process depth persistence, `subagent-announce.ts` handles completion push, `subagent-attachments.ts` handles file attachments to subagents, `subagent-lifecycle-events.ts` handles lifecycle events (start / complete / fail / cancel).
 
@@ -323,11 +314,11 @@ If depth lived only in memory, both would restart from depth=0 after restart, br
 
 Persisting to the session store prevents that corner case.
 
-### Hermes · The most restrained subagent model: one function + 5 hard-blocked tools + MAX_DEPTH baked in
+### Hermes · A narrow subagent model: one function, 5 hard-blocked tools, and a fixed MAX_DEPTH
 
-Hermes's subagent design is the simplest in this chapter: just one `delegate_task(goal, context, toolset, max_iterations)` function.
+Hermes exposes one delegate_task function. MAX_DEPTH=2, a tool allowlist, and heartbeats cover the small case; the parent waits synchronously, so long work needs a separate UI measurement.
 
-It looks like "didn't do it" levels of minimalism, but it is actually "did the most important things, declined to do the rest" restraint.
+This design covers bounded delegation without adding a general orchestration lifecycle. Whether that scope is sufficient depends on the product's need for cancellation, recovery, and asynchronous progress.
 
 The reason: Hermes itself is a chat agent (multi-platform chat), not an agent orchestration framework, so its subagent needs come down to one thing, "give a clearly defined sub-task to a temporary agent, get the result", and it does not need OpenClaw's level of complex lifecycle management.
 
@@ -381,7 +372,7 @@ The meaning of MAX_DEPTH = 2 is: the root agent (the one the user is talking to)
 
 Why 2 and not 3 or 5? The Hermes team's experience: practically useful subagent tasks almost always fit in one layer (parent focuses on one thing and delegates a helper task out); going to the second layer typically reflects the model falling into a useless decomposition loop (every sub-task gets further decomposed to grandchildren that don't actually need it).
 
-Allowing more than 2 levels wastes tokens in 99% of scenarios rather than truly needing more depth.
+Hermes chooses a depth limit of two because deeper delegation is treated as a decomposition-loop risk in this design. There is no cross-product sample supporting the 99% figure; if you relax the limit, measure completion rate, duplicate work, and tokens by depth.
 
 Concurrency goes through `ThreadPoolExecutor`:
 
@@ -424,21 +415,21 @@ This is the classic synchronous concurrency model, the opposite of OpenClaw's pu
 
 The upside of synchronous-blocking is the parent's logic is dead simple (spawn all children, wait for all, consolidate); the downside is the parent cannot do anything else while waiting, which hurts UI responsiveness for long tasks.
 
-Hermes chooses synchronous because its subagent tasks are typically short (completing in 1-2 minutes), the UX loss of synchronous wait is small, and it buys extreme code simplicity.
+The Hermes snapshot chooses synchronous waiting and emits a heartbeat. Whether that fits a workload depends on child-duration distribution, UI responsiveness, and slow-child timeouts; this article has no one-to-two-minute benchmark.
 
-## What subagent systems already agree on
+## Invariants shared by child agents
 
-Despite wildly different implementation depth, four things are universally agreed. These consensus points reflect inescapable hard constraints of subagent engineering.
+Across the four snapshots, four control questions recur: recursion depth, delegated permissions, completion return paths, and waiting behavior. Treat them as an audit checklist, not universal consensus.
 
-**The first is that depth must be controlled: unbounded recursion is not allowed.** Codex records via `ThreadSpawn.depth`, OpenClaw persists `spawnDepth` to session store so it survives process restarts, Hermes hard-codes `MAX_DEPTH = 2` as a source constant. None of the four allows unbounded recursive spawning. The reason is simple. Without depth limits, a misconfigured subagent prompt can let the model spawn itself in infinite nesting, doubling tokens per layer; within a few layers the entire context window blows up, the bill explodes. Depth limits are not an optional optimisation; they are required hard safety boundaries.
+**The first is how depth is controlled.** Codex records `ThreadSpawn.depth`, OpenClaw persists `spawnDepth`, and Hermes hard-codes `MAX_DEPTH = 2`; the cited Claude Code Task path does not show the same explicit cap. Unbounded recursion expands calls, tokens, and debugging paths, so an implementation should enforce depth, total-call budget, or a non-recursive toolset rather than rely on prompt discipline.
 
-**The second is that recursive spawning must be blocked: a subagent cannot spawn the same kind of subagent.** Hermes uses the most direct route, putting `delegate_task` into the hard-blocked tool list so subagents simply do not get the tool. Codex / Claude Code / OpenClaw go through feature flags or toolset restrictions; by default subagent toolsets don't include the spawn tool. Different implementations, same goal: subagents are "temporary units doing work", not "another scheduler"; scheduling is reserved for the root agent.
+**The second is whether a child can delegate again.** Hermes puts `delegate_task` in a blocked-tool list; other implementations constrain different spawn paths through source, feature flags, toolsets, or depth. Recursive delegation can be a product feature, but it needs a depth limit, total budget, and permission inheritance rather than prompt-only restraint.
 
-**The third is that subagent tool capabilities are a strict subset of the parent's: children may not gain tools the parent lacks.** This goes deeper than the first two. It defends not against "subagent acts maliciously" but against "prompt injection induces a subagent to gain tools the parent doesn't have". If a child could have tools its parent lacked, a malicious prompt could let the parent first spawn a more-privileged child, then have the child do what the parent was forbidden, a privilege escalation attack. All four systems treat "inherit the parent's permission boundary" as default behaviour, and none of them allow "enable in child what is disabled in parent".
+**The third is that delegation should not grant broader capability by itself.** This protects against prompt injection using spawn to bypass a parent's limits. The cited implementations tighten this through inherited execution policy, restricted toolsets, or recursion blocks. Because the mechanisms differ, verify every spawn path instead of inferring the boundary from one default.
 
-**The fourth is that subagent completion notification must avoid polling: either push events or await futures.** Codex pushes `EventMsg::TurnComplete` to the parent via receiver/sender, OpenClaw actively pushes notifications to the parent via subagent-announce with an explicit "do not poll" warning, Hermes uses `as_completed()` to await futures, Claude Code triggers callbacks via TaskStatus state machine transitions. None uses "parent loops querying child status" polling. The reason is very practical: under polling, the model repeatedly calls sessions_list / sessions_history wasting massive tokens on "is it done yet", while push lets the model just wait, token efficiency orders of magnitude better.
+**The fourth is how completion reaches the parent.** Codex sends `EventMsg::TurnComplete` through receiver/sender, OpenClaw uses subagent-announce with an explicit "do not poll" warning, Hermes awaits futures with `as_completed()`, and Claude Code exposes TaskStatus transitions. Repeated model-driven status queries add tokens and latency; quantify the difference by comparing push, await, and polling traces on the same tasks.
 
-## Choose typed delegation, generic tasks, or a platform
+## Choose by task shape
 
 <Diagram
   src="/diagrams/10-tradeoff.svg"
@@ -446,42 +437,40 @@ Despite wildly different implementation depth, four things are universally agree
   caption="Hermes function-style is the lightest; Codex typed enum sits in the middle; Claude Code Task gives the most concurrency freedom; OpenClaw is the heaviest, full-platform abstraction."
 />
 
-While the agreements above are the floor, the divergence on "how heavy should the subagent abstraction be" is what really decides which approach suits which product.
+These checks do not imply one abstraction. The actual choice is how much state, permission, and scheduling the task needs, and how much maintenance surface the product can own.
 
-Viewed through "what kind of agent are you building", the four trade-offs each map to one best-fit scenario.
+**If an orchestration framework genuinely needs cross-process state, attachments, and completion notifications, start by studying OpenClaw's subagent platform.** The cited snapshot's six modules, 13 fields, push notification, and depth persistence cover those capabilities. The cost is long-term configuration, storage, and lifecycle maintenance; task samples and resource budgets should justify any claim about dozens of concurrent agents.
 
-**If you are building an agent orchestration framework hoping users write all sorts of subagent workflows, then OpenClaw's full subagent platform is the right choice.** In this scenario, capabilities like "cleanly managing dozens of concurrent subagents", "persisting subagent state across processes", "passing attachments to subagents" are all required, and OpenClaw's 6-module split + 13-field config + push-based completion + depth persistence covers these needs. The cost is high new-user ramp-up (every one of 13 fields must be understood, every one of 6 submodules must be maintained), but for a framework-positioned product this is unavoidable complexity.
+**If subagent uses have converged to a few scenarios such as review, compaction, and memory consolidation, start by studying Codex's SubAgentSource typing.** Typing gives dispatch, telemetry, and permission paths an explicit basis. The cost is that a new use changes the protocol and is harder to add externally; whether that constraint pays off depends on change frequency and plugin needs.
 
-**If you are building an agent product where subagent uses have converged to a few clear scenarios (e.g. code review, context compression, memory consolidation), then Codex's SubAgentSource typing is the right choice.** In this scenario, each subagent use has its own prompt and constraints; typing gives dispatch / telemetry / permission paths a single source of truth, vastly more maintainable than asking every caller to manually configure parameters for a generic spawn function. The cost is that adding a new use requires modifying the protocol definition (can't be added by external plugin), reducing flexibility, but this kind of constraint is actually a good thing for mature products.
+**If an IDE must manage subagents together with bash, remote calls, and workflows, start by studying Claude Code's Task abstraction.** A shared lifecycle, state machine, UI, and cancellation path reduces entry-point differences. The cost is maintaining seven TaskType boundaries, while the cited path does not show a common explicit depth cap.
 
-**If you are building an IDE-integrated agent that needs to manage subagents together with other async executions (bash commands, remote agent calls, workflow batches, teammate collaboration), then Claude Code's Task abstraction is the right choice.** In this scenario, having all async executions share one lifecycle / state machine / UI / cancellation mechanism brings huge consistency gains, and the model can use the same set of tools (TaskCreate / List / Update / Get / Stop) to manage all these async behaviours. The cost is long-term maintenance of 7 TaskType boundaries and no explicit depth limit relying on user discipline.
+**If a conversational agent only needs one bounded delegation, start by studying Hermes's delegate_task function and five blocked tools.** Its API surface is small and each restriction maps to a concrete risk; comprehension and delivery time still depend on surrounding tools, tests, and failure handling. It lacks attachments, mode, and cleanup controls, and synchronous waiting affects long-task responsiveness.
 
-**If you are building a simple conversational agent and only need the "delegate a task to a throwaway subagent" capability, then Hermes's delegate_task function + 5 hard-blocked tools is the right choice.** In this scenario, the entire subagent module is one function plus a few constants, a new engineer can fully understand it in 5 minutes, and every restriction has a clear failure case it prevents. The cost is missing advanced features like attachments / mode / cleanup, and the synchronous blocking model freezes the UI on long tasks, but for simple chat agents none of these matter.
+## Choice: parallel gain must beat handoff cost
 
-## My take: price the handoff first
+There is no star rating here. Parallelism should follow task separability and handoff cost; this site has not measured which fan-out wins.
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: '5 SubAgentSource variants name every usage; child inherits 7 service categories (including exec_policy); approvals route back to parent; depth lives in ThreadSpawn. Extremely consistent engineering', risk: 'Adding a sixth variant requires a protocol change; inherited_exec_policy makes the child strictly weaker than the parent, limiting flexibility' },
-    { system: 'Claude Code', value: '★★★★', reason: 'Task abstraction unifies 7 async execution kinds; isConcurrencySafe lets the dispatcher decide parallelism; clear FSM; outputFile keeps memory bounded', risk: 'Long-term maintenance of 7 variants; no explicit depth limit, users manage it themselves; "dream" background tasks add operational complexity' },
-    { system: 'OpenClaw', value: '★★★★★', reason: 'Complete subagent platform: spawn / registry / depth / announce / attachments / lifecycle all built in; push-based plus an anti-polling warning literally inside the tool return value; depth persisted across process restarts', risk: '13-field config has a learning curve; six submodules to maintain; new users get tripped up by the mode/cleanup/sandbox enums' },
-    { system: 'Hermes', value: '★★★★', reason: 'One function plus five blocked tools plus MAX_DEPTH=2. The minimum viable subagent design, each restriction tied to a concrete failure mode', risk: 'Synchronous blocking model freezes the parent UI when children run long; missing advanced features like attachments; the 7-backend compatibility surface is user-managed' },
-  ]}
-  caption="Scoring criteria: abstraction consistency + safety-boundary clarity + concurrency-model fit"
-  headers={['System', 'Score', 'Strengths', 'Risks']}
-/>
+| Task shape | Start with | Measure first |
+| --- | --- | --- |
+| Fixed child-agent roles that inherit parent policy | Codex SubAgentSource and service inheritance | Handoff fields, narrowed permissions, and failure return |
+| Shell, remote calls, and agents share one scheduler | Claude Code TaskType, status machine, and concurrency flags | Queueing, cancellation, and shared-resource conflicts |
+| Multi-model orchestration needs attachments and cross-process notices | OpenClaw spawn/registry/depth/announce | Push completion, duplicate work, storage, and merge time |
+| One constrained delegation is enough | Hermes delegate_task, depth, and blocked tools | Wall time, parent blocking, and budget exhaustion |
+
+Run the same task with 1, 2, 4, and 8 agents. Record wall time, input/output tokens, duplicate reads, conflicts, and human merge time before making a speed claim.
 
 ## Start with one constrained delegation
 
-Below is the recipe distilled from the four systems for writing your own sub-agent. Start functional, then add production-grade features, finally avoid five common dead ends.
+Below is a starting checklist from the cited implementations. Validate the task shape with a functional delegate, then add permissions, notification, and persistence from traces.
 
 <BuildRecipe
   title="Build recipe"
   minimal={[
     'Start functional (borrow from Hermes\' delegate_task): args task (task description) / context (necessary context, not parent\'s full history) / toolset (restricted tool set) / max_iterations (independent budget); simple and clear, args explicit',
     'Hard-block 5 tools to prevent recursion / cross-platform side effects: blocked_tools = [delegate, clarify, memory, send_message, execute_code]; delegate prevents recursion, clarify prevents child asking parent back, memory prevents shared memory pollution, send_message prevents out-of-bounds messaging, execute_code restricts available tools',
-    'Hard-code MAX_DEPTH (borrow from Hermes\' 2 levels): parent(0) → child(1) → grandchild reject; 2 levels covers 95% of sub-agent scenarios, deeper requires special audit',
-    'Default 3 concurrency, configurable; parent uses ThreadPoolExecutor blocking for all children; 3 concurrency is the sweet spot for most scenarios (more hits API rate limit), configurable lets users tune by quota',
+    'Set MAX_DEPTH early (borrow from Hermes\' two levels): parent(0) → child(1) → grandchild reject. Two levels is a source-specific product choice, not evidence of 95% coverage; require task samples and audit records before going deeper',
+    'Make concurrency configurable (Hermes defaults to 3 in this snapshot); the parent waits for children through ThreadPoolExecutor. Three is an implementation parameter, not a universal sweet spot; tune from provider quota, task latency, memory, and rate-limit traces',
   ]}
   advanced={[
     'Type the source enum (borrow from Codex\' SubAgentSource): Review / Compact / ThreadSpawn / MemoryConsolidation / Other; different source sub-agents need different trace / monitoring strategies; typing enables event stream classification queries',
@@ -494,14 +483,14 @@ Below is the recipe distilled from the four systems for writing your own sub-age
   ]}
   avoid={[
     'Don\'t share parent conversation history wholesale into child: context inheritance biases child toward "direction already taken" (cognitive anchoring bias), losing independent judgement; only pass task description + necessary context',
-    'Don\'t let children spawn same-kind sub-agents: recursive nesting blows tokens (one level 100K, three levels 1M), and debug chains explode beyond depth>2; MAX_DEPTH is required hard limit',
+    'Don\'t allow unbounded same-kind spawning: recursion increases call count, tokens, and debug depth. Set MAX_DEPTH and a total budget, then choose the limit from task traces',
     'Don\'t poll for child completion: parent agent constantly calling wait_for_subagent burns tokens for nothing; use push-based completion + hard warning (borrow from OpenClaw)',
     'Don\'t let children run send_message / write shared memory: cross-platform side effects (child suddenly messages user, user confused), shared state pollution (multiple children writing memory simultaneously, data conflicts)',
-    'Don\'t ignore attachment size: base64-encoded images in prompts easily blow context (a 1MB image ~1.4M tokens); attachments must have size limit + auto-compression',
+    'Don\'t ignore attachment size: base64 expands transfer bytes, while model-token cost depends on the provider\'s multimodal encoding. Enforce both byte and provider-token budgets, compressing or rejecting over-limit inputs',
   ]}
 />
 
-## Four subagent flows side by side
+## Put concurrency differences back in context
 
 <Diagram
   src="/diagrams/10-subagent-flows.svg"
@@ -511,7 +500,7 @@ Below is the recipe distilled from the four systems for writing your own sub-age
 
 Lined up, the abstraction-depth spectrum is one glance: function (Hermes) -> typed enum (Codex) -> task abstraction (Claude Code) -> full platform (OpenClaw).
 
-## Follow spawn entry points through source
+## Evidence for delegation permissions and completion
 
 <SourceTrail
   title="Further reading / source entry points"
@@ -580,7 +569,7 @@ Enum + serde gives one consistent shape.
 
 **Source**: [`codex/codex-rs/protocol/src/protocol.rs:2558-2576`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/protocol/src/protocol.rs#L2558-L2576) plus the source-specific branches in `codex_delegate.rs`.
 
-**Follow-up**: "Why does `Other(String)` exist?" To cover plugin / experimental flows. The five canonical variants cover 95% of production usage; new types live in `Other("plugin-name")` until they stabilize and graduate to a real variant. Classic enum escape hatch.
+**Follow-up**: "Why does `Other(String)` exist?" To cover plugin and experimental flows. The five variants are the categories in this source snapshot, not evidence of 95% production coverage; new types can live in `Other("plugin-name")` until their usage and constraints justify a real variant.
 </details>
 
 <details>
@@ -589,7 +578,7 @@ Enum + serde gives one consistent shape.
 Inheritance is correct by default for three reasons:
 
 1. **Child is never broader than parent**: there is no "spawn a child to bypass limits" escape hatch. Safe.
-2. **Avoid cold start**: plugins / mcp_manager are expensive to boot (subprocesses, connections). Sharing one saves 100-500ms.
+2. **Avoid duplicate initialization**: plugins and mcp_manager may spawn processes and establish connections. Sharing can skip that work, but this article has no 100-500ms benchmark; measure cold and reused paths separately.
 3. **State stays in sync**: if the parent just disabled a plugin, the child should also see it disabled. Sharing prevents drift.
 
 But three concrete scenarios bite back:
@@ -626,19 +615,19 @@ Engineering lesson: **the shared-service boundary follows semantics**. Read-only
 <details>
 <summary>**Q3 · Concept**: Hermes blocks five tools for children (`delegate_task / clarify / memory / send_message / execute_code`). What real failure does each correspond to?</summary>
 
-Each of the five maps to a real incident, not dogma:
+Each item maps to a failure mode described around the source. This site does not have Hermes incident records to verify the anecdotes independently:
 
 **`delegate_task` · Self-recursive nesting**
 
 Children are also LLM-driven. If a child has `delegate_task`, it will think "this task is too big, let me spawn my own child". Parent → child → grandchild → great-grandchild; every level burns tokens.
 
-Hermes once hit a four-level recursive spawn that drained 60K of context. After that, `MAX_DEPTH = 2` was added as a fallback, plus the tool-level block as belt-and-suspenders.
+A four-level recursive spawn consuming 60K of context is presented here as a source-side anecdote, not a site-verified incident. The verifiable design is `MAX_DEPTH = 2` plus the tool-level block.
 
 **`clarify` · Child cannot talk to the user**
 
 The user is talking to the parent. A child popping a `clarify("which algorithm do you want?")` confuses the routing: either the UI shows multiple stacked clarify dialogs, or the message vanishes silently.
 
-Hermes hit a deadlock when an analysis subagent fired `clarify` and the TUI did not know where to route it. From then on, children must never ask; if they do not know something they put it in the result and let the parent decide.
+The deadlock story is also an unverified source-side anecdote. The testable failure mode is routing ambiguity when a child invokes `clarify`; the design response is to return uncertainty to the parent instead of opening child-owned UI.
 
 **`memory` · Shared MEMORY.md pollution**
 
@@ -796,9 +785,9 @@ Engineering lesson: **abstraction is not unconditionally good. It depends on whe
 <details>
 <summary>**Q6 · Practical**: You are adding subagent capability to your own agent from scratch. What does the path from MVP to production look like?</summary>
 
-Four stages: **functional MVP → safety boundary → typed → platformized**.
+Advance through five scopes: **functional MVP → safety boundary → parallelism → typed → platformized**. Each scope must pass resource, permission, and result-contract fixtures.
 
-**Stage 1 (Day 1) · Functional MVP**
+**Stage 1 · functional MVP**
 
 Borrow from Hermes:
 
@@ -807,7 +796,7 @@ def delegate_task(goal: str, context: str, toolset: list[str], max_iter: int = 5
     return run_subagent_sync(goal, context, toolset, max_iter)
 ```
 
-Day-one ready. Parent uses it like:
+Use it first to validate the parent/child result contract. Parent uses it like:
 
 ```
 parent: I want to analyze these 3 log files
@@ -817,7 +806,7 @@ parent: delegate_task("analyze log 2", ..., ["read_file", "grep"])
 ... wait for result
 ```
 
-**Stage 2 (Day 2-3) · Safety boundary (do not skip)**
+**Stage 2 · safety boundary (do not skip)**
 
 Add four things that cannot be skipped:
 
@@ -828,7 +817,11 @@ Add four things that cannot be skipped:
 
 This stage is the boundary between "minimum viable" and "blows up in production".
 
-**Stage 3 (Week 2) · Parallelism**
+**Acceptance gate**: recursion, blocked tools, concurrency limits, and timeout fixtures reject or terminate child tasks and clean up resources.
+
+**Stage 3 · parallelism**
+
+**Prerequisite**: Stage 2 depth, tool, and timeout boundaries are stable.
 
 Let the parent run multiple children at once:
 
@@ -844,11 +837,15 @@ async def parent_turn():
     results = await asyncio.gather(*tasks)
 ```
 
-Each child is an independent LLM call. 3× speed.
+When the three calls have no data dependency they can run concurrently. Wall time is then bounded by the slowest child plus scheduling overhead; measure speedup against the serial baseline.
 
 UI consideration: three children running simultaneously means three progress indicators. Give each child a `child_id` and render per-child progress.
 
-**Stage 4 (Week 3-4) · Typed sources (medium term)**
+**Acceptance gate**: compare a fixed no-dependency task set with the serial baseline, recording duplicate calls, conflicts, and child cleanup.
+
+**Stage 4 · typed sources**
+
+**Prerequisite**: child sources show repeatable behavior differences and string configuration is becoming hard to maintain.
 
 When subagent kinds exceed 3 (e.g., review / summarize / search / analyze), switch to enum:
 
@@ -870,7 +867,11 @@ Benefits:
 - Metrics aggregated by source
 - Feature constraints determined by source (Review auto-disables web_search)
 
-**Stage 5 (Month 2-3) · Platformization (long term)**
+**Acceptance gate**: each source's prompt, tool constraints, and metric labels agree in schema fixtures; unknown sources are rejected explicitly.
+
+**Stage 5 · platformization (when needed)**
+
+**Prerequisite**: the product needs cross-process state, notifications, attachments, or multi-user framework capabilities.
 
 If you are building an agent framework (other developers write agents on top), borrow OpenClaw:
 
@@ -882,14 +883,16 @@ If you are building an agent framework (other developers write agents on top), b
 
 These are "framework features" you do not need in a single-user agent.
 
+**Acceptance gate**: kill/resume, push notifications, attachment transfer, and lifecycle events replay correctly, and the platform layer never widens inherited permissions.
+
 **Key takeaways**:
 
-1. **MAX_DEPTH on day one** (recursive nesting and token blow-ups are the most common incident)
-2. **blocked_tools on day one** (shared-state pollution)
-3. **Timeout + heartbeat by end of week 1** (UI freezing)
-4. **Typing / platformization is later** (data-driven, only when there is real demand)
+1. **Fix MAX_DEPTH first** (recursive nesting expands calls, tokens, and debugging paths)
+2. **Fix blocked_tools first** (shared-state pollution)
+3. **Promote concurrency after timeout + heartbeat fixtures pass** (UI freezing)
+4. **Add typing / platformization from demand** (use traces and real calls)
 
-**Source composition**: Hermes `tools/delegate_tool.py` (MVP) + Codex `protocol.rs SubAgentSource` (typing) + OpenClaw `agents/subagent-*.ts` (platform). Stitch the three together and you have subagent framework v0.1.
+**Source route**: Hermes `tools/delegate_tool.py` shows minimal delegation, Codex `protocol.rs SubAgentSource` shows typed purposes, and OpenClaw `agents/subagent-*.ts` shows state and notification. Their contracts differ, so select layers from task traces instead of stitching them together verbatim.
 
 **Follow-up**: "How does the parent handle a child failure?" Three strategies: (1) retry once (transient error); (2) mark failed and let the parent decide (business logic error); (3) abort the parent task (fatal, e.g. quota exhausted). Most cases pick (2), keep the decision with the parent.
 </details>
@@ -905,7 +908,7 @@ If the child could exceed the parent's limits, an attacker could "have the paren
 
 Classic attack pattern: user input "write a script that deletes /etc/passwd" → parent's `exec_policy` blocks `rm -rf` → but the child does not inherit → child runs → boom.
 
-**Codex's design is therefore correct**: by default, the child is a subset of the parent, strictly stricter.
+**Codex's default-tight policy is a useful safety starting point**: by default, the child is a subset of the parent; when a business case genuinely needs more, the parent can grant it explicitly with additional constraints.
 
 **But "child does more than parent" is sometimes a real need**
 
@@ -966,7 +969,7 @@ That outsources the permission decision to the LLM, too large a security surface
 
 Four layers: **concurrency model → resources → communication → model**.
 
-**Layer 1 · Concurrency model (10 min)**
+**Layer 1 · Concurrency model (check first)**
 
 Check whether subagents are sync or async:
 
@@ -982,7 +985,7 @@ rust-gdb -p <parent_pid>             # Rust
 
 Look for the parent stuck in `wait()` / `recv()` / `gather()`. If yes, go to the next layer.
 
-**Layer 2 · Resource exhaustion (20 min)**
+**Layer 2 · Resource exhaustion (check next)**
 
 Ten children can blow up four resources:
 
@@ -1000,7 +1003,7 @@ cat /proc/<parent_pid>/limits        # ulimit
 grep "429" logs/                     # rate-limit errors
 ```
 
-**Layer 3 · Communication bottleneck (30 min)**
+**Layer 3 · Communication bottleneck**
 
 For push-based:
 
@@ -1016,7 +1019,7 @@ grep "input_tokens" logs/parent.log
 chrome devtools performance tab
 ```
 
-**Layer 4 · Model behavior (1 hour)**
+**Layer 4 · Model behavior (check last)**
 
 If everything else looks fine:
 
@@ -1028,24 +1031,24 @@ Investigation: look at the parent LLM trace (the messages of each call); find po
 
 **Common root causes + fixes**
 
-By frequency:
+The following is a diagnostic order, not an observed frequency distribution. The original 30/25/20/15/10 split had no incident sample; reorder it from trace and incident data after deployment.
 
-1. **Rate limit hit** (30%): limit concurrency to 3-5, add exponential backoff.
-2. **Sync blocking dragged down by a slow child** (25%): switch to async / push-based + per-child timeout.
-3. **Resource exhaustion** (20%): monitoring + concurrency limit + cleanup.
-4. **Parent model polling** (15%): borrow OpenClaw's anti-poll warning.
-5. **UI render lag** (10%): debounce + batch events.
+1. **Rate limit hit**: limit concurrency, add exponential backoff.
+2. **Sync blocking dragged down by a slow child**: switch to async / push-based + per-child timeout.
+3. **Resource exhaustion**: monitoring + concurrency limit + cleanup.
+4. **Parent model polling**: borrow OpenClaw's anti-poll warning.
+5. **UI render lag**: debounce + batch events.
 
 **Prevention**
 
-Make these defaults so users do not step on the rake:
+Use these as explicit starting parameters, then tune them from quota and trace data:
 
 - max concurrent = 3
 - single-child timeout = 5 min
 - queue size limit + drop policy
 - API rate-limit-aware retry
 
-**Source reference**: Hermes's `_DEFAULT_MAX_CONCURRENT_CHILDREN = 3` + `_HEARTBEAT_INTERVAL = 30` + `DEFAULT_MAX_ITERATIONS = 50`. Three defaults distilled from real incidents.
+**Source reference**: Hermes's `_DEFAULT_MAX_CONCURRENT_CHILDREN = 3`, `_HEARTBEAT_INTERVAL = 30`, and `DEFAULT_MAX_ITERATIONS = 50`. They are current source defaults; this site has no incident data explaining how they were selected.
 
 **Follow-up**: "What if the business genuinely needs 10 concurrent without freezing?" Do specialized parallelism (worker pool / connection pool / API tier upgrade), not use a generic subagent framework to brute-force it. Subagent is "one agent delegates one task to a throwaway agent", not "batch process 10000 tasks". The latter needs a data pipeline, not an agent.
 </details>
@@ -1080,9 +1083,9 @@ If forced to pick:
 
 Claude Code is the former (CLI / IDE); OpenClaw is the latter (long-lived agent platform). Their priorities follow from that.
 
-**Best practice: do both**
+**For long-lived systems, persist both**
 
-Any serious subagent system should:
+For subagent systems that span processes, run for a long time, or must recover after restarts, persist:
 
 1. **Persist large outputs** (outputFile / stdout redirect / chunked storage)
 2. **Persist safety constraints** (depth / quota / rate-limit state)
@@ -1121,7 +1124,7 @@ spawnDepth:
 </details>
 
 <details>
-<summary>**Q10 · Open-ended**: Combine the best of all four into a "universal subagent framework". Provide a minimum API + implementation outline.</summary>
+<summary>**Q10 · Open-ended**: Design a composable subagent framework from task constraints, with a minimum API and verification path.</summary>
 
 Layered design; enable layers on demand:
 
@@ -1141,7 +1144,7 @@ async function spawnSubagent(args: SpawnArgs): Promise<SubAgentResult> {
 }
 ```
 
-Minimum viable, 30 lines.
+This is a minimum interface sketch. A production implementation still needs timeout, cancellation, budgets, tracing, and error propagation; the snippet length is not a delivery estimate.
 
 **Layer 2 · Typing (recommended)**
 
@@ -1165,7 +1168,7 @@ const SOURCE_CONFIG: Record<SubAgentSource, SourceConfig> = {
 
 Borrow Codex `SubAgentSource`. Each source routes to its own config.
 
-**Layer 3 · Safety constraints (required, do not skip)**
+**Layer 3 · Safety constraints (retain where needed)**
 
 ```typescript
 const HARD_LIMITS = {
@@ -1189,7 +1192,7 @@ function validateSpawn(parent: Session, args: SpawnArgs) {
 }
 ```
 
-Borrow Hermes's five blocks + MAX_DEPTH. Absolutely required.
+Borrow Hermes's five blocked tools + MAX_DEPTH. Keep these constraints for cross-process or long-lived runs; for short, single-process tools, weigh them against the risk.
 
 **Layer 4 · Service inheritance (recommended)**
 
@@ -1323,17 +1326,17 @@ Simple one-liner. Enable layers as scenarios get richer.
 - OpenClaw contributes anti-polling warning + spawnDepth persistence.
 - Hermes contributes the five tool blocks + ThreadPoolExecutor.
 
-**Implementation effort**:
+**Evaluate by scope**:
 
-- Layers 1-3: 1 week with tests
-- Layers 4-6: 2-3 weeks
-- Layers 7-9: 1-2 months with UI integration
+- **Layers 1-3 · core delegation**: spawn contract, depth/tool boundaries, and timeout semantics. **Gate**: unit tests cover rejection paths, and an integration fixture receives either a child result or an explicit failure.
+- **Layers 4-6 · concurrency and typing**: add only when child tasks truly have no data dependency or source kinds have become hard to maintain. **Prerequisite**: a serial baseline and `child_id`; **gate**: a fixed task set measures speedup, duplicate calls, cleanup, and source constraints.
+- **Layers 7-9 · platform capabilities**: add only when cross-process state, durable notifications, attachments, or UI observability are required. **Prerequisite**: lifecycle and permission boundaries are defined; **gate**: kill/resume, push notification, attachment, and state-query fixtures are replayable.
 
 **Critical decisions**:
 
 1. **Core API is JSON-friendly** (cross-language schema)
 2. **Configuration is file-based** (YAML / JSON describing source behavior)
-3. **Reject polling**: anti-polling warning baked in on day one
+3. **Reject polling**: bake the anti-polling warning into the core contract
 
 **Follow-up**: "How do you test such a framework?" Three layers: (1) unit-test spawn / depth / blocked_tools; (2) integration-test push event flow; (3) chaos-test 100 child spawns + kill half + verify resource cleanup. The first two run in CI; the third runs weekly.
 </details>

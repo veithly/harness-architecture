@@ -1,34 +1,76 @@
 ---
-title: 18 · Cron and background tasks
+title: "18 · Background Tasks: Who Closes the Loop?"
 sidebar:
   order: 18
-description: codex cloud-tasks vs Claude Code dual-track cron (CronCreateTool + scheduler) vs OpenClaw full cron subsystem (service + isolated-agent + delivery) vs Hermes croniter + jobs.json. How four systems run agents while you are away.
+description: "Model background work as scheduling, isolation, delivery, and failure state so restarts and missed notifications are diagnosable."
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
-import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## Background work needs its own lifecycle
+## After a background task fails, who closes the loop?
 
-<Verdict tldr="Letting an agent keep running while the user is away sounds simple but actually pulls on several independent engineering threads. The four core questions you have to answer are: when should the agent take action (a specific time, after a delay, on a period, just once?), how should the result reach the user (silently land on disk, actively notify, push to an external system?), whose session does this work happen in (intrude on the user's current conversation, or spin up a clean isolated environment?), and what happens when something goes wrong (retry quietly, back off, alert, auto-disable?). The four systems give wildly different answers. Codex moves the whole thing to the cloud: the local client deliberately has no cron at all, and anything that needs to run long or on a schedule is handed over to a cloud task service (cloud-tasks, a managed task table hosted on the OpenAI backend that the local client only polls for results) that lives in a more stable environment, can isolate cleanly, and can even run several parallel attempts and let the user pick the best. Claude Code builds a thoroughly IDE-native local cron: a tight set of user-facing tools wrapped around a plain 5-field cron expression (cron expression: the Unix-cron-standard 'minute hour day month weekday' format), plus serious attention to the very real problem of 'multiple IDE windows opening the same config without doubling every fire' (scheduler lock, a cross-process mutex ensuring exactly one scheduler owns each config). OpenClaw is the textbook local cron subsystem: three different scheduling shapes (at a specific moment / every fixed interval / a full cron expression), plus everything a production deployment actually needs: isolated execution (isolated-agent, spin up a separate session for the task so the user's current conversation is not disrupted), failure backoff (exponential backoff: double the wait after each failure), an independent alert channel (failure routes to its own destination so error messages do not bleed into the user's normal channel), four delivery modes, and dozens of regression tests named after real production bugs. Hermes goes the most restrained route: it uses an industry-standard cron library (croniter, the canonical Python library for parsing cron expressions and computing the next fire time), persists everything to a small json file, gives one-shot tasks a two-minute grace window (ONESHOT_GRACE_SECONDS=120: right after restart, missed triggers from the last two minutes still fire) to absorb restart hiccups, and treats every cron prompt as security-critical input that must be scanned (_CRON_THREAT_PATTERNS, a set of strict regexes plus a 10-character invisible-Unicode check to prevent malicious prompts being smuggled into scheduled tasks). Bottom line: borrow Claude Code for personal developer cron, borrow OpenClaw for production-grade cron, borrow Hermes for security-sensitive cron, and borrow Codex when long-running tasks can simply go to the cloud." />
+<Verdict tldr="A background task can fire twice, complete without delivering its result, or miss a one-shot trigger during restart. This chapter follows scheduling, isolation, failure state, and delivery through source. There is no shared benchmark here; a test vector is not an incident report."/>
 
-## Four background-work systems
+A background task is more than a cron expression in a loop. It needs a lifecycle that survives restart: when to fire, where to run, whether the result arrived, and what the next retry means.
+
+## Define the terminal states first
+
+| Constraint | State that must be recorded | Failure action |
+| --- | --- | --- |
+| A restart must not lose a reminder | Scheduled time, last fire, grace window | Fire inside the window; mark it missed after expiry |
+| A task must not pollute the user session | Session target and skills snapshot | Use an isolated session with an explicit close path |
+| Execution success is not delivery success | Run status and delivery status | Alert separately; do not repeat an already successful side effect |
+| Bad configuration must not create a retry storm | Schedule errors separate from execution errors | Disable configuration faults; back off transient failures |
+
+This is a state contract, not a product scorecard.
+
+## Compare only at lifecycle forks
+
+### When a task needs an online runtime: Codex
+
+Codex moves long-running work to cloud tasks. The local client shows summaries and lets the user choose an apply. The trade is explicit: code runs in a managed environment and depends on network access.
+
+### When reminders stay local: Claude Code
+
+Claude Code exposes a small task shape: expression, prompt, recurrence, and durability. A scheduler lock prevents duplicate fires across IDE windows, while default expiry keeps short-lived reminders from running forever.
+
+### When execution and delivery differ: OpenClaw
+
+OpenClaw records `lastRunStatus` separately from `lastDeliveryStatus`, and counts schedule errors separately from execution errors. Isolated sessions, deterministic staggering, and a failure destination all support that split.
+
+### When a persisted prompt needs a gate: Hermes
+
+Hermes uses croniter and a JSON store. `ONESHOT_GRACE_SECONDS=120` gives a one-shot task a short restart window, and cron prompts pass threat-pattern and invisible-Unicode checks. The source does not prove an interception rate.
+
+## A cancellable minimum
+
+Persist state before an irreversible action:
+
+```text
+created -> due -> running -> executed -> delivered
+                         \-> failed -> retrying | disabled
+```
+
+Write task id, attempt, timestamp, and error class on each transition. If the process exits after a tool side effect but before its log, recovery must inspect the side effect instead of blindly replaying it.
+
+Before shipping, ask:
+
+- Do `at`, `every`, and `cron` have separate time semantics?
+- Are permissions, logs, and close paths separate for main and isolated sessions?
+- What does the user see when a run succeeds but a webhook fails?
+- Are cron test vectors clearly separated from production incidents?
+
+## Source notebook: implementation details
 
 <details>
-<summary>Before reading (optional)</summary>
-
-- **Four questions before any cron**: when the agent acts, how results reach the user, whose session hosts the work, what happens on failure.
-- **From no local cron to a full subsystem**: Codex hands everything to cloud-tasks (the client only polls); Claude Code wraps 5-field cron in tools plus a cross-process scheduler lock; OpenClaw adds isolated-agent execution, exponential backoff, and a separate failure-alert channel; Hermes uses croniter with a json file and ONESHOT_GRACE_SECONDS=120.
-- **Session ownership determines disruption**: scheduled work in an isolated session never intrudes on the user's live conversation.
-- **Treat every cron prompt as security-critical input**: Hermes scans with _CRON_THREAT_PATTERNS plus a 10-character invisible-Unicode check to stop smuggled malicious prompts.
-
-</details>
+<summary>Source notebook: implementation details</summary>
 
 <Diagram
   src="/diagrams/18-cron-background-base.svg"
@@ -38,56 +80,25 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 The four systems on scheduling, isolation, delivery, and failure handling:
 
-<CompareTable
-  rows={[
-    { label: 'Scheduling model', values: ['cloud-tasks runs against a remote task table; no local cron', '5-field cron expression in local time per CronTask', 'CronSchedule with 3 kinds: at / every / cron + tz + staggerMs', 'croniter (standard cron) + ONESHOT_GRACE_SECONDS=120'] },
-    { label: 'Trigger loop', values: ['Cloud backend pushes; codex client polls TaskSummary list', '1s tick + chokidar file watch + cross-process scheduler lock', 'Per-job timer + arm/rearm (anti-tight-loop) + stagger', 'scheduler.py asyncio loop'] },
-    { label: 'Execution isolation', values: ['Cloud env / sandbox (EnvironmentRow controls env)', 'inline / teammate / assistant mode (permanent reserved for morning-checkin / dream)', 'main session OR isolated-agent (separate session + frozen skills-snapshot + subagent-followup)', 'Default main session; can mark as isolated'] },
-    { label: 'Failure handling', values: ['Cloud backend retries', '`removeCronTasks` + `recurringMaxAgeMs` auto-expiry', 'consecutiveErrors backoff + scheduleErrorCount auto-disable + failureAlert (separate destination + cooldownMs)', 'Logs + error state + user-driven retry'] },
-    { label: 'Delivery', values: ['cloud-tasks UI fetches results', 'On fire, `onFire(prompt)` enqueues into the current session', 'CronDelivery 4 modes (none / announce / webhook) + accountId + bestEffort', 'Outputs to `~/.hermes/cron/output/{job_id}/{ts}.md` plus optional platform adapter'] },
-    { label: 'Security', values: ['Handled on cloud side', 'Relies on `allowed-tools` constraints', 'Relies on sandbox + ExecHost', '`_CRON_THREAT_PATTERNS` 10 critical patterns + 10 invisible unicode chars'] },
-  ]}
-  caption="Background = scheduling model x execution isolation x failure handling x delivery path"
-  dimensionLabel="Dimension"
-/>
-
 ## How four systems schedule cron and background work
 
 ### Codex · move the whole "runs in the background" problem to the cloud
 
-Codex's way of handling background tasks can be summarised in one line: **the local client is always a user-driven development tool, and anything that needs to run for a long time outside the user's active view is handled by the cloud**.
+Codex's source places long-running work in cloud tasks; the local client reads summaries and lets the user choose which result to apply. That moves persistence and execution into a managed environment, along with network, credential, quota, and data-boundary decisions. Whether it fits depends on whether the task may run remotely.
 
-The reasoning behind this is very practical. A user's laptop will be closed, will go to sleep, will lose network connection; running anything that is supposed to "fire reliably, on a schedule, for many minutes, while the user is away" inside that environment is unreliable.
+A managed runtime can provide persistent processes and scheduler infrastructure, but availability still depends on deployment, service dependencies, and quotas. The source structure is not an SLA and does not establish that the service is always online.
 
-A cloud environment is the opposite: it is always online, it has controllable resource quotas, and the surrounding cloud ecosystem already has a mature task-scheduling stack (Kubernetes CronJobs, event-bus services from major providers).
-
-There is no good reason to reimplement all of that inside the client.
-
-So Codex builds an independent cloud-side submodule for tasks, and the local client merely acts as a window into it: you can see which tasks exist for your account, what state they are in, and what they produced.
-
-The cloud side is the source of truth for the task list; the client just caches a summary view to render.
-
-Each task is also bound to an "environment" (think of it as a pre-configured container with the right tools installed, credentials injected, and the matching repository already cloned), so every run happens in the same setup and there is no drift-driven weirdness across runs.
-
-There is one design decision in this cloud architecture to remember: **let the same task run as several parallel variants and have the user pick the best one to apply**.
-
-For a task like "fix this bug", the cloud can simultaneously launch several independent branches that use different prompts, different models, or different strategies, and once they are all done the user reviews each diff side-by-side in the client and applies the one that worked best.
-
-This kind of "diverge first, then converge" workflow is effectively impossible on a local machine (there is not enough headroom to run several variants concurrently), but for a cloud setup with elastic capacity it is cheap.
+The source also shows an environment binding and a multi-branch apply model. How many branches run, and what they cost, depends on runner capacity, model choice, task duration, and quota. The model does not prove that cloud execution is always cheaper or that local parallelism is impossible.
 
 The client supports it with a matching experience: an "apply" is not a binary success/failure but a three-way distinction (fully applied, partially applied (some paths conflicted), or completely rejected), and a partial apply surfaces the skipped and conflicting paths so the user can decide what to do next.
 
 The cost of this design is obvious. If the network drops or the cloud service goes down, the entire background-task capability disappears.
 
-This product shape also assumes users are comfortable with "my coding tasks run inside some remote environment". Codex picks this trade because its product positioning is "coding assistant plus cloud collaboration".
-
-The architecture matches the product, not the other way around.
+The trade is concrete: a network or service failure can interrupt the task, and sensitive code may not be allowed to leave the machine. Those constraints can favor a local scheduler instead.
 
 ### Claude Code · make cron a first-class tool inside the IDE
 
-Claude Code goes in the opposite direction. It builds the entire cron capability locally so that users can create, list, and delete scheduled tasks from inside the IDE just like calling any other tool.
-
-Its reasoning is simple: IDE users have their IDE open during working hours anyway, local cron is more than enough for that environment, and it responds far faster than anything that crosses a network to the cloud.
+Claude Code keeps cron in the local IDE process, so it does not require a remote task service while the scheduler process and machine stay available. Sleep, an exited IDE, and local permissions can still prevent a fire; the source does not provide a performance comparison with a cloud scheduler.
 
 <SourceBlock path="REF/claude-code-2.1.88-expanded/src/utils/cronTasks.ts" lines="30-70" system="claude-code" summary="A cron task is described by just a handful of essential fields: identity, expression, the prompt to fire, timestamps, whether it is recurring, whether it persists to disk, and whether it is permanent.">
 
@@ -170,7 +181,7 @@ The first is **wait for the file to settle before reading it**: when a user's co
 
 The second is **mutual exclusion across IDE windows**: users routinely have several windows open at once, each with its own scheduler process, and without coordination the same task would fire once per window. The fix is a local file lock.
 
-Only the window holding the lock actually fires tasks; the others become "observers" that probe the lock every few seconds. If the lock-holder has gone offline (its process crashed), one of the observers takes over as the new lock-holder.
+Only the window holding the lock actually fires tasks; the others become observers. The current source uses a one-second scheduler tick and a 300-millisecond quiet-write window. Those are implementation constants, not site-measured optima; they balance trigger delay against partially written configuration reads.
 
 The third is **default expiry after a month for recurring tasks**, to prevent the failure mode of a `*/5 * * * *` task quietly burning fire costs for six months because nobody remembers it; if some built-in feature really must "always run" (the daily IDE briefing), it carries an explicit "permanent" marker and skips expiry.
 
@@ -178,11 +189,11 @@ The fourth is **default no-persist**: most cron tasks users type are actually "r
 
 ### OpenClaw · the textbook implementation of a local cron subsystem
 
-If the previous two systems are answering "local or cloud", OpenClaw is answering the next question down: "if we go fully local, what does a complete, production-grade cron subsystem look like?".
+If the previous two systems are answering "local or cloud", OpenClaw is answering the next question down: what state and operations does a local cron subsystem need?
 
-Its cron submodule alone contains hundreds of files and covers nearly every production edge you can think of.
+Its cron submodule is large and exposes separate scheduling, isolation, delivery, and failure paths. File count and listed modules are source evidence, not proof that every production edge is covered.
 
-The first thing it gets right is **three explicit scheduling shapes**. The most common one is naturally a cron-expression-style recurring task, but there are two more that deserve their own first-class representation: "fire once at a specific moment" (run something at 9am next Wednesday and never again) and "fire every fixed number of milliseconds" (check this status every 30 seconds).
+The source represents **three explicit scheduling shapes**. A cron-expression-style recurring task is one shape; the other two are "fire once at a specific moment" (run something at 9am next Wednesday and never again) and "fire every fixed number of milliseconds" (check this status every 30 seconds).
 
 All three shapes live inside a single tagged union, each with its own dedicated next-fire computation logic, so you do not need to torture every kind of schedule into a single cron expression that loses the original intent.
 
@@ -228,7 +239,7 @@ export type CronFailureAlert = {
 
 </SourceBlock>
 
-Around the scheduling shapes there are several modifier fields that are each highly practical: **timezone** (especially important for cross-region teams where "every day at 9am" means different moments in different places); **a stagger window** (a clever engineering detail discussed below); **execution context** (choose between running inside the user's main session or spinning up a separate isolated session); **wake mode** (wait until the next heartbeat to handle this, or fire the moment the time matches).
+Around the scheduling shapes there are several modifier fields: **timezone** (especially important for cross-region teams where "every day at 9am" means different moments in different places); **a stagger window** (a deterministic offset discussed below); **execution context** (choose between running inside the user's main session or spinning up a separate isolated session); **wake mode** (wait until the next heartbeat to handle this, or fire the moment the time matches).
 
 Next is the **persistent state attached to each task**. OpenClaw models this state quite precisely: the next time the task should run, the last time it ran, whether the last run succeeded or failed, how many consecutive failures have accumulated, whether the last result was delivered, and what the delivery's final status was.
 
@@ -276,7 +287,7 @@ OpenClaw tracks them on two independent state lines and lets their alert channel
 
 Similarly, **consecutive execution failures** and **schedule-configuration errors** are kept as separate counters.
 
-If a task's cron expression itself is malformed, that is a configuration problem and should be shut down quickly to stop the useless triggers; if the task is just hitting transient runtime errors (flaky network, an external API occasionally returning 500), the right behavior is exponential backoff plus retries, with an alert only once the error count has clearly crossed a threshold.
+If a task's cron expression itself is malformed, treat it as a configuration error and stop the useless triggers; for transient runtime errors (flaky network, an external API occasionally returning 500), one possible policy is exponential backoff plus retries, with an alert threshold chosen for the workload.
 
 The tolerance levels of these two are naturally different, and mixing them lets "configuration is broken, stop now" interfere with "runtime is flaky, keep trying patiently".
 
@@ -292,21 +303,21 @@ Next, **why it is a bad idea to run cron tasks directly inside the user's main s
 
 If a cron firing simply enqueues its prompt into the main session's message queue, the user comes back and finds a long string of mystery messages in their conversation history, the prompt prefix cache gets shredded by the injected content, and the task's own tool calls can race against whatever the user is doing right now.
 
-OpenClaw's answer is to **spin up a completely independent session for every cron task**: no inherited conversation history, its own working directory, auto-closed when the task finishes.
+OpenClaw's answer is to **spin up a separate session for every cron task**: no inherited conversation history, its own working directory, and an explicit close path. Whether the boundary is fully independent depends on the runner configuration.
 
 Paired with the isolated session is another very important design: **freezing the skills snapshot at task creation**.
 
 The skills that a task depends on (its tool surface) are whatever they happen to be the moment the task is created; later, the user may modify those skills (remove one, add one, tweak the behavior of another), but every time the cron task fires it still uses the frozen snapshot captured at creation.
 
-This guarantees behavioral stability: a task you configured today won't suddenly drift in behavior next week because you tweaked some skill last night.
+This freezes the captured skills configuration for that task; it reduces one source of behavior drift, but external state and runner changes still need their own controls.
 
 Finally, OpenClaw's testing posture is distinctive. There are dozens of test files for this cron subsystem, and a significant fraction of them are named directly after past production bug numbers ("issue-22895-how-soon-is-the-next-fire" and so on).
 
 This treats tests as living artefacts of production pain: every time a real edge case is found in the wild, an issue-numbered regression test is left behind to keep that case from regressing in the future.
 
-### Hermes · do the whole job with the most restrained possible toolkit
+### Hermes · do the whole job with a small toolkit
 
-Hermes deliberately avoids reinventing anything. It adopts the industry-standard cron-expression library to parse schedules, stores all tasks in a single json file, and writes each run's result to a small per-task directory on disk.
+Hermes uses a cron-expression library to parse schedules, stores all tasks in a single json file, and writes each run's result to a small per-task directory on disk. The library choice is an implementation detail, not a claim about a universal standard.
 
 The overall structure is compact, but every choice has a clear reason behind it.
 
@@ -326,9 +337,9 @@ Recurring tasks do not need this kind of grace because there will simply be a ne
 
 But the heaviest thing Hermes does for cron is not in scheduling; it is in **security scanning**.
 
-It is very clear about one thing: a cron prompt is a piece of instruction that "executes while the user is away with the agent's full privileges".
+It is very clear about one thing: a cron prompt may execute while the user is away and inherits whatever tools and permissions the configured runner grants.
 
-That is equivalent to a very high-privilege entry point, and it must be vetted with the same rigour as system-level input.
+Treat that actual authority boundary as a high-risk input surface and vet it with the same rigour as system-level input.
 
 <SourceBlock path="REF/hermes-agent/tools/cronjob_tools.py" lines="41-68" system="hermes" summary="Any prompt about to be written into a cron config is first run through a threat-pattern library specifically tuned for the cron scenario; any invisible Unicode character is blocked outright.">
 
@@ -380,22 +391,22 @@ It records the **trigger origin** of each task on the task itself (which chat pl
 
 And it maintains backward compatibility for the on-disk task shape. Early versions stored "the skill in use" as a single field while newer versions made it an array, and on read both shapes are normalized into one canonical form so that a format evolution does not orphan every task ever created.
 
-These look like throwaway details but in a system that has been live for a year they are highly valuable.
+These fields target migration and delivery-maintenance problems. Their value still needs runtime evidence; the source alone does not establish an operating history or outcome.
 
 ## Local capability versus cloud capability
 
 <Diagram
   src="/diagrams/18-tradeoff.svg"
   alt="Four cron systems plotted on local capability and cloud capability axes"
-  caption="OpenClaw has the most complete local cron; Codex pushes everything to the cloud; Claude Code and Hermes pick a middle local-only path."
+  caption="The implementations emphasize local scheduling, IDE lifecycle, bounded file storage, or managed tasks. The axes show emphasis, not completeness."
 />
 
 How the four split:
 
-- **OpenClaw** top-left: textbook-grade local cron subsystem + delivery + failure-alert, runs offline.
-- **Claude Code** top-middle: 1s tick + chokidar + cross-process scheduler lock. IDE-style.
-- **Hermes** middle: croniter + jobs.json + 10 threat patterns. Restrained engineering.
-- **Codex** bottom-right: no local cron; long-running tasks all go to cloud-tasks with bestOf parallel.
+- **OpenClaw** top-left: local scheduling + delivery + failure-alert. Scheduling can stay local; individual jobs may still require a network.
+- **Claude Code** top-middle: the source's 1s tick + chokidar + cross-process scheduler lock, scoped to an IDE lifecycle.
+- **Hermes** middle: croniter + jobs.json + the current ten-pattern scan. Coverage stops at the rule set.
+- **Codex** bottom-right: the reviewed client routes this work through cloud-tasks and renders bestOf apply results.
 
 Side by side, the four cron subsystems:
 
@@ -411,9 +422,9 @@ Side by side, the four cron subsystems:
 
 Treating "recurring" as "once created, runs forever" is an extremely common piece of lazy design. A `*/5 * * * *` schedule looks harmless, but six months later nobody remembers it exists and each fire keeps quietly costing money.
 
-A safer default is to give every recurring task a maximum lifetime (something like 30 days) and let it expire on its own; if the user genuinely wants a task to live beyond that, they should have to explicitly mark it as "permanent".
+Claude Code's current source uses a 30-day default expiry. That is an implementation setting, not a universal lifetime. Choose a TTL from trigger cost, task risk, and the renewal workflow; require explicit renewal or a permanent marker only when the task must outlive it.
 
-This "active renewal beats passive expiry" pattern is much safer. In parallel, a task that has failed many times in a row should auto-disable rather than continuing to burn fires for no result.
+Explicit renewal makes ownership visible. Separately, repeated failures can trigger backoff or disablement when the error policy and recovery path are defined.
 
 With these two policies together, the cron subsystem stops being a write-once, garbage-only-grows accumulation pit.
 
@@ -425,7 +436,7 @@ The task may have run perfectly but the webhook configured for it happens to be 
 
 If your data model exposes only a single success/failure bit, you will hit user-experience disasters like "the task crashed but the user got nothing" or "the task is perfectly fine but the user is being woken up by alerts".
 
-The right move is to track "execution outcome" and "delivery outcome" on two separate state lines and let their alert paths be independent.
+When delivery can fail independently, track execution and delivery outcomes separately and give each an explicit alert path.
 
 This both pinpoints whether the problem is in execution or delivery and gives the user a meaningful diagnostic.
 
@@ -433,56 +444,34 @@ This both pinpoints whether the problem is in execution or delivery and gives th
 
 If a cron fire simply enqueues its prompt into the user's main session, you immediately create a cascade of headaches: the user comes back to find a pile of mystery messages in their conversation history, the prompt prefix cache is invalidated by those injections, and the task's tool calls can race against whatever the user is doing in real time.
 
-The healthier approach is to spin up a completely independent session for every cron fire, run the task to completion there, and only afterwards surface "the task ran, here is the result" as one clean notification back into the main conversation.
+The healthier approach is to give each cron fire a separate session with explicit close, log, and notification paths, then surface "the task ran, here is the result" back into the main conversation. Whether it is fully isolated depends on the runner configuration.
 
-OpenClaw goes one step further and freezes the task's skill configuration to the moment it was created, so that even if the user later edits their skills the task's behavior never drifts out from under them.
+OpenClaw goes one step further and freezes the task's skill configuration at creation time. That reduces drift from later skill edits; external state, runner changes, and permissions still need separate controls.
 
 ### Mistake 4: trusting user-provided cron prompts as if they were ordinary text
 
-A cron task's prompt is an instruction that will run "while the user is absent, with the agent's full privileges". That puts it in the same security class as system-level input, not ordinary user chat.
+A cron task may run while the user is absent and inherits whatever tools and permissions its configuration grants. Treat its prompt according to that actual authority, not as ordinary chat text.
 
 Any prompt being written into a cron config should be scanned for classic injection templates, commands that read known credential files, shell snippets that exfiltrate keys from environment variables, keywords that plant SSH backdoors or edit sudoers, and destructive root commands like `rm -rf /`.
 
 Beyond regex matches, the scan also needs to enumerate invisible Unicode characters explicitly: these are not visible on screen but do reach the model's tokens, and they are one of the most common ways to bypass keyword-based scanners.
 
-This step is not optional.
+For prompts that can invoke privileged tools, invisible-character checks cover one class of keyword bypass. They still need runtime policy, approval, and audit; a rule-set match rate is not a security coverage rate.
 
-## My take: a successful run is not successful delivery
-
-<ScoreCard
-  systems={[
-    {
-      name: 'Codex',
-      scores: { 'Local cron': 1, 'Cloud tasks': 5, 'Isolation': 4, 'Failure handling': 3, 'Delivery': 3 },
-    },
-    {
-      name: 'Claude Code',
-      scores: { 'Local cron': 5, 'Cloud tasks': 1, 'Isolation': 4, 'Failure handling': 3, 'Delivery': 3 },
-    },
-    {
-      name: 'OpenClaw',
-      scores: { 'Local cron': 5, 'Cloud tasks': 2, 'Isolation': 5, 'Failure handling': 5, 'Delivery': 5 },
-    },
-    {
-      name: 'Hermes',
-      scores: { 'Local cron': 4, 'Cloud tasks': 1, 'Isolation': 3, 'Failure handling': 3, 'Delivery': 4 },
-    },
-  ]}
-  caption="Five dimensions (1 = weakest, 5 = strongest)."
-/>
+## Closing the loop requires separate run and delivery state
 
 ## Start with one cancellable task
 
 <BuildRecipe
   steps={[
     { title: '1. Pick a scheduling model', detail: 'Cron expressions only: use croniter or cron-parser. Need at / every / cron together: borrow OpenClaw\'s CronSchedule discriminated union.' },
-    { title: '2. Add recurring vs one-shot', detail: 'One-shot fires then deletes (Claude Code\'s fire-then-delete). Recurring computes next-fire and re-schedules. Add grace seconds (Hermes 120s) for missed one-shots.' },
+    { title: '2. Add recurring vs one-shot', detail: 'One-shot fires then deletes (Claude Code\'s fire-then-delete). Recurring computes next-fire and re-schedules. Hermes currently configures a 120-second grace window; tune yours against startup delay and late-fire cost.' },
     { title: '3. Add a durable option', detail: 'Default to session-only, not persisted. Explicit durable=true writes to .claude/scheduled_tasks.json or ~/.hermes/cron/jobs.json. Avoids polluting long-term storage with ephemeral reminders.' },
-    { title: '4. Add a scheduler lock', detail: 'Multiple sessions reading the same cron file need cross-process mutual exclusion (Claude Code\'s scheduler lock). Otherwise fires double-trigger.' },
-    { title: '5. Add isolated-agent option', detail: 'In production, cron should run in its own session (OpenClaw\'s isolated-agent + skills-snapshot) to avoid stepping on the user\'s active session.' },
+    { title: '4. Add a scheduler lock', detail: 'When multiple processes can own one cron file, add exclusion or a single-owner mechanism. Claude Code uses a scheduler lock; a single-process deployment may not need the same primitive.' },
+    { title: '5. Add isolated-agent option', detail: 'When a job can contend with user tools, permissions, or context, consider OpenClaw isolated-agent + skills-snapshot. A lightweight reminder may stay in the main session.' },
     { title: '6. Separate execution vs delivery', detail: 'OpenClaw\'s lastRunStatus + lastDeliveryStatus. A failed webhook must not mask a failed job; a failed job must not pretend delivery succeeded.' },
     { title: '7. Add failure backoff + alert', detail: 'consecutiveErrors for exponential backoff. scheduleErrorCount auto-disables broken jobs. failureAlert with its own cooldownMs prevents alert storms.' },
-    { title: '8. Add prompt scanning', detail: 'A cron prompt executes system-level instructions while the user is absent. Hermes\'s _CRON_THREAT_PATTERNS 10 patterns are the baseline.' },
+    { title: '8. Add prompt scanning', detail: 'Cron prompts may invoke privileged tools while the user is away. Hermes\'s current ten _CRON_THREAT_PATTERNS are a starting set of known patterns, not complete coverage.' },
     { title: '9. Add staggerMs', detail: 'All `0 9 * * *` tasks triggering simultaneously will hammer the model API. OpenClaw\'s deterministic stagger spreads each job across 0..staggerMs.' },
   ]}
 />
@@ -499,7 +488,7 @@ Do you need cron? Answer these 7 questions:
 6. **Isolation requirements?** High: isolated-agent + skills-snapshot. Low: run in main session.
 7. **Is the prompt source trusted?** From user or model: force scan. From system config: trust.
 
-Five or more yes? Build a cron subsystem in the OpenClaw style. Two or three: borrow Claude Code. Fewer than two: setTimeout is enough.
+Do not choose a product by counting yes answers. Offline execution, multi-process ownership, cross-session persistence, isolation, and independent delivery each introduce different state. Implement only the required branches, then test restart, duplicate fire, and delivery failure.
 
 ## Follow the scheduler through source
 
@@ -519,6 +508,8 @@ Five or more yes? Build a cron subsystem in the OpenClaw style. Two or three: bo
     { label: 'Hermes · cron jobs storage', path: 'REF/hermes-agent/cron/jobs.py', system: 'hermes', lines: '30-80' },
   ]}
 />
+
+</details>
 
 ## Where to continue
 
@@ -545,9 +536,9 @@ Three related but distinct concepts:
 
 **Overlap and distinction**:
 
-- Cron jobs are inherently background (non-blocking)
+- A cron job describes a schedule; its runner may execute in the foreground or background, and the executor determines whether it blocks
 - Background tasks aren't necessarily cron (can be user-triggered then suspended)
-- Long-running tasks aren't necessarily background (can be a long foreground task the user waits on)
+- Long-running tasks aren't necessarily background (they can be long foreground tasks the user waits on)
 
 **Examples**:
 
@@ -660,13 +651,13 @@ Client is a thin TUI; main logic in the cloud. `codex-cloud-tasks` is an indepen
 
 **bestOf multi-branch**:
 
-`BestOfModalState` lets a task run N branches in parallel (different prompts / models). UI picks the best to apply. Local can never do that parallelism (insufficient resources).
+`BestOfModalState` represents N branches (different prompts / models) and lets the UI choose an apply result. Actual parallel execution depends on runner capacity and quota; the same pattern can run locally when the machine can support it.
 
 **Trade-offs vs Claude Code / OpenClaw**:
 
-- Claude Code serves "IDE users", IDE is always open, local cron useful
-- OpenClaw serves "self-hosted agents", must run locally (not always cloud)
-- Codex serves "Codex product users", cloud is naturally available
+- Claude Code: local scheduling depends on an IDE or scheduler process staying available
+- OpenClaw: a self-hosted deployment can keep work local or connect another runtime
+- Codex: cloud tasks own the task state and execution environment
 
 Each product's "typical deployment environment" differs, so cron strategy differs.
 
@@ -769,7 +760,7 @@ def should_fire_now(job):
 - Too long (1h): catching up after 1h may not be what the user wants ("remind me 10am to meet" running at 11am isn't useful)
 - 120s = 2 min: covers agent restart time, not too loose
 
-**Production engineering value**:
+**Engineering implications of the grace window**:
 
 Similar "grace period" concepts in many scheduling systems:
 - AWS EventBridge: default 1 min
@@ -792,9 +783,9 @@ Similar "grace period" concepts in many scheduling systems:
 <details>
 <summary>**Q6 · Real-world**: Roadmap for adding cron to your agent, 0 to 1?</summary>
 
-5 phases:
+The following eight steps are an implementation decomposition, not a schedule estimate. Effort depends on the existing scheduler, storage, permission system, and test harness.
 
-**Week 1 · MVP**
+**Step 1 · MVP**
 
 ```python
 import schedule
@@ -811,7 +802,7 @@ def cron_runner():
 
 Borrow `python-schedule` library to get running first.
 
-**Week 2 · Persistence**
+**Step 2 · Persistence**
 
 ```python
 @dataclass
@@ -828,7 +819,7 @@ def save_jobs(jobs: list[CronJob]):
 
 Borrow Hermes `jobs.json` + `~/.youragent/cron/` layout.
 
-**Week 3 · Scheduler + isolation**
+**Step 3 · Scheduler + isolation**
 
 ```python
 import croniter
@@ -849,7 +840,7 @@ class Scheduler:
 
 Borrow OpenClaw 1s tick + croniter standard cron syntax.
 
-**Week 4 · Failure handling + alerts**
+**Step 4 · Failure handling + alerts**
 
 ```python
 async def fire_with_retry(job: CronJob):
@@ -867,7 +858,7 @@ async def fire_with_retry(job: CronJob):
 
 Borrow OpenClaw `consecutiveErrors` + `failureAlert`.
 
-**Week 5 · scheduler lock**
+**Step 5 · scheduler lock**
 
 ```python
 def acquire_lock(cwd: Path) -> bool:
@@ -882,7 +873,7 @@ def acquire_lock(cwd: Path) -> bool:
 
 Borrow Claude Code scheduler lock file mutex + ts heartbeat.
 
-**Week 6+ · Isolated execution**
+**Step 6 · Isolated execution**
 
 ```python
 async def run_job_isolated(job: CronJob):
@@ -898,7 +889,7 @@ async def run_job_isolated(job: CronJob):
 
 Borrow OpenClaw isolated-agent + skills-snapshot.
 
-**Week 7+ · Threat scanning**
+**Step 7 · Threat scanning**
 
 ```python
 CRON_THREAT_PATTERNS = [
@@ -916,7 +907,7 @@ def scan_cron_prompt(prompt: str) -> Optional[str]:
 
 Borrow Hermes `_scan_cron_prompt` 10 critical + 10 invisible unicode.
 
-**Week 8+ · Delivery modes**
+**Step 8 · Delivery modes**
 
 ```python
 class CronDelivery(Enum):
@@ -938,8 +929,8 @@ Borrow OpenClaw 4-mode delivery.
 
 1. **MVP with python-schedule**: not croniter directly; get running fast
 2. **Persist jobs.json**: simpler than SQLite, enough for most cases
-3. **scheduler lock mandatory**: otherwise multi-window explosion
-4. **Threat scan mandatory**: cron is the attacker's vehicle of choice
+3. **Choose a lock by owner model**: shared jobs need exclusion; a single owner does not need the same primitive
+4. **Scan according to authority**: static rules cover known patterns only; runtime policy still limits tools
 5. **Isolation not for MVP**: main session first; isolate when grown
 
 **Follow-up**: "How to test cron?" Use freezegun to freeze time + run a few periods checking correct triggers.
@@ -1004,14 +995,14 @@ Claude Code cron injects prompt into current session; main session if running ge
 
 **Practical engineering takeaways**:
 
-- Long tasks must be isolated
-- Skills and other mutable state must be snapshotted
-- Isolated sessions need autoClose, otherwise resource leaks
-- Isolated session logs must be queryable (not fully black-box)
+- Isolate a task when it would occupy the foreground session, needs independent cancellation, or must recover on its own
+- For reproducible results, record or snapshot skill, model, and configuration versions at scheduling time; when the task should follow current configuration, resolve them at execution and record what was used
+- A scheduler that creates isolated sessions needs explicit close and reclamation paths, including abnormal exits
+- When operations or audit matter, make isolated-session logs queryable by task instead of exposing only a final status
 
 **Follow-up**: "isolated-agent vs subagent differences?" Subagent is sync call (main agent waits result); isolated-agent is async (runs independently, main agent doesn't wait). `subagent-followup` is OpenClaw's mechanism for isolated-agent to notify main agent on completion.
 
-**Follow-up**: "Cost of isolated-agent?" Each spawn is a new agent context (system prompt + tool box), token cost 100% of main session. Can be lazy-spawned.
+**Follow-up**: "Cost of isolated-agent?" Each spawn creates a new agent context (system prompt + tool box). Actual token cost depends on context length, model, and tool calls; it is not a fixed percentage of the main session. Spawn lazily when the task needs isolation.
 
 **Source**: [`openclaw/src/agents/isolated-agent.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/isolated-agent.ts).
 </details>
@@ -1075,7 +1066,7 @@ _CRON_THREAT_PATTERNS = [
 
 **Follow-up**: "What if user writes base64-encoded cron?" `base64.*decode` is a threat pattern; auto-ask. Signature: users tricked into pasting base64 prompts is common social engineering.
 
-**Follow-up**: "How to test cron security?" Red team test: 20 malicious cron prompts, check scanner detection rate. Production push > 95%.
+**Follow-up**: "How to test cron security?" Fix the threat model, platform, scanner version, and input set first; record blocks, false positives, false negatives, and side effects. Without those materials, do not publish a universal production threshold.
 
 **Source**: `hermes-agent/scheduler.py:_CRON_THREAT_PATTERNS + _INVISIBLE_CHARS`.
 </details>
@@ -1083,7 +1074,7 @@ _CRON_THREAT_PATTERNS = [
 <details>
 <summary>**Q9 · Engineering**: How to auto-decide disable vs retry on cron failure?</summary>
 
-OpenClaw's strategy is most complete: consecutiveErrors + scheduleErrorCount + backoff.
+OpenClaw records `consecutiveErrors`, `scheduleErrorCount`, and backoff separately. The useful comparison is error classification, not completeness.
 
 **Two independent counters**:
 
@@ -1145,11 +1136,11 @@ Otherwise a persistently failing cron triggers alerts every time; user receives 
 
 **Why independent destination?**
 
-Cron main delivery may be the failing party (webhook url down). Alerts must use independent path (email) to ensure user knowledge.
+The main delivery path may itself be failing. An independent alert path reduces correlated failure, but it can fail too, so track its delivery state.
 
 **Compared to Claude Code's strategy**:
 
-Claude Code uses `recurringMaxAgeMs` auto-expire: 30 days unconfirmed = auto-delete. Simple but not smart.
+Claude Code currently uses `recurringMaxAgeMs` to expire unrenewed tasks after 30 days. It caps lifetime; it does not judge business value.
 
 **Follow-up**: "How to distinguish 'business broken' vs 'network jitter'?" Error type classification: NetworkError / TimeoutError = jitter (not counted in consecutiveErrors), BusinessError / SyntaxError = hard break (counted).
 
@@ -1161,9 +1152,9 @@ Claude Code uses `recurringMaxAgeMs` auto-expire: 30 days unconfirmed = auto-del
 <details>
 <summary>**Q10 · Open-ended**: Combine the four to design a general cron system.</summary>
 
-7-layer architecture:
+The seven layers below combine components from four sources. They are not a universal minimum; omit or add layers according to process ownership, external delivery, and tool authority.
 
-**Layer 1 · CronJob data model (mandatory)**
+**Layer 1 · CronJob data model (when state must persist)**
 
 ```python
 @dataclass
@@ -1190,7 +1181,7 @@ class CronJob:
 
 Borrow OpenClaw CronSchedule + Claude Code CronTask + Hermes job.
 
-**Layer 2 · Scheduler (mandatory)**
+**Layer 2 · Scheduler (when triggers run locally)**
 
 ```python
 class Scheduler:
@@ -1211,7 +1202,7 @@ class Scheduler:
 
 Borrow Hermes croniter + OpenClaw 1s tick.
 
-**Layer 3 · Cross-process mutex (mandatory)**
+**Layer 3 · Cross-process mutex (when schedulers share jobs)**
 
 ```python
 class SchedulerLock:
@@ -1235,7 +1226,7 @@ class SchedulerLock:
 
 Borrow Claude Code scheduler lock.
 
-**Layer 4 · Isolated execution (recommended)**
+**Layer 4 · Isolated execution (when jobs contend for session state or authority)**
 
 ```python
 async def fire_isolated(job: CronJob):
@@ -1257,7 +1248,7 @@ async def fire_isolated(job: CronJob):
 
 Borrow OpenClaw isolated-agent + skills-snapshot.
 
-**Layer 5 · Failure handling (mandatory)**
+**Layer 5 · Failure handling (when retries are allowed)**
 
 ```python
 async def handle_failure(job: CronJob, error: Exception):
@@ -1274,7 +1265,7 @@ async def handle_failure(job: CronJob, error: Exception):
 
 Borrow OpenClaw failure-handler.
 
-**Layer 6 · Delivery (recommended)**
+**Layer 6 · Delivery (when results leave the runner)**
 
 ```python
 class Delivery(Enum):
@@ -1290,7 +1281,7 @@ async def deliver(job: CronJob, result: str):
 
 Borrow OpenClaw 4 modes.
 
-**Layer 7 · Threat scanning (mandatory)**
+**Layer 7 · Threat scanning (when prompt origin is not fully trusted)**
 
 ```python
 CRON_THREAT_PATTERNS = [
@@ -1314,28 +1305,23 @@ def scan_cron_prompt(prompt: str) -> Optional[str]:
 
 Borrow Hermes _scan_cron_prompt + _INVISIBLE_CHARS.
 
-**Core design principles**:
+**Choices this example makes explicit**:
 
-1. **Persistence first**: jobs.json is simpler than SQLite
-2. **Lock mandatory**: multi-window will produce bugs without it
-3. **Isolation on by default**: keep main session clean
-4. **Threat scanning mandatory**: cron is an attack vector
-5. **Auto-disable on failure**: 5 consecutive failures auto-stop
+1. **Choose storage by query needs**: jobs.json has a smaller surface; evaluate SQLite when concurrency or migrations require it
+2. **Choose locks by owner model**: shared jobs need exclusion; a single owner does not need the same mechanism
+3. **Choose isolation by contention risk**: a separate session reduces interference but adds context and operational cost
+4. **Scan according to authority**: static rules cover known patterns only; runtime policy still limits tools
+5. **Derive thresholds from configuration**: the example's five failures are not a universal stop rule
 6. **Delivery split by mode**: different scenarios, different paths
 7. **Cloud option optional**: depends on deployment environment
 
-**Replication cost**:
-
-- Layer 1-3 + 7: mandatory, 3-4 weeks
-- Layer 4-6: recommended, 2-3 weeks
-
-Total v0.1 one month, v1.0 two months.
+**Implementation cost**: this chapter has no project log for the combined design, so it cannot estimate weeks. Estimate scheduling, persistence, locking, isolation, delivery, scanning, and fault-injection tests separately.
 
 **Follow-up**: "Multi-host lock?" Redis SETNX or etcd lease. File locks don't span hosts.
 
 **Follow-up**: "How to test the cron system?" Freezegun + run cycles checking correct triggers / backoffs.
 
-**Source mosaic**: All four systems' best parts layered together.
+**Source mosaic**: components from four implementations combined by task boundary; this site has not benchmarked the combined design end to end.
 </details>
 
 </details>

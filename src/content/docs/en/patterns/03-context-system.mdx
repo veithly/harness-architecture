@@ -1,6 +1,9 @@
 ---
-title: 03 · Context System
-description: What goes in, in what order, how much fits. Context loaders across Codex / Claude Code / OpenClaw / Hermes
+title: "03 · Context system: cache, pruning, and trust boundaries"
+description: Split long-running context into static and dynamic parts, control recomputation, and inspect untrusted project files.
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 sidebar:
   order: 3
 ---
@@ -8,27 +11,15 @@ sidebar:
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## Context is not an ever-growing transcript
+## Protect a boundary before adding context
 
-<Verdict tldr="The context system decides what the model sees on every inference. «Same model + same tools, plug them into different context systems and the runtime gap is bigger than swapping models». Four questions to answer: which content is static (every prompt is the same, can be cached) versus dynamic (recomputed every turn, paid for again past the cache boundary); whether external files (`AGENTS.md` / `CLAUDE.md` / `.cursorrules` / …) should be loaded and, once loaded, whether they should pass a safety scan first (defending against prompt injection); how project-level instructions (this repo's lint rules, commit style) should be injected; and when different identities (main agent, subagent, coordinator) need to see different context, whether to hard-code or parameterise. The four systems answer these very differently. Codex picks the «fragment registry» route: `core/src/context/` defines 24 `ContextualUserFragment` trait implementations (`UserInstructions`, `EnvironmentContext`, `AvailableSkillsInstructions`, `PermissionsInstructions`, `ApprovedCommandPrefixSaved`, …). Each fragment has START / END markers and is rendered together into the user-message slot; afterwards the type can be reverse-identified by marker, so compaction never loses a category. This «every kind of context content is a strongly-typed object» approach has the strongest observability but the largest code footprint. Claude Code picks «string array + explicit cache boundary»: `buildEffectiveSystemPrompt()` builds a `string[]` by 5-level priority, with a magic string `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` marking the cache boundary. The front half (identity + tools, same across users) caches; the back half (cwd, time, project rules, different per user per day) recomputes. `splitSysPromptPrefix()` slices at the boundary before the request so Anthropic's prompt caching hits the front half precisely. `DANGEROUS_uncachedSystemPromptSection` forces any section containing PID or timestamp to be marked uncacheable, preventing cache pollution. OpenClaw picks «modular functions + 3-mode»: the prompt is split into a dozen `buildXxxSection()` functions assembled by the main entry. `PromptMode` has 3 modes: `full` for the main agent, `minimal` for subagents (drops memory and authorised-senders sections, keeps only tool descriptions), `none` when external callers assemble it themselves. A `ctx` parameter (`ctx.projectInstructions` / `ctx.skillsPrompt` / `ctx.availableTools`) runs through the assembly chain and decides what each section outputs. This makes single-point edits easier than Codex's 24 fragments, but cache friendliness is worse than Claude Code's explicit boundary. Hermes picks «10-layer explicit assembly + pre-injection safety scan»: `prompt_builder.py` splits the prompt into 10 layers (agent identity, tool-aware, honcho static, optional system msg, frozen MEMORY, frozen USER, skills index, context files, timestamp, platform hint), the first 7 cached and the last 3 recomputed. The identity layer is read directly from `~/.hermes/SOUL.md`; editing this file changes the agent's personality. Hermes also does prompt-injection scanning on external files (`AGENTS.md` / `.cursorrules` / `.cursor/rules/*.mdc`) before they reach the prompt: `_scan_context_content` checks 9 dangerous pattern types plus invisible Unicode; on hit, the entire file is replaced with a `[BLOCKED]` placeholder. The other three default to trusting local repos; Hermes pulls the trust boundary down to the file-read layer. Want strongly-typed observable context? Borrow from Codex. Want cache-friendly? Borrow from Claude Code. Want modular / 3-mode adaptation? Borrow from OpenClaw. Want a safety-strict long-runner? Borrow from Hermes." />
+<Verdict tldr="When context grows, what should be cached, pruned, or treated as untrusted project input? This chapter follows four source paths through static and dynamic boundaries, compaction, and injection scanning. The right choice changes with the workload." />
 
-## The seven things entering context
-
-<details>
-<summary>Before reading (optional)</summary>
-
-- **A bigger lever than the model**: same model + same tools, plug them into different context systems and the runtime gap is bigger than swapping models.
-- **Four assembly routes**: Codex registers 24 typed `ContextualUserFragment`s with START/END markers; Claude Code splits a `string[]` at `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` for prompt caching; OpenClaw assembles `buildXxxSection()` functions under a 3-mode `PromptMode`; Hermes stacks 10 explicit layers in `prompt_builder.py`.
-- **The cache boundary sets the bill**: content before the static/dynamic split is cached; everything past it is paid for again on every turn.
-- **Scan before you inject**: external files (`AGENTS.md`, `.cursorrules`) can carry prompt injection; only Hermes's `_scan_context_content` checks 9 patterns plus invisible Unicode and replaces hits with `[BLOCKED]`.
-
-</details>
+## Ask what deserves a place in context
 
 Any agent's context is roughly these seven slots:
 
@@ -52,7 +43,7 @@ The four systems pack these into the model input quite differently:
   dimensionLabel="Dimension"
 />
 
-## Four ways to assemble context
+## Compare only implementations that change cache or trust
 
 ### Codex · Makes every kind of context content into a strongly-typed Fragment object: observable, compactable, type-reverse-lookupable
 
@@ -96,17 +87,17 @@ Each concrete fragment maps to its own small markdown template. E.g. `permission
 
 This "small markdown file + fragment type" combination lets prompt changes do precise diffs (which file changed by one line, git log shows it), and debug-time reproducibility is easier (each fragment can render individually for inspection).
 
-This design pushes "context = a typed message array" to the limit, the deepest context engineering of the four.
+In the pinned Codex snapshot, this fragment/marker path is relatively concentrated, which makes it useful for tracing how typed context reaches replay and compaction. That is a source-scope observation, not a ranking of the four systems.
 
 The cost is large code footprint: 24 fragments each need trait impl + template file, much heavier than direct string concatenation.
 
-### Claude Code · String array + explicit cache boundary, push cache hit rate to the limit
+### Claude Code · String array + explicit cache boundary
 
 Claude Code's starting point on context is: context engineering's real bottleneck isn't "type clarity" but "whether Anthropic API's prompt caching can hit".
 
 In a normal conversation, the vast majority of system prompt content (agent identity, tool descriptions, normal rules) is actually unchanging and should be cached; only a few contents (current time, cwd, project files) change.
 
-If the entire system prompt is sent as one big string, the model pays again every time to process several thousand tokens; if it can be split into "static front half + dynamic back half" with the front half hitting cache, costs can drop 5-10×.
+If the system prompt is split into a static prefix and a dynamic suffix, the prefix can hit cache. The saving depends on provider pricing, hit rate, and suffix size; measure it from request billing and cache telemetry.
 
 Claude Code therefore doesn't go the trait/fragment route (too heavy) but compiles the prompt into `string[]`: `buildEffectiveSystemPrompt()` builds the array by 5-level priority (overrideSystemPrompt → coordinator → subagent → customSystemPrompt → defaultSystemPrompt), with a magic string `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` marking the cache boundary.
 
@@ -118,7 +109,7 @@ Cache control is finest at two helper functions. `systemPromptSection(name, comp
 
 "this section contains current PID, must be queried every time"). The naming is intentionally DANGEROUS because breaking cache means token costs spike, forcing developers to write a reason to justify.
 
-The boundary's aft positioning preserves the front half's cache hit: putting all DANGEROUS sections after the boundary, the front half never changes so always hits cache.
+The boundary's aft positioning keeps the front half stable. It can be reused when the provider accepts the unchanged prefix and the request sequence actually matches; confirm the result with cache usage fields rather than assuming every request hits.
 
 ### OpenClaw · Modular functions + 3-mode PromptMode adapting different identities
 
@@ -126,13 +117,13 @@ OpenClaw's starting point on context is: different identities (main agent / suba
 
 The main agent needs complete memory + user preferences + all tool descriptions; the subagent only needs the task assigned by the main agent and the necessary tools (no memory, no authorized senders list); external callers (e.g. wanting to embed OpenClaw's tool descriptions in their own prompt) even want to control the entire prompt.
 
-If using a pile of string concatenation, three identities require three different prompt files; using strongly-typed fragments is too heavy; the best compromise is "modular functions + mode switch".
+OpenClaw uses modular functions plus a mode switch. This avoids maintaining three prompt files without adding Codex's fragment types.
 
 Actual implementation is splitting the entire prompt into a dozen `buildXxxSection()` functions (each returning `string[]`); the main entry `system-prompt.ts` calls them in order. `PromptMode = 'full' | 'minimal' | 'none'` 3 modes correspond to main agent, subagent, external caller respectively: `full` mode generates all sections; `minimal` mode cuts memory, authorized senders, project instructions etc. keeping only tool descriptions; `none` mode generates nothing (external caller assembles itself).
 
-Subagents don't need the main agent's memory and permission context; flipping this switch saves a big chunk of tokens.
+Subagents can omit the main agent's memory and permission context. The token reduction depends on the actual section sizes.
 
-The `ctx` argument runs through the whole assembly chain. `ctx.projectInstructions` (project-level instructions), `ctx.skillsPrompt` (available skill list), `ctx.availableTools` (specific tool set), `ctx.citationsMode` (whether to ask the model to add citations) etc. fields determine what each buildXxxSection outputs. `ctx` is OpenClaw's unified interface from "runtime state" to "prompt assembly functions": single-point edits are easier than Codex's 24 fragments (find the right buildXxxSection and change), but cache friendliness is not as good as Claude Code's explicit boundary (OpenClaw has no concept of cache boundary; the entire prompt is sent as dynamic together, so cache hit rate is lower).
+The `ctx` argument runs through the assembly chain. Fields such as `projectInstructions`, `skillsPrompt`, `availableTools`, and `citationsMode` determine each `buildXxxSection` result. A section can be changed in one function. This snapshot has no Claude Code-style cache boundary; actual cache behaviour depends on the generated prefix and provider rules, so inspect request telemetry rather than infer a lower hit rate from the function layout.
 
 ### Hermes · 10-layer explicit assembly + pre-injection safety scan on external files
 
@@ -182,71 +173,59 @@ def _scan_context_content(content: str, filename: str) -> str:
 
 </SourceBlock>
 
-The other three systems don't do this. They trust the local repo's `AGENTS.md` / `CLAUDE.md` (assumed authored by the developer).
+Within the compared snapshots and file-loading paths, Hermes explicitly runs this scan; that does not prove the other systems lack controls elsewhere. Treat repository instructions as untrusted input regardless of session length. Pattern matching covers known strings only and must be paired with permissions, isolation, provenance cues, and audit logs.
 
-Hermes assumes "the user might have cloned a repo with a malicious AGENTS.md" (attackers poisoning via PR), pulling the trust boundary down to the file-read layer.
+## Fix the context contract first
 
-This paranoia is essential for long-running agents: single-session hijack is still tolerable (user notices immediately), but long-running scenarios may have hidden hijacks (agent slowly leaks data over time), so it must be blocked at the source.
+All four snapshots address sources, tool descriptions, project instructions, and context capacity, with different scopes and trade-offs:
 
-## What context systems already agree on
+**First, distinguish stable content from dynamic content**: the four systems use different markers, fragments, or modes to preserve context sources. This can improve cache reuse and make compaction easier to audit; the saving depends on API semantics, prompt churn, and hit rate, so measure telemetry and billing.
 
-The four systems share four obvious common understandings on context system design. These are engineering bottom lines that all agents should follow:
-
-**First, context must be layered (static cacheable + dynamic recompute every iteration)**: all four systems realised that the entire system prompt cannot be sent to the model as one big string. Even though implementation differs (Codex uses fragment markers, Claude Code uses boundary string, OpenClaw uses PromptMode, Hermes uses 10-layer structure), all explicitly distinguish "unchanging part" (agent identity / tool descriptions / static rules) and "changing part" (cwd / time / project files). This layering makes prompt caching potentially hit, single-inference cost can drop an order of magnitude. Agents without layering are crushed by token costs.
-
-**Second, tool signatures use JSON Schema description (detailed in ch. 04)**: all four use JSON Schema to express tool input parameters (rather than natural language). The model parses JSON Schema with significantly higher accuracy than natural language description; tool call failure rate drops from 10% to under 1%.
+**Second, tool signatures use JSON Schema (detailed in ch. 04)**: all four express tool inputs as schema rather than natural-language instructions alone. Schema makes types and required fields machine-checkable; call-failure rates still need to be measured for the target model, tool set, and workload.
 
 **Third, project-level markdown files as "project context" injection slot**: all four support reading AGENTS.md / CLAUDE.md / .cursorrules / SOUL.md and similar instruction files in the project root, letting users/teams give the agent "this project's specific notices" (e.g. lint rules, commit style, technical-debt history). This is the mechanism for an agent to evolve from "generic assistant" to "project-specific assistant".
 
-**Fourth, must have context budget mechanism (auto-compress at token limit)**: all four implement context budget (detailed in chapter 02 compression pipeline), knowing the agent running long will hit the context window limit. The difference is just the aggressiveness of compression strategies (when to compress, what to compress, how to compress). Agents without budget eventually crash.
+**Fourth, long tasks need a capacity strategy**: budget tokens, truncate low-value material, compact history, or split work across turns. Short bounded calls may not need a full compaction pipeline; inputs approaching the provider limit still need an observable, tested handling path.
 
-## Trade cacheability against flexibility and safety
+## Put cache gains beside trust costs
 
 <Diagram
   src="/diagrams/03-tradeoff.svg"
   alt="Four systems on a 2D plane: assembly flexibility × cache hit rate"
-  caption="X: assembly flexibility (more dynamic on the right). Y: cache hit rate. Claude Code maxes out the Y; Hermes maxes out the X; Codex and OpenClaw split the difference."
+  caption="X is assembly flexibility; Y is prefix stability. Positions are qualitative readings of source structure, not measured cache-hit rates for the four products."
 />
 
 The four systems represent four typical trade-offs in context system design.
 
-**If you want to maximise cache hit rate (lower single-inference cost)**: borrow from Claude Code's explicit boundary route. A magic string splits in two, front half always cached, back half recomputed every iteration, pushing Anthropic prompt caching hit rate to 80%+. The cost is rigid assembly rules (adding new sections requires hard-coding into one of systemPrompt.ts's 5 priority levels) and missing external hooks (plugin extension only via fork). Suits scenarios particularly cost-sensitive about single-inference cost.
+**If you want to maximise cache reuse (lower single-inference cost)**: borrow from Claude Code's explicit boundary route. One string splits the prompt into a stable segment and a dynamic segment; the API may reuse the stable prefix while the dynamic part is recomputed. Check `cache_read_input_tokens` and `cache_creation_input_tokens` for the actual hit rate. The cost is rigid assembly rules (adding new sections requires hard-coding into one of systemPrompt.ts's 5 priority levels) and missing external hooks (plugin extension only via fork). Suits scenarios particularly cost-sensitive about single-inference cost.
 
-**If you want the strongest type safety / observability (deepest context engineering)**: borrow from Codex's fragment + marker route. 24 ContextualUserFragment trait impls make every kind of context content into a strongly-typed object; rollout reverse-identifies type, compaction picks strategy by type, single-point edits change the corresponding fragment. The cost is large code footprint (every new context type requires trait impl + template file + register to mod.rs) and missing pre-injection safety scan (default trusts local repo). Suits enterprise / high-engineering-rigor scenarios.
+**If you need typed context and traceable assembly**: examine Codex's fragment-and-marker route. Its 24 `ContextualUserFragment` implementations preserve type through rollout and compaction. The cost is a larger code footprint for every new context type, plus no pre-injection scan in this snapshot.
 
-**If you want to adapt to multi-identity (main agent / subagent / external caller)**: borrow from OpenClaw's buildXxxSection + PromptMode 3-mode route. Modular functions + 3-mode structure lets the same code serve three identities; extending to new identities just adds a PromptMode value; ctx parameter through assembly chain gives uniform interface for runtime state injection. The cost is implicit cache split (main agent and subagent going through same prompt function pollutes cache). Suits multi-channel / multi-role agents.
+**If you need different prompts for main agents, subagents, and external callers**: examine OpenClaw's `buildXxxSection` functions and `PromptMode`. One assembly chain serves several identities. Cache interaction depends on the final prefix and provider rules; sharing a function does not itself prove cache pollution.
 
-**If you want a safety-strict long-runner / let users freely customise personality**: borrow from Hermes' 10-layer assembly + pre-injection scan route. 10 layers make each layer's responsibility clear (agent identity from SOUL.md user-modifiable, frozen MEMORY snap locks cache stability, context files external input scanned then injected); prompt-injection scan pulls trust boundary to file-read layer (the other three don't). The cost is completely sacrificing system prompt's stable cache (10 layers can each change, low cache hit rate) and scan rules need ongoing maintenance (9 patterns don't cover all variants). Suits long-running / user personal agent scenarios.
+**If you need a long-running assistant with user-editable identity**: examine Hermes' 10-layer assembly and explicit pre-injection scan in this snapshot. The scanner covers known patterns only, and cache impact needs request-level measurement; this comparison does not prove the other systems lack defenses elsewhere.
 
-**If you want to adapt to multi-identity (main agent / subagent / external caller)**: borrow from OpenClaw's buildXxxSection + PromptMode 3-mode route. Modular functions + 3-mode structure lets the same code serve three identities; extending to new identities just adds a PromptMode value; ctx parameter through assembly chain gives uniform interface for runtime state injection. The cost is implicit cache split (main agent and subagent going through same prompt function pollutes cache). Suits multi-channel / multi-role agents.
+## Classify inputs before caching them
 
-**If you want a safety-strict long-runner / let users freely customise personality**: borrow from Hermes' 10-layer assembly + pre-injection scan route. 10 layers make each layer's responsibility clear (agent identity from SOUL.md user-modifiable, frozen MEMORY snap locks cache stability, context files external input scanned then injected); prompt-injection scan pulls trust boundary to file-read layer (the other three don't). The cost is completely sacrificing system prompt's stable cache (10 layers can each change, low cache hit rate) and scan rules need ongoing maintenance (9 patterns don't cover all variants). Suits long-running / user personal agent scenarios.
+| Context constraint | Route to borrow | Cost or boundary |
+| --- | --- | --- |
+| Typed markers and replayable compaction matter | Codex fragments and markers | Extending the registry requires type changes |
+| Prefix-cache hit rate is the primary goal | Claude Code explicit cache boundary | Dynamic sections must be marked and stay coupled to the API |
+| Main agents and subagents need different prompts | OpenClaw PromptMode | Flexible assembly gives up some cache stability |
+| Repository files may be untrusted across sessions | Hermes layered assembly and injection scan | A blacklist needs maintenance and cannot replace isolation |
 
-## My take: boundaries matter more than templates
+## Start with static, dynamic, and external input layers
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★☆', reason: '24 fragments make "context = typed messages" first class; markers let compaction reconstruct types; prompt files all in repo and diff-able', risk: 'Adding a fragment type means editing mod.rs; less extensible than pure functions; no pre-injection safety scan' },
-    { system: 'Claude Code', value: '★★★★★', reason: 'Explicit `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` + 5 priorities + `string[]` segmented caching set the cache-friendly ceiling', risk: 'New sections hard-coded into systemPrompt.ts; no external plugin hook' },
-    { system: 'OpenClaw', value: '★★★★☆', reason: 'buildXxxSection modular + PromptMode three modes are practical; ctx is a single point to feed runtime state in', risk: 'Cache split is implicit; main agent and subagent on same prompt can pollute the cache' },
-    { system: 'Hermes', value: '★★★★★', reason: 'Only system that scans for prompt injection + invisible Unicode before injection; users overwrite SOUL.md to change the agent persona', risk: 'Stable system-prompt cache is sacrificed; scan rules need maintenance (9 patterns won\'t cover every variant)' },
-  ]}
-  caption="Scoring rests on engineering tractability + real risk, not maxed-out star worship"
-  headers={{ system: 'System', value: 'Score', reason: 'Strength', risk: 'Risk' }}
-/>
-
-## Build the smallest context system
-
-Below is the recipe distilled from the four systems for writing your own Context System. Lay solid foundations first, then add production-grade features, finally avoid four common dead ends.
+For a new Context System, make sources, precedence, and budgets visible first. Add caching, compaction, and injection defenses only after those boundaries are testable.
 
 <BuildRecipe
   title="Building a context system"
   minimalLabel="Minimal viable"
-  advancedLabel="Production-grade"
+  advancedLabel="When the evidence justifies it"
   avoidLabel="Avoid"
   minimal={[
     'Write the system prompt as string[], one segment each. This enables fine-grained caching strategy per segment, and makes downstream replacement / compression / debugging easier (borrow from Claude Code\'s design)',
-    'Add a dynamic_boundary marker that splits the array in two, front cached (identity + tools never change) / back ephemeral (cwd / time / project files change every iteration); this is the key to taking prompt caching hit rate from 20% to 80%',
+    'Add a dynamic_boundary marker that splits the array in two, front cached (identity + tools rarely change) / back ephemeral (cwd / time / project files change every iteration); use the API token fields to verify whether this improves cache reuse',
     'Auto-discover AGENTS.md / .cursorrules / CLAUDE.md and similar project-level instruction files from cwd for injection (priority by appearance order), making the agent evolve from "generic assistant" to "project-specific assistant"',
     'Add a `Now: <ISO time>` line at the prompt end for a minimal env hint, letting the model know current time (avoiding wrong answers like "what is today\'s date")',
   ]}
@@ -272,7 +251,7 @@ Below is the recipe distilled from the four systems for writing your own Context
   caption="Identity / Tools / Skills sit before the boundary (cache region). Env / Cwd / Mem sit after (rebuilt each turn)."
 />
 
-## Follow the context builders through source
+## Source paths for cache and trust boundaries
 
 <SourceTrail
   title="Source map & further reading"
@@ -306,7 +285,7 @@ Below is the recipe distilled from the four systems for writing your own Context
 <details>
 <summary>**Q1 · Concept**: Disambiguate "context window", "context system", and "system prompt".</summary>
 
-Context window is the model's hard limit: parameter-baked, token-level. GPT-5 is 256K, Claude 4.5 is 200K. It is decided by architecture; the harness cannot change it.
+Context window is the token limit exposed by a model or service, and it changes across versions and providers. A harness can select, compact, or split input, but it cannot exceed the current API limit; consult current official model documentation.
 
 Context system is a harness-side concept: it decides **which raw inputs (user messages, project files, memory, tool outputs) go into model input, in what order, in which slot, on each turn**.
 
@@ -314,11 +293,11 @@ This layer is engineering, and the chapter compares the four systems precisely h
 
 System prompt is one segment that the context system produces (usually the role=system message). It typically carries identity, tool specs, principles. Together with user messages and tool-result messages it forms model input.
 
-The system prompt is the most cache-friendly piece because it does not change.
+The system prompt is cache-friendly only when it stays stable and the provider supports the relevant cache semantics.
 
-The distinction matters in practice: when an engineer complains "context isn't big enough", most of the time the context system is poorly designed (compaction or priority order is wrong), not the window.
+The distinction matters in practice: before buying a larger window, inspect compaction, source priority, and duplicated context. The source comparison does not establish how often each cause occurs.
 
-A coarse context system on a 256K window often loses to a careful one on a 100K window.
+Window size is not sufficient evidence. Compare truncation, key-fact retention, task success, latency, and cost on the same provider, model version, and workload before attributing a result to capacity or assembly.
 
 **Source**: [`codex/codex-rs/core/src/context/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/context/) (Codex), `claude-code/src/utils/systemPrompt.ts` (Claude Code).
 **Follow-up**: "Window full, now what?" See the [Agent Loop compaction comparison](/en/patterns/02-agent-loop/#five-places-where-loops-usually-break) for truncation, folding, and summarization order.
@@ -331,18 +310,16 @@ There is no universal "most worth copying"; it depends on four things: how many 
 
 **Codex style** (fragment + marker) suits big prompts maintained by several teams, with future plans for fine-grained compaction. Markers let you compact history yet still know "this dropped block was the tool list; never drop it." Cost: every new fragment type means editing `mod.rs`.
 
-**Claude Code style** (string[] + boundary) suits prompts that won't grow too much and where cache hit rate is the top priority. The boundary string is a hardcore engineering choice: efficient but inflexible.
+**Claude Code style** (`string[]` + boundary) suits stable prefixes where cache behaviour needs to be observed. The marker makes the split explicit while coupling cache semantics to assembly code.
 
-**OpenClaw style** (buildXxxSection) suits medium complexity and need for distinct subagent modes. `PromptMode = full|minimal|none` is a clever abstraction that covers most needs in three tiers.
+**OpenClaw style** (`buildXxxSection`) suits systems that need distinct main-agent, subagent, and external-caller modes. Whether three modes remain enough depends on the identities the product actually supports.
 
-**Hermes style** (10 layers hardcoded) suits short prompts where users may rewrite identity and cache doesn't matter. Greatest strength is readability: open `prompt_builder.py` and you see the order immediately.
+**Hermes style** (10 ordered layers) suits systems that allow user-edited identity and need injection order to be visible in one file. Its cache fit depends on each layer's churn and provider semantics.
 
-Practical advice: start Hermes-style (simplest). When the prompt grows past 8 segments or post-launch you see low cache hits, upgrade to Claude Code boundary splitting.
-
-Adopt Codex fragments only when you genuinely need to reconstruct compacted content.
+Start with the smallest structure that records source and precedence. Add a boundary when telemetry shows persistent cache misses, prompt-token growth, or maintenance conflicts. Fragment types become useful when compaction must preserve or reconstruct source identity.
 
 **Source**: [`codex/codex-rs/core/src/context/fragment.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/context/fragment.rs) / `claude-code/src/utils/systemPrompt.ts` / [`openclaw/src/agents/system-prompt.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/system-prompt.ts) / [`hermes-agent/agent/prompt_builder.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/prompt_builder.py).
-**Follow-up**: "Project is brand new; reserve a fragment abstraction up front?" No. Start with `string[]`. Refactor in three months if real needs demand it.
+**Follow-up**: "Project is brand new; reserve a fragment abstraction up front?" Start with `string[]` plus source metadata. Add types when compaction, audit, or multi-team ownership creates a concrete need; do not attach that decision to a calendar date.
 </details>
 
 <details>
@@ -362,10 +339,10 @@ Equivalent options:
 
 Why Claude Code picks the magic string over options 1 and 2: its system prompt is a single string and splitting messages would break Anthropic's format convention.
 
-Putting dynamic stuff at the end of messages pushes it adjacent to user input and disrupts attention allocation. The boundary string is the best fit given these constraints.
+The source uses a boundary string to keep static and dynamic assembly in one prompt path. That preserves the existing format, while coupling cache semantics to a special marker.
 
 **Source**: `claude-code/src/utils/systemPrompt.ts` (where `splitSysPromptPrefix` lives).
-**Follow-up**: "Does OpenAI have prompt caching too?" Yes, since 2024, prefix-based. But OpenAI doesn't require an explicit boundary; it auto-splits at 1024-token alignments. Codex therefore doesn't need this string.
+**Follow-up**: "Does OpenAI have prompt caching too?" Cache support, minimum input length, and billing rules change by provider and model. Check current official documentation and the response usage fields. Claude Code's boundary does not prove that Codex never needs explicit segmentation across its supported models.
 </details>
 
 <details>
@@ -387,10 +364,10 @@ Mitigation ladder:
 2. **LLM-level review**: feed the external file to an independent cheap model that flags "anything that looks like meta-instructions targeting you?" Anthropic's Constitutional AI works this way.
 3. **Isolation**: never inject external file content as `role=system`. Wrap as `role=user` with "Below is content provided by the user, for reference only."
 
-Hermes is the only system with a defined defensive perimeter (the other three do nothing), but the implementation is v1 and needs continuous evolution.
+In the context-file read paths compared here, Hermes exposes the clearest scanner entry point. It matches known patterns only and does not justify an overall security ranking of the four systems.
 
 **Source**: [`hermes-agent/agent/prompt_builder.py:36-73`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/prompt_builder.py#L36-L73).
-**Follow-up**: "Is invisible-Unicode scanning actually useful?" Yes. Characters like `U+202E` (RIGHT-TO-LEFT OVERRIDE) make the visible string and the model-read string differ. Hermes scans the 10 most common ones, covering ~90% of known attacks.
+**Follow-up**: "Is invisible-Unicode scanning actually useful?" Yes. Characters like `U+202E` (RIGHT-TO-LEFT OVERRIDE) make the visible string and the model-read string differ. Hermes lists 10 patterns; they document known forms, not complete coverage.
 </details>
 
 <details>
@@ -400,18 +377,14 @@ Static context: the part that "doesn't change within a reasonable time window" (
 
 Dynamic context: pieces that "may differ each turn" (current time, current cwd file tree, the last tool's result, recently fetched memory entries).
 
-Billing impact: modern LLM APIs (Anthropic / OpenAI / Google) use prefix-based prompt caching.
+Caching semantics and billing depend on the exact API. Providers differ on prefix or message-block matching, TTL, cache writes, reads, model, region, and current price.
 
-The request prefix must match the cached prefix byte-for-byte to hit. **Hit portion is billed at 1/10 price** (Anthropic 5-minute cache) or **1/2** (OpenAI).
-
-Math example: 6000-token system prompt fully static, 1000-token user message. Second request hits 6000 cached tokens (1/10 price) and 1000 new (full price). Foolishly putting current time in the first line of system prompt?
-
-Second request gets 0 cache hit, full price, several times more expensive.
+Use a symbolic estimate: for stable tokens `S`, dynamic tokens `D`, cached-read price `Pc`, and normal input price `Pi`, a hit costs roughly `S×Pc + D×Pi`. Read the actual hit count and prices from request telemetry and billing.
 
 So practical rules:
 
-1. **Any dynamic token belongs in the back half of the prompt**.
-2. **Use a boundary string or message splitting** to tell the API "above is static, below is dynamic".
+1. Organise stable and dynamic content according to the target API's cache semantics; providers do not all expose the same prefix rules.
+2. A boundary string or message split is an implementation technique, not a portable cache directive. Verify it from cache telemetry.
 3. **If a project file changes, cache invalidates naturally**; you can't control that, but you can hit cache reliably when files haven't changed.
 
 **Source**: Anthropic Prompt Caching docs; `claude-code/src/utils/systemPrompt.ts` in practice.
@@ -421,15 +394,11 @@ So practical rules:
 <details>
 <summary>**Q6 · Practical**: Project requirement is "upload a PDF, agent analyzes it." How do you design the context system?</summary>
 
-Three tiers by PDF size:
+PDF routing should not depend on token count alone. Treat full inlining, chunked retrieval, and hybrid dense-plus-sparse retrieval as starting strategies, then choose using the target model window, document structure, query distribution, latency, and answer recall. The old 5K / 50K values are evaluation buckets, not routing rules.
 
-**< 5K tokens** (short report): parse and inline into user message. No vector store. Prefix the system prompt with "the following PDF is attached, content as below."
-
-**5K - 50K tokens** (medium document): parse to markdown, split by H2 / H3, tag each chunk with metadata (chapter, page). On first inference, stuff the full doc into the prompt (if the model can hold it). Subsequent inferences: retrieve relevant chunks by query. Vector store optional at this scale; pure keyword TF-IDF often suffices.
-
-**> 50K tokens** (large manual): parse + chunk + embed into a vector store. Mix dense + sparse retrieval. The context system layer does two things:
+For a retrieval route, the context system does two things:
 1. Place retrieval results after the boundary (dynamic zone) with a preamble: "Below are relevant excerpts retrieved from PDF `xxx.pdf`, may not be exhaustive."
-2. On first parse, generate a 200-word PDF summary and place it in the static zone so the model has the big picture.
+2. On first parse, generate a configurable-length PDF summary and test whether it omits sections needed by later queries.
 
 Injection defense: PDFs are external files, so run Hermes-style `_scan_context_content` (Q4). If the PDF hides "Ignore previous instructions" or any obfuscated attack text, the scanner should block it.
 
@@ -460,7 +429,7 @@ Implementation suggestion:
 
 1. Start by copying Codex (walk up, first-match wins): simple, low bug surface.
 2. When the monorepo pain shows, add hierarchical merge (parent defaults + child overrides) using markdown frontmatter to mark levels.
-3. Never directly follow Hermes's "merge all" strategy; it blows up prompt size.
+3. Do not copy Hermes's "merge all" strategy without measuring prompt growth; it can be a poor fit when project instructions are large.
 
 **Source**: [`codex/codex-rs/core/src/agents_md.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/agents_md.rs); `claude-code/src/utils/claudemd.ts`.
 **Follow-up**: "AGENTS.md vs .cursorrules, which wins?" Of the four, only Hermes supports both. For compatibility, load both with `.cursorrules` lower priority than `AGENTS.md`.
@@ -502,9 +471,9 @@ OpenClaw walks the source + ctx-param path, the same shape as Claude Code. Herme
 <details>
 <summary>**Q9 · Concept**: What does "prompt priority ordering" mean? What are Claude Code's 5 levels and why this order?</summary>
 
-Different prompt segments don't get equal attention from the model. Empirical rule: the first ~200 tokens and the last ~200 tokens are remembered most. The middle gets "lost in the middle".
+Position can affect performance in long-context tasks, but there is no cross-model rule that the first and last 200 tokens are always remembered best.
 
-So ordering centers on putting **the most important (identity + current task) at the two ends**, secondary content in the middle.
+Place mandatory constraints and the current task in stable, testable locations, then evaluate whether information in the middle is being ignored.
 
 Claude Code's 5-level priority (assembly order in `splitSysPromptPrefix`, highest to lowest):
 
@@ -523,13 +492,13 @@ Logic behind the order:
 If you design your own, at minimum split 3 layers: CLI override / built-in / runtime. 5 layers is Claude Code's evolved result; a new project doesn't need it day one.
 
 **Source**: `claude-code/src/utils/systemPrompt.ts`.
-**Follow-up**: "What does the 'lost in the middle' paper actually say?" Liu et al. 2023: GPT-4 / Claude on long contexts answer questions placed mid-document with 20% lower accuracy than head or tail placements. This is the empirical foundation for the ordering.
+**Follow-up**: "What does the 'Lost in the Middle' paper actually say?" Liu et al. observed position-dependent degradation in multi-document QA and key-value retrieval when relevant information sat in the middle of long contexts. The size varied by model, task, and position; it is evidence to test ordering, not a universal 20% penalty. [Paper](https://arxiv.org/abs/2307.03172).
 </details>
 
 <details>
 <summary>**Q10 · Open-ended**: If you were designing a context system from scratch, which features would you cherry-pick?</summary>
 
-My pick (based on 18 months of real projects):
+Based on the four source snapshots in this chapter, I would start by testing this combination:
 
 **Core layer (required)**:
 
@@ -537,26 +506,26 @@ My pick (based on 18 months of real projects):
 2. Codex's **fragment marker mechanism**. You need this to round-trip segment types during compaction; without markers you can only drop whole sections.
 3. OpenClaw's **`PromptMode` three tiers** (full / minimal / none). Minimal for subagents, full for the main agent.
 
-**Safety layer (required in production)**:
+**Safety layer (when external or untrusted files enter)**:
 
-4. Hermes's **`_scan_context_content`** + invisible Unicode scan. Even a simple version is 10,000× better than nothing. Production agents will encounter malicious AGENTS.md.
-5. **Isolation boundary**: external files never go in via role=system. Wrap them as role=user with "The following is user-provided content."
+4. Hermes's **`_scan_context_content`** plus invisible-Unicode scan. A small scanner catches some obvious anomalies, but it does not replace source trust, path isolation, or human review.
+5. **Isolation boundary**: treat external files as untrusted input by default. Keep them out of role=system and wrap them as role=user with "The following is user-provided content."
 
-**Observability layer (required in production)**:
+**Observability layer (when tuning cache or context cost)**:
 
-6. **Report cache-hit ratio per request**. Low number = boundary design wrong or dynamic content slipped into static zone.
-7. **Fragment-level token counting**. You must see which segment eats tokens; otherwise you optimize blind.
+6. **Report cache-hit ratio per request**. A low value can indicate boundary churn or dynamic content in the static zone; verify it against the provider's usage fields.
+7. **Fragment-level token counting**. Record which segment consumes tokens so that tuning is based on observed cost.
 
 What I'd skip:
 
 - Hermes's 10-layer hardcode (gets messy as projects grow).
 - Claude Code's "all prompts in source" (non-engineers can't edit, slows prompt iteration).
-- Codex's 24 fragments (over-engineering; don't need this granularity in month one).
+- Codex's 24 fragments (possibly too fine for a small harness that has not yet seen compaction-provenance or recovery problems; let maintenance cost and recovery needs decide).
 
-Rollout cadence: month 1 OpenClaw-style (buildXxxSection + PromptMode), month 2 add Hermes-style scanning, month 3 add Claude Code-style boundary, month 6 (when segments exceed 10) add Codex-style fragment markers.
+Sequence work by evidence: start with testable assembly and modes; add scanning when external files enter, add a cache boundary when telemetry shows churn, and add fragment markers when compaction must preserve source types.
 
 **Source**: see [chapter 04 (tool system)](/en/patterns/04-tool-system/), [chapter 05 (verifier)](/en/patterns/05-verifier/), [chapter 15 (observability)](/en/patterns/15-observability-cost/) for the implementations referenced above.
-**Follow-up**: "Will copying everything be too heavy?" Yes, which is why this is phased. Start with 200 lines that work; add abstraction layers only when real pain appears.
+**Follow-up**: "Will copying everything be too heavy?" Yes, which is why this is phased. Start with the smallest assembly that records source and precedence; add layers when external-file volume, cache misses, compaction recovery, or telemetry shows a concrete need.
 </details>
 
 </details>

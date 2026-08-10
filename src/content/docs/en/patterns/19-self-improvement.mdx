@@ -1,34 +1,62 @@
 ---
-title: "19 · Self-improvement: When Does the Agent Learn?"
+title: "19 · Agent Learning: Who Approves the Write-Back?"
 sidebar:
   order: 19
-description: "Should an agent keep getting better on its own? Each of the four systems gives a very different answer to four entangled sub-questions: when does it learn, whose compute budget pays for it, where do the lessons end up, and how do we keep the learning process itself safe from injection."
+description: "Follow experience from collection to write-back and decide who approves persistence, how it is scanned, and how it is undone."
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
-import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## Self-improvement starts with auditable feedback
+## Who approves a rule the agent learned?
 
-<Verdict tldr="The real engineering challenge of self-improvement is not whether an agent can learn, but a cluster of interacting sub-questions: when does it learn (does the learning step itself consume the user's live token budget?), on whose compute (does the main conversation's model take a detour to summarise, or does a separate LLM job do it, or does the user do it manually?), where do the lessons go (into a file that ends up in future prompts, or into a vector index that is queried on demand?), and how is the learning kept safe (because if a prompt injection ever lands inside a memory file, it becomes a long-lived backdoor planted in your system prompt). The four systems give very different answers. Codex runs a separate LLM job out of band on a fixed cadence (Phase 1 stage1, immediate per-session summarization; Phase 2 global consolidate, cross-session merge and dedup), treats self-improvement as a serious piece of infrastructure, and uses a multi-hundred-line prompt to strictly govern what the consolidated output looks like, what counts as high-value experience, and what must never be written in. Claude Code defers the timing entirely to the user: any non-trivial sedimentation action has to be triggered by a user-press (disableModelInvocation, a config switch that strips the model's ability to write skills on its own; the user must confirm in the UI), the model does not get to decide on its own. OpenClaw picks the most passive route: it never writes a 'lessons learned' file at all; it simply indexes everything that gets persisted, applies temporal decay, and lets 'learning' happen at retrieval time. Hermes goes for the most restrained option: the agent may write to memory mid-conversation but only through a narrow tool with hard character limits, and every write is passed through a threat-pattern library (_MEMORY_THREAT_PATTERNS, 11 regexes plus a 10-character invisible-Unicode check) so that nothing resembling an injection ever makes it into the long-term prompt. For team-wide reusable workflows, lean on Codex plus Claude Code. For zero-effort experience capture, borrow OpenClaw. For an injection-resistant memory, follow Hermes." />
+<Verdict tldr="Start with the write-back boundary: who can put a lesson into the next session's prompt, how is it checked before write-back, and how can it be rebuilt after deletion? This chapter follows experience from collection to write-back and compares background consolidation, user-triggered capture, retrieval-time learning, and bounded writes. These are source observations, not a local evaluation."/>
 
-## Four meanings of learning
+Self-improvement is not a switch called “make the model smarter”. Decide who may write, where the lesson lives, how it can be revoked, and what evidence supports it.
+
+## Split the learning pipeline
+
+| Stage | Question | Evidence to retain |
+| --- | --- | --- |
+| Collect | Which part of the session is worth revisiting? | Thread, rollout, cwd, and time |
+| Distil | Which sentence is reusable knowledge rather than a guess? | Original phrase, failure condition, citation |
+| Write back | Who approved prompt or skill persistence? | User confirmation, scan result, snapshot version |
+| Forget | How is a deleted or stale input removed? | Watermark, change record, rebuild path |
+
+## Compare only when the boundary changes
+
+Codex separates stage one from phase two. That supports cross-session consolidation, but it also requires locking, cooldown, and forgetting rules. Claude Code makes `skillify` user-launched and reviewable, so the write boundary is visible at the cost of user effort.
+
+OpenClaw does not rewrite a lessons file; it combines indexed history at retrieval time. Hermes permits an in-turn write but narrows it with character caps, a frozen snapshot, and threat scanning.
+
+These are source observations. Numbers such as an “800-line prompt” or a 30-day decay setting describe source configuration, not cross-product effects.
+
+## A reversible write-back path
+
+```text
+collect -> redact -> review -> write snapshot -> verify on use
+                       \-> reject / delete / rebuild
+```
+
+Treat raw input as data before asking a model to distil it. Show a human-readable diff before persistence. On the next use, check that named files, functions, or policies still exist. Rebuild from immutable inputs after deletion.
+
+Before shipping, ask:
+
+- Can a reader see the original phrase and its source?
+- Can the model trigger persistence without a user action?
+- Do writes pass secret, injection, and invisible-character checks?
+- Is there a rebuild path after deletion?
+
+## Source notebook: implementation details
 
 <details>
-<summary>Before reading (optional)</summary>
-
-- **The hard part is not whether the agent can learn**: it is when it learns, on whose compute, where the lessons go, and how the learning stays injection-safe.
-- **Four answers**: Codex runs an out-of-band two-phase LLM job (stage1 + global consolidate); Claude Code requires a user press (disableModelInvocation strips the model's own write ability); OpenClaw writes no lesson files and learns at retrieval time via indexing plus temporal decay; Hermes filters every write through _MEMORY_THREAT_PATTERNS (11 regexes plus an invisible-Unicode check).
-- **Learning timing determines who pays**: an out-of-band job keeps the learning step off the user's live token budget.
-- **The biggest trap is injection into memory**: one landed prompt injection becomes a long-lived backdoor in your system prompt; scan every write.
-
-</details>
+<summary>Source notebook: implementation details</summary>
 
 <Diagram
   src="/diagrams/19-self-improvement-base.svg"
@@ -37,19 +65,6 @@ import SourceBlock from '@components/SourceBlock.astro';
 />
 
 Differences across timing, writer, output, and safety:
-
-<CompareTable
-  rows={[
-    { label: 'When', values: ['Out of band (Phase 1 per-turn + Phase 2 global, 6h cooldown)', 'User-invocable: skillify / /insights / autoMode critique', 'Passive: every session lands on disk and is indexed', 'In-turn: agent calls the memory tool itself'] },
-    { label: 'Who writes', values: ['Separate LLM job (global lock + worker)', 'Session model or Opus (/insights pins Opus)', 'Indexer (embeddings + FTS5); does not rewrite text', 'The agent in the current turn'] },
-    { label: 'Output', values: ['MEMORY.md (task groups) + memory_summary.md (profile) + skills/<name>/', 'SKILL.md under ~/.claude/skills/ or .claude/skills/', 'SQLite index; MEMORY.md still hand-written', 'MEMORY.md (2200 char) + USER.md (1375 char), § delimiter'] },
-    { label: 'Scope', values: ['User / global (thread-level stage1 to user-level phase2)', 'Project or personal (user picks)', 'Agent-level (per agentId directory)', 'Profile-level (one per HERMES_HOME)'] },
-    { label: 'Safety', values: ['Raw rollouts treated as data; secrets become [REDACTED_SECRET]', 'disableModelInvocation = user must press the button', 'sanitize / redactSensitiveText', '_MEMORY_THREAT_PATTERNS (11) + 10 invisible unicode chars'] },
-    { label: 'Cold start', values: ['INIT mode: build MEMORY.md + memory_summary.md from scratch', 'Session memory + user messages go straight into the prompt', 'Empty index, sessions accumulate', 'Empty files, agent fills as it works'] },
-  ]}
-  caption="Self-improvement = trigger mode x writer x output granularity x safety perimeter."
-  dimensionLabel="Dimension"
-/>
 
 ## How four systems accumulate experience
 
@@ -61,9 +76,9 @@ It should look more like compilation or backup: a background task with clear tri
 
 The first phase is lightweight and runs inline with normal sessions. Every turn that produces something worth remembering yields a small summary, tagged with a bit of metadata (working directory, git branch, session identifier), written to a local database table.
 
-This phase is essentially free: its job is just to accumulate raw material for what comes later.
+Its resource cost depends on the summarisation model, session volume, and storage implementation; the source establishes only that this phase accumulates raw material for what comes later.
 
-The second phase is where actual learning happens, and **it does not happen inside the user's conversation**. It is a separate LLM task (separate process, separate prompt, separate output files).
+The second phase performs consolidation, and **it does not happen inside the user's conversation**. It is a separate LLM task (separate process, separate prompt, separate output files); calling that outcome "learning" would require a task-level evaluation.
 
 That task reads three things: the accumulated phase-one summaries, the longer rollout summaries from past sessions, and the current state of the long-term memory file.
 
@@ -71,7 +86,7 @@ It then does one thing: rewrites a new version of the long-term memory file, ref
 
 Several engineering constraints protect this from going wrong: a global lock ensures only one such task runs at a time (preventing concurrent writers from clobbering each other), a hard cooldown of several hours after each successful run prevents runaway costs and pointless rework over a thin slice of new material, and an input-watermark mechanism prevents the same raw summary from being consumed twice.
 
-What makes all of this actually work is not the table or the cooldown; it is **the long prompt that governs phase two**. That prompt encodes a very specific definition of what counts as worth remembering.
+The consolidation prompt decides how phase two selects and rewrites material; the table, lock, and cooldown define its operating boundary. The source documents goals and format, but it does not show that these rules improve long-running task completion.
 
 <SourceBlock path="REF/codex/codex-rs/memories/write/templates/memories/consolidation.md" lines="1-20" system="codex" summary="Opening of a long memory-consolidation prompt that explicitly declares its goal: 'help future agents solve similar tasks with fewer tool calls and fewer reasoning tokens'.">
 
@@ -94,6 +109,8 @@ The goal is to help future agents:
 
 </SourceBlock>
 
+“Fewer tool calls and fewer reasoning tokens” is the prompt's objective, not a benefit measured by this site.
+
 There are several things in this prompt worth re-reading carefully.
 
 The first is that **it draws a sharp line around "high-value experience"**. Above the line: stable user preferences ("this user always wants tests run before any diff is reviewed"), decision triggers ("if you see this symptom, just go down path X, no need to explore"), failure shields ("symptom is A, cause is B, fix is C, verification is D, here is when to give up"), repo and task maps (entry points, configs, command cheat-sheet), tool quirks, and proven reproduction plans.
@@ -110,9 +127,9 @@ The third is **a hard "preserve the original phrasing" rule**. When the source r
 
 Three reasons: it keeps `grep`-style search hooks alive (so something like "file URL is invalid" remains greppable in future memory), it preserves the provenance of the knowledge (whether it is something "the user said" or something "the agent inferred"), and a user re-reading "the exact words they used" is far more likely to notice a misremembering than the same idea filtered through polished-sounding abstractions.
 
-The fourth is that **skills emerge automatically out of experience**. If the same tool sequence shows up across multiple sessions, or the same failure shield saves the day more than once, the consolidation step is allowed to spin it off into a standalone skill file.
+The fourth is that the consolidation step **can derive a skill from repeated experience**. If the same tool sequence shows up across multiple sessions, or the same failure shield saves the day more than once, the source allows it to spin that pattern off into a standalone skill file. It does not establish that the extracted skill is useful without review.
 
-Skills stop being user-authored artefacts and start being natural byproducts of sediment.
+The resulting skill is still a generated artifact that needs review; it is not evidence of autonomous improvement by itself.
 
 The fifth is **a forgetting mechanism**. Any memory system that can only add and never remove eventually drowns in noise.
 
@@ -124,7 +141,7 @@ This kind of "surgical forgetting" is much gentler than crude age-based pruning,
 
 Claude Code's stance on self-improvement can be summarised in one sentence: **the model is not allowed to decide on its own that "now is a good time to crystallise what we just learned"; that decision is the user's, full stop**.
 
-This "explicit first" posture is in deliberate contrast to the previous system, and the reasoning is clean: anything that lets the agent automatically write into a long-term prompt is a potential injection entry point, so having the user be the final gate is the cheapest and most effective defense available.
+Anything that lets the agent automatically write into a long-term prompt expands the persistence surface. User confirmation makes that boundary visible, but it does not by itself prove content safe or replace scanning, runtime authority, and revocation.
 
 It builds three independent tools around this stance.
 
@@ -132,11 +149,11 @@ The first is a **session-to-skill wizard**. When a user feels that the workflow 
 
 The wizard is itself a specially marked skill (one with a flag that says "the model is not allowed to launch me, only the user can").
 
-Once invoked, it walks four short rounds of multi-choice interaction (see Chapter 17) to distill the session into a complete skill file.
+The current prompt uses four rounds of multi-choice interaction (see Chapter 17) to generate a skill draft for review. The important boundary is user initiation and review, not the number four.
 
 The important thing in this design is not the questions and answers; it is **the human being in control of whether to sediment at all**. The model is merely an executor.
 
-<SourceBlock path="REF/claude-code-2.1.88-expanded/src/skills/bundled/skillify.ts" lines="22-90" system="claude-code" summary="A sedimentation wizard that the model cannot launch; only the user can. Once invoked, four short rounds of interaction turn the just-finished session into a complete skill file.">
+<SourceBlock path="REF/claude-code-2.1.88-expanded/src/skills/bundled/skillify.ts" lines="22-90" system="claude-code" summary="A user-launched wizard the model cannot invoke; its current four-round prompt generates a skill draft for user review.">
 
 ```ts
 const SKILLIFY_PROMPT = `# Skillify {{userDescriptionBlock}}
@@ -173,7 +190,7 @@ Round 4: Final questions (when_to_use trigger phrases + gotchas)
 
 </SourceBlock>
 
-The second is a **conversation-insights report**. Users can ask the system to run an analysis over their entire history of conversations; it is mandated to use the strongest available model and to make two passes: the first extracts features by topic, by tool usage, and by time, and the second turns those features into a readable markdown report.
+The second is a **conversation-insights report**. The reviewed source pins `getDefaultOpusModel()` and makes two passes: the first extracts features by topic, tool usage, and time, and the second writes a markdown report. Pinning a model is an implementation choice; this chapter does not compare report quality across models.
 
 The report is **for the user only**: it is not fed back into any long-term prompt. This is an important point of contrast with Codex: Codex's consolidation output is going to be read by future sessions directly;
 
@@ -185,35 +202,23 @@ Note that this is **the LLM auditing rules the user wrote**: it is not the agent
 
 These three tools share the same philosophy: **the agent must not quietly learn anything**. Timing is in the user's hands; outputs (whether a skill file or an insights report) are previewed or read-only for the user.
 
-The price is that the user has to be diligent: if they never press the button, the agent never grows. The payoff is that the long-term prompt stays absolutely clean: every line in it got there through an explicit human "yes".
+The price is that the user has to be proactive. Explicit confirmation makes the write-back boundary visible, but it does not replace content scanning, provenance checks, or a revocation path.
 
 ### OpenClaw · don't write a lessons file at all; learn at retrieval time
 
-OpenClaw picks a more radical path: **it does not try to sediment lessons at all, because it does not trust anyone to reliably decide what is worth sedimenting**.
-
-It argues that a sounder approach is to index every session's content thoroughly, then pair that index with a smart retrieval system so that the agent looks things up before acting and "learns" temporarily from what it finds.
-
-Put differently, self-improvement does not happen at a write moment; it happens at every retrieval moment.
+OpenClaw takes a retrieval path: it chunks session content and builds lexical and vector indexes, then combines results at query time instead of producing a structured lesson or skill here. The source establishes this data path; it does not establish what the product authors “trust” or whether retrieval improves later task outcomes.
 
 How does this actually work? At the end of every session, the indexing system pulls the session's text, chunks it, and builds two parallel indices over those chunks: a traditional full-text search index (which is good at matching exact keywords) and a vector index (which is good at matching semantic similarity).
 
 Having both pays off in different ways: if a user later asks "how did we fix that X that was returning 401?", the keyword index can lock onto "X" and "401" precisely; if they ask "the bug related to permission checks?", the vector index can find sessions that talked around the topic without using the same words.
 
-Indexing alone is not enough: a casual note from three years ago should not be weighted the same as a careful summary from yesterday.
+OpenClaw also provides optional **temporal decay**. When enabled, its current default half-life parameter is 30 days; the current configuration defaults `enabled` to `false`. Date-named files enter the decay path, while `MEMORY.md` and other paths are treated as evergreen. These are implementation settings, not recall-quality results, and evergreen does not mean current or verified.
 
-So OpenClaw applies **temporal decay**: weights drop by half every 30 days, so older content drifts lower in retrieval rankings.
+The final result combines semantic similarity, keyword match, optional temporal decay, and a diversity constraint. A tool description also directs relevant tasks to query memory first. Whether the call happens and whether the returned chunks help still needs runtime traces and a labelled query set; it is not evidence that the system has “learned”.
 
-There is one exception: content the user has explicitly marked as "evergreen" (typically a hand-maintained memory file) is exempt from decay.
+The big cost of this approach is **the absence of any structured skill layer**: the retrieval path does not produce "a list of user preferences" or "a standardised workflow file"; it produces a relevance-ranked stream of past session fragments.
 
-This split means "yesterday's scratch notes fade naturally while evergreen design constraints stay at the top".
-
-The final retrieval result is the product of several signals, not just one: semantic similarity, keyword match, temporal decay, and a diversity constraint to avoid returning near-duplicates all combine into a single weighted ranking.
-
-Pair this with a hard prompt-side rule that requires the agent to query memory before taking action, and the system has completed its "learning" loop.
-
-The big cost of this approach is **the absence of any structured skill layer**: you will never get "a list of user preferences" or "a standardised workflow file" out of this system; you only get a relevance-ranked stream of past session fragments.
-
-If your product does not strongly require workflow sedimentation, the cost is more than acceptable; what you get back is virtually zero-maintenance experience accumulation.
+It avoids write-back and version-migration work, but indexing, storage, and retrieval quality still need maintenance. If your product does not strongly require workflow sedimentation, that trade-off may be a better fit.
 
 ### Hermes · let the agent write inside the turn, but tightly bounded
 
@@ -225,19 +230,17 @@ The first bound is that **only two files are writable and only four operations a
 
 The four actions are: add an entry, replace an entry, remove an entry, and read an entry. Entries are separated by a special delimiter. There is no "create a third file"; there is no nested structure.
 
-This deliberate restraint reframes "memory" as a very narrow contract: the agent never has the impression that it is "taking free-form notes", just that it is performing a clearly defined small action.
+This deliberate restraint reframes "memory" as a very narrow contract: the tool does not permit free-form notes; it requires the agent to perform a clearly defined small action.
 
-The second bound is that **the limits are character-count, not token-count**. The reason is pragmatic: token counts vary wildly across tokenisers (the same Chinese sentence can take several times as many tokens in one tokeniser as in another) and are therefore unpredictable.
+The second bound is that **the limits are character-count, not token-count**. Character counts can be checked by a static schema, while token counts vary with tokenizer, language, and model. The 2200/1375 caps are Hermes implementation limits; they do not map to a fixed token budget or a recommendation for another product.
 
-Character counts are predictable across models. And the cap itself exists to force authors into a "what stays, what goes" decision: once you hit the cap, you have to replace an existing entry, not pile a new one on top.
-
-The third bound is the very clever **"snapshot at session start"** mechanism. The system prompt contains the memory snapshot as it was on disk the moment the session started; when the agent calls the tool mid-session to write new content, the write **only updates disk; it does not reshape the current session's system prompt**.
+The third bound is a **snapshot-at-session-start** mechanism. The system prompt contains the memory snapshot as it was on disk the moment the session started; when the agent calls the tool mid-session to write new content, the write **only updates disk; it does not reshape the current session's system prompt**.
 
 The new content takes effect only when the next session boots and reloads the snapshot.
 
-This guarantees that the prefix cache (which can save a lot of token cost) is not invalidated by mid-session memory writes, an extremely valuable optimisation in long-running agent systems.
+This keeps a mid-session write from rebuilding the current prompt. Whether the prefix cache saves tokens depends on the provider and model, so measure that effect separately.
 
-The fourth bound, and by far the most security-critical, is **threat-pattern scanning before every write**.
+The fourth bound is **threat-pattern scanning before every write**.
 
 <SourceBlock path="REF/hermes-agent/tools/memory_tool.py" lines="65-101" system="hermes" summary="Anything about to enter the permanent prompt is first passed through a library of patterns specifically trained for 'prompt injection' and 'credential exfiltration'; any invisible Unicode characters are blocked outright.">
 
@@ -273,7 +276,7 @@ def _scan_memory_content(content: str) -> Optional[str]:
 
 </SourceBlock>
 
-The reasoning is direct: memory ends up in the system prompt, so anything entering memory passes prompt-grade scrutiny.
+The scan targets content that will enter a high-trust prompt. It blocks the listed patterns and invisible characters, but it does not replace use-time verification, runtime authority, or user revocation.
 
 ## The decisions that actually matter
 
@@ -303,7 +306,7 @@ The four second-order design questions collapsed into one table (replacing the o
 | **Forgetting** | workspace diff triggers surgical cleanup | User deletes SKILL.md manually | Temporal decay halfLife=30d | Char limit forces replace |
 | **Failure cost** | 6h cooldown = freshly learned waits 6h | User forgets to press = nothing learned | Index bloat + no structured skill | No cross-session abstraction |
 
-**How to choose**: building reusable team workflows? Codex Phase 2 plus Claude Code skillify. Want zero-touch sediment? OpenClaw. Want no injection in your prompt? Hermes. Hybrid combinations are valid, but every layer needs a clear boundary.
+**How to choose**: if the requirement is cross-session consolidation, inspect Codex's Phase 2 boundaries; if users must approve write-back, inspect Claude Code's skillify flow; if retrieval is enough, inspect OpenClaw; if writes must stay narrow, inspect Hermes. These are starting points, not a capability ranking, and a hybrid still needs explicit boundaries.
 
 ## Inside the Codex Phase 2 prompt
 
@@ -395,18 +398,9 @@ Why it matters:
 
 Deleted `rollout_summaries/*.md` triggers surgical cleanup in `MEMORY.md` (delete only the parts uniquely supported by deleted inputs; mixed blocks get split or rewritten).
 
-## My take: control writes before automating them
+## Make write-back a reversible contract
 
-<ScoreCard
-  rows={[
-    { name: 'Codex', score: 9, badge: 'background-learning king', notes: 'Phase 1 + Phase 2 + 800-line consolidation prompt + auto-extracted skills + INIT/INCREMENTAL/forgetting. Downside: 6h cooldown is long.' },
-    { name: 'Claude Code', score: 8, badge: 'user-driven, safest', notes: 'skillify + /insights + autoMode critique. User must press the button; safe and controllable but requires participation.' },
-    { name: 'OpenClaw', score: 6, badge: 'passive index', notes: 'Zero ops; temporal decay + hybrid retrieval turn learning into retrieval. Downside: no structured skill.' },
-    { name: 'Hermes', score: 7, badge: 'safe and restrained', notes: '11 threat patterns + invisible unicode + frozen snapshot keep prefix cache. Downside: no cross-session abstraction.' },
-  ]}
-/>
-
-## Start with one reversible write
+## Minimal implementation: one reversible write
 
 <BuildRecipe
   steps={[
@@ -416,8 +410,8 @@ Deleted `rollout_summaries/*.md` triggers surgical cleanup in `MEMORY.md` (delet
     { title: 'Add cooldown and locks', body: 'Global lock + input_watermark + cooldown (Codex 6h). Prevents "ran-and-ran-again" loops and concurrency races.' },
     { title: 'Add a threat scan', body: 'Memory entering the prompt must be scanned: prompt injection / role hijack / exfil (curl/wget + KEY/TOKEN) / secrets read / ssh / invisible unicode. Borrow Hermes 11 patterns.' },
     { title: 'Add a frozen snapshot', body: 'System prompt uses the session-load snapshot; mid-session writes update disk only; next session reloads. Preserves prefix cache.' },
-    { title: 'Add forgetting', body: 'Memory must shrink, not only grow. Deleted inputs trigger surgical cleanup (not whole-block delete). Codex workspace-diff routing is a great template.' },
-    { title: 'Add a user-facing report', body: 'Expose at least one /insights-style report so the user can see what the agent is remembering and learning. Lets them course-correct.' },
+    { title: 'Add forgetting', body: 'Memory must shrink, not only grow. Deleted inputs trigger surgical cleanup (not whole-block delete). Codex workspace-diff routing is one template to inspect.' },
+    { title: 'Add a user-facing report when writes are automatic', body: 'Expose an /insights-style report so the user can inspect what the agent retains, and preserve delete or rebuild controls.' },
   ]}
 />
 
@@ -484,7 +478,7 @@ Deleted `rollout_summaries/*.md` triggers surgical cleanup in `MEMORY.md` (delet
 
 ## Anti-patterns
 
-- **Rewriting MEMORY synchronously in the main turn**: wastes tokens, pollutes the prefix cache, makes the user wait. Codex pushes this work to a separate job for a reason.
+- **Rewriting a large MEMORY synchronously in the main turn**: when rewriting needs a long context or another model call, it can add tokens, reduce prefix-cache reuse, and raise user-visible latency. The pinned Codex snapshot moves this work to a separate job; test main-turn p95 latency, cache read/write tokens, queue delay, and memory staleness before adopting the split. Small deterministic local updates may still fit inline.
 - **Letting the model auto-invoke skillify**: Claude Code's `disableModelInvocation: true` is intentional. Models that distill skills on their own pick the wrong highlights.
 - **Treating memory as a transcript dump**: violates Codex's "no large raw outputs verbatim." Context budgets are finite; raw dumps are equivalent to no memory.
 - **Letting memory reach the prompt without a scan**: Hermes's 11 threat patterns are not paranoia. Memory is injected into the system prompt; one bad write is forever.
@@ -493,6 +487,8 @@ Deleted `rollout_summaries/*.md` triggers surgical cleanup in `MEMORY.md` (delet
 - **Not separating evergreen from dated**: OpenClaw's distinction between decaying `memory/YYYY-MM-DD.md` and evergreen `MEMORY.md` is necessary.
 - **Letting the agent write secrets into MEMORY**: Hermes's exfil_curl / read_secrets / ssh_backdoor patterns block these explicitly.
 - **Skills without success criteria**: Claude Code skillify embeds "Success criteria: ALWAYS include this!" in the template. A skill without success criteria is wishful thinking.
+
+</details>
 
 ## Appendix: review questions
 
@@ -507,19 +503,17 @@ Deleted `rollout_summaries/*.md` triggers surgical cleanup in `MEMORY.md` (delet
 
 Phase 1 runs inside the main turn while the rollout, cwd, git_branch, and current task are still hot in context.
 
-This is the "cheap + high fidelity" pass: one row per thread written to the SQLite `stage1_outputs` table, with no LLM rewriting.
+This pass writes one row per thread to the SQLite `stage1_outputs` table without phase-two LLM rewriting. The source does not publish a cost or fidelity comparison for it.
 
 Phase 2 is a standalone LLM job running an 800-line system prompt that consolidates `raw_memories.md` + multiple `rollout_summaries` + the existing `MEMORY.md` into final artifacts (`MEMORY.md` / `memory_summary.md` / `skills/*`).
 
 That step is expensive, so it gets a global lock + `input_watermark` to prevent duplicates + a 6h cooldown to prevent thrash.
 
-The core reason to split: **extraction must happen while context is hot (in the main turn); rewriting must happen cool (a separate LLM job that does not steal main-session tokens or invalidate the prefix cache)**.
-
-Merging them would either slow the main turn or starve the LLM of the full raw rollout.
+The trade-off in this snapshot is to perform a lighter extraction in the main turn while rollout and task metadata are available, then move the cross-document rewrite to a standalone LLM job to reduce main-session token use, latency, and prefix-cache churn. This split is not inherently required: small deterministic inputs may fit one step, while a separate job introduces queue delay, lock contention, and stale memories. Compare main-turn p95 latency, cache tokens, stage-one recall, job delay, and retry failures before choosing.
 
 Source: [`codex/codex-rs/state/src/model/memories.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/state/src/model/memories.rs) (Stage1Output + Phase2JobClaimOutcome), [`codex/codex-rs/memories/write/templates/memories/consolidation.md`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/memories/write/templates/memories/consolidation.md).
 
-Follow-up: why 6h instead of 1h? Too short a cooldown wastes tokens on near-empty new input batches; too long and the user stops feeling that the agent is "learning". 6h is an empirical value, tunable via `PHASE2_SUCCESS_COOLDOWN_SECONDS`.
+Follow-up: why 6h instead of 1h? The reviewed source configures `PHASE2_SUCCESS_COOLDOWN_SECONDS` to six hours but does not publish an experiment behind that value. It limits reruns after success; tune it against new-input volume, model cost, and acceptable delay.
 
 **Q2 · Why does Claude Code's skillify set `disableModelInvocation: true`? Doesn't this defeat automatic skill activation?**
 
@@ -539,9 +533,7 @@ Two different routes: Claude Code uses a capability gate, Codex uses prompt engi
 
 Temporal decay formula: `weight = 0.5 ^ (ageDays / halfLifeDays)`. At 30 days the weight halves, at 60 days it is one-quarter, at 90 days one-eighth.
 
-The value is empirical: too short and recent experience loses weight too fast (a fix from 30 days ago should still apply); too long and the index bloats. `memory/YYYY-MM-DD.md`-style dated files decay because they record contemporary environments and contemporary failures. `MEMORY.md` is evergreen because it captures the repository's entry points, conventions, and long-running preferences, which only become invalid if the repo changes stack. **The signal for evergreen vs decayed**: is the information time-bound?
-
-"October 2024 deployment failure" should decay; "this repo's unit test entry is `pnpm test:unit`" should not.
+If a 30-day half-life is enabled, the formula yields multipliers of one-half, one-quarter, and one-eighth at 30, 60, and 90 days. The source does not explain why 30 days was chosen, and decay is disabled by default. Date-named files enter the decay path; `MEMORY.md` does not. That path classification is not proof that an entry is current, so verify retrieved files and commands before use.
 
 Source: [`openclaw/src/memory/temporal-decay.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/memory/temporal-decay.ts). Follow-up: can an LLM decide evergreen automatically?
 
@@ -549,9 +541,7 @@ Yes but expensive (every write needs an LLM call). OpenClaw uses file path as th
 
 **Q4 · Why does Hermes limit memory by character count (2200/1375) instead of tokens?**
 
-Token counts depend on tokenizer. Different models (Claude 3.5 / GPT-4 / Gemini) tokenize the same Chinese passage differently: 100 tokens in Claude could be 80 in GPT-4.
-
-Token limits would force the agent to know which model is active, which is a complexity explosion. Character limits are cross-model predictable: 2200 chars in Chinese fits any model with a tight upper bound.
+Token counts depend on tokenizer, language, and model, so the same text has no fixed conversion. Character limits are easy to validate in a static schema, but 2200 characters can consume different token budgets across models and must be measured for the target context.
 
 This pushes the "what to prioritize" decision onto the agent: char limit is a hard constraint that forces explicit prioritization.
 
@@ -567,7 +557,7 @@ Invisible unicode (zero-width space, zero-width joiner, bidi overrides) does not
 
 Attackers exploit this in three ways: (1) **regex bypass**: a regex catches `ignore previous instructions` but not `ignore\u200Bprevious instructions`; the model treats the zero-width space as nothing and still reads "ignore previous instructions"; (2) **bidi override (U+202D / U+202E)**: visible order differs from byte order, so the user sees one thing while the prompt receives another; (3) **embedding pollution**: invisible chars throw off search and equality checks.
 
-Hermes maintains an explicit list of 10 high-risk characters in `_scan_memory_content` and blocks at write time. **Memory entering the system prompt is "inject once, persist forever"**, so input scanning beats prompt-level defense.
+Hermes maintains an explicit list of ten characters in `_scan_memory_content` and blocks them at write time. This screens a known class of bypasses; prompt rules, use-time verification, and runtime policy cover different risks.
 
 Source: [`hermes-agent/tools/memory_tool.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/tools/memory_tool.py) lines 65-101. Follow-up: why not block all control characters?
 
@@ -589,7 +579,7 @@ Follow-up: why not dump the raw text? Full dumps bloat MEMORY.md and violate "no
 
 **Q7 · OpenClaw chose passive indexing with no structured skills. What is the cost, and when is it acceptable?**
 
-Four costs: (1) **cannot tell the user "I remember X"**: there is no explicit memory ledger, only an index; (2) **no real user profile**: preferences inferred at retrieval time are query byproducts, not persistent; (3) **bad cold start**: empty index means new agents have no prior; (4) **monotonic growth**: even with temporal decay, storage only grows. **Acceptable when**: (a) short-lived agents with little experience to accumulate, where structured skills are pure overhead; (b) multi-agent shared data, where retrieval generalizes better than a schema; (c) the team does not want to own a consolidation prompt (Codex's 800 lines is a long-term cost).
+Four costs to test are: no explicit memory ledger, no separately maintained user profile, an empty-index cold start, and storage growth. The trade may fit short-lived agents that do not need structured skills, shared retrieval libraries with a representative query set, or teams that do not want to maintain a consolidation prompt. The current Codex prompt length indicates maintenance surface, not a measured engineering cost.
 
 OpenClaw moves "learning" to "retrieval"; hybrid retrieval (semantic + lexical + MMR + decay) assembles relevant chunks on the fly so the agent behaves as if it remembered.
 
@@ -613,7 +603,7 @@ Follow-up: what if the LLM mis-derives? Codex marks `raw_memories.md` as "immuta
 
 Three things: (1) **input privacy**: `/insights` runs over `~/.claude/projects/*.jsonl`, which holds every prior session.
 
-Claude Code runs locally to Opus and never writes results back into the prompt (the report is shown to the user only), preventing user data from sedimenting into future prompts; (2) **model choice**: pinning Opus rather than the current session model is deliberate. `/insights` is an analysis task (long context, strong reasoning) that should not be downgraded to a fast/cheap model. `queryWithModel(getDefaultOpusModel())` is an explicit call that bypasses user model settings; (3) **two-stage pipeline**: pass one extracts facets (structured), pass two writes the narrative summary (prose).
+The command reads local history and passes selected content through `queryWithModel(getDefaultOpusModel())`; provider-side data handling still depends on the configured service. The report is shown to the user rather than written into future prompts. Pinning Opus bypasses the current session-model choice, but the source does not publish a cross-model quality comparison. The two-stage pipeline first extracts structured facets, then writes prose.
 
 Splitting makes the facets reusable: rewriting the narrative does not re-extract facets. **Core principle**: the insights report is for the user, not for memory.
 
@@ -621,7 +611,7 @@ Writing the report back to memory would re-open the injection door (a malicious 
 
 Follow-up: can the user save an insight directly as a skill? Only via skillify, which preserves the `disableModelInvocation` gate.
 
-**Q10 · Give a general six-layer "safe self-improvement" defense stack with one specific threat per layer.**
+**Q10 · Use six control points to inspect write-back threats.**
 
 In data-flow order:
 
@@ -632,10 +622,8 @@ In data-flow order:
 5. **Review layer · user preview**: show the user the SKILL.md or memory entry before persisting; reject = no write. Threat: silent sedimentation of wrong information.
 6. **Isolation layer · frozen snapshot**: mid-session writes update disk only; next session reloads. Threat: just-injected memory polluting the current prompt.
 
-The four systems map differently: Codex emphasizes 1+2+6 (prompt engineering + redact + naturally isolated background job); Claude Code 4+5 (capability flag + user review); OpenClaw 2 (redact at extraction is the strongest single layer);
+The four systems place controls at different points: Codex at input instructions, redaction, and background execution; Claude Code at capability gating and user review; OpenClaw on extraction-time redaction; Hermes on regex screening and snapshot timing. The six layers are a threat-model checklist, not a production minimum. Select controls from data origin, write authority, and revocation needs.
 
-Hermes 3+6 (regex + frozen snapshot). **Production minimum: at least 2+3+5** (redact + regex + user review). Source pointers are at the end. Follow-up: if the team can only build one layer, which?
-
-Layer 3 (regex + invisible unicode scan) is the last line for "injection that persists". If other layers fail, layer 3 still blocks; if layer 3 fails, the injection persists forever.
+Follow-up: if the team can build only one layer, which? No single layer covers injection, secret leakage, stale facts, and unauthorized writes. For content entering a high-trust prompt, start by constraining write authority or requiring review; regex catches known patterns only.
 
 </details>

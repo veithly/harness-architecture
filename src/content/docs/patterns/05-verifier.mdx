@@ -1,65 +1,56 @@
 ---
-title: 05 · Verifier：loop 不能靠模型自评收尾
+title: 05 · Verifier：什么证据足以让 Agent 停下
 sidebar:
   order: 5
-description: 三层 verifier（硬、软、放任型）加四家的具体实现，附 Codex execpolicy、Claude Code TOKEN_BUDGET、OpenClaw loop detection、Hermes insights 真源码
+description: 把“完成”拆成可审计的硬信号、预算信号和止损上限，避免让模型自评替代验证。
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
 > **承接 [Agent Loop](/patterns/02-agent-loop/)**：那一章给了三层 verifier 的概览。本章继续看每一层的源码、失败模式与选型逻辑。
 
-## 谁来判定任务完成
+## 什么证据足以让 Agent 停下
 
-<Verdict tldr="Verifier 是 agent loop 唯一能托底的外部判官。模型说「我做完了」这件事在生产环境基本不能信，loop 完全靠模型自评停或不停，必然出现「bug 还没修但 agent 说改完了」的灾难。三层 verifier：硬 verifier 看外部产物（exit code、patch 合法性、lint、tests），软 verifier 看预算和启发式（token 增量、调用模式哈希），放任型 verifier（lazy verifier）信模型自停（最后兜底）。三层都得有，缺一翻车。四家覆盖度差别巨大：Codex 走最严格路线，4 个硬 verifier 串到底（apply_patch 对 patch 做语法校验、run tests 看测试退出码、execpolicy 给每条 shell 命令打 allow/prompt/forbidden 三态、goals.rs 1500 行状态机周期性检测 goal 是否收敛）；Claude Code 走软 verifier 算法化路线，tokenBudget.ts 60 行做出普适算法（0.9 阈值、500 token 增量、3 轮连续低增量判 diminishing），但没硬 verifier 接口；OpenClaw 走中间件化路线，tool-policy-pipeline 让外部任意挂检查，tool-loop-detection 4 种 detector（generic_repeat 同工具同参数重复、known_poll_no_progress 已知的轮询模式无进展、ping_pong 两个工具在两步之间来回切换、global_circuit_breaker 全局调用次数熔断）拦死循环；Hermes 走长期累积路线，单 loop 只有 IterationBudget 软兜底，靠 memory.prefetch（loop 启动前注入跨会话记忆）加 insights（loop 结束后自评写回 memory）跨会话变聪明。选型：严格 coding agent 参考 Codex，IDE 工具参考 Claude Code TOKEN_BUDGET，企业可扩展参考 OpenClaw 中间件，长跑助理参考 Hermes memory 加 insights。" />
+<Verdict tldr="Agent 说“完成”不是证据。本文追踪哪些外部信号能让 loop 停下：Codex 的测试和策略、Claude Code 的预算启发式、OpenClaw 的 middleware hooks、Hermes 的跨会话反馈。没有统一 rubric 的地方，结论保留条件。" />
 
-## 硬验证、软验证与止损上限
-
-<details>
-<summary>读前提示（按需展开）</summary>
-
-- **模型说「我做完了」基本不能信**：loop 完全靠模型自评收尾，必然出现「bug 没修但 agent 说改完了」的灾难。
-- **覆盖度分歧最大**：Codex 4 个硬 verifier 串到底（execpolicy 三态、goals.rs 收敛检测），Claude Code 只有 TOKEN_BUDGET 软算法，OpenClaw 靠 tool-loop-detection 4 种 detector，Hermes 靠 insights 跨会话累积。
-- **verifier 层数决定翻车概率**：硬、软、放任型三层都得有，缺一翻车。
-- **自己动手第一优先**：先接外部客观信号（exit code、patch 合法性、tests），别指望模型自评。
-
-</details>
+## 先区分证明、预算和止损
 
 <Diagram
   src="/diagrams/05-verifier-base.svg"
   alt="Verifier 三层决策流：外部产物 → 内部预算 → 模型自评"
-  caption="任意一个 turn 的输出都串过这三层。前两层任一过不去就强制继续，最后一层才允许模型说停。"
+  caption="一种可选组合：外部完成证据、资源启发式和模型停止信号分层记录。哪些信号阻止继续或阻止完成，由宿主按任务配置。"
 />
 
 三层在 4 个系统里覆盖度差别很大：
 
 <CompareTable
   rows={[
-    { label: '硬 verifier', values: ['`goals.rs` 收敛检查加 `apply_patch` 校验加 tests 退出码加 `execpolicy::Decision::{Allow, Prompt, Forbidden}` 三态', '无（query.ts 不开放 verifier 钩子）', '`before、after_tool_call` 等十几个 plugin hook，verifier 完全可挂载', '无运行时硬 verifier，只有 skill 层 policy'] },
+    { label: '外部可复核信号', values: ['宿主可接 tests 退出码；`apply_patch` 验证语法；`execpolicy` 约束命令；`goals.rs` 记录状态与预算', 'query.ts 没有通用 verifier 插件口', '`before、after_tool_call` 等 hooks 可接宿主检查', '主循环没有结构化外部完成门禁'] },
     { label: '软 verifier', values: ['Goal token_budget 加 retry backoff 加 Turn 上限', '`TOKEN_BUDGET` 90% 阈值加连 3 次 <500 token 判 diminishing returns', '`tool-loop-detection.ts` 4 种 detector（generic_repeat、poll_no_progress、ping_pong、global_circuit_breaker）', 'IterationBudget 90/50 加 grace call'] },
     { label: '放任型 verifier', values: ['模型 `output_type: completed`', '流里没 `tool_use` block', 'lifecycle:end 事件', '模型不发 tool_call 即结束 turn'] },
-    { label: '硬上限', values: ['Turn 计数加服务端 ratelimit 加 `GOAL_BUDGET_LIMITED_METRIC` 上报', 'maxTurns（默认很大）', 'runtime timeout 加 30 次 global circuit breaker', 'iteration_budget 耗尽走 grace call 强制总结'] },
+    { label: '硬上限', values: ['Turn 计数加服务端 ratelimit 加 `GOAL_BUDGET_LIMITED_METRIC` 上报', 'maxTurns（默认很大）', 'runtime timeout；global circuit breaker 可选且源码默认关闭', 'iteration_budget 耗尽走 grace call 强制总结'] },
   ]}
   caption="Verifier 三层加硬上限在 4 系统的覆盖"
   dimensionLabel="层级"
 />
 
-## 四套系统怎样验证完成
+## 只比较会改变停止语义的实现
 
-### Codex · 4 个硬 verifier 串联，loop 完全不靠模型自评
+### Codex · 把不同层的完成信号分开记录
 
 Codex 在 verifier 设计上的出发点是：模型说「我完成了」基本不能信。很多时候模型实际没有完成任务但它觉得自己完成了（比如改了一个文件就以为整个 bug 都修好了，但还有 3 个相关文件没改。或者跑了一次测试看到通过就以为修好了，但其实测试覆盖不全）。Coding 场景的好处是有大量客观可验证的信号：exit code 是 0 还是非 0、patch 语法对不对、lint 是否通过、tests 是否全 pass，这些信号都是机器可读不需要模型判断。
 
-Codex 把这些客观信号全部串起来，loop 完全不依赖模型自评。
+Codex 的源码把这些信号放在不同层处理；它们能减少只听模型自评的风险，但是否组成完成门禁要由宿主工作流决定。
 
-实际实现是 `goals.rs` 里 1500 多行的 `GoalRuntimeEvent` 状态机处理每一次 turn 的预算、收敛、外部 goal 变更，把所有事件统一收敛成机器可判断的「任务完成」信号：
+`goals.rs` 的 `GoalRuntimeEvent` 把 turn、工具、预算与中止等运行事件送入同一状态机。它让状态和资源变化可记录；`turn_completed` 等字段仍来自上游流程，不能独立证明业务目标完成：
 
 <SourceBlock path="REF/codex/codex-rs/core/src/goals.rs" lines="98-130" system="codex" summary="GoalRuntimeEvent: turn 完成 / 工具完成 / 中止统一收敛">
 
@@ -105,23 +96,23 @@ pub enum Decision {
 
 </SourceBlock>
 
-Codex 的硬 verifier 4 件套，每一个都对应一个具体的「客观完成信号」：
+Codex 里的四类控制各自对应一个可复核信号，但不应被读成“全 pass 就等于业务完成”：
 
 **1. `apply_patch` 校验**（详见 06 章 V4A）：模型生成的 patch 必须通过 V4A diff 算法的语法校验，不合法的 patch 直接拒绝执行，loop 强制重试。这层 verifier 防止「模型生成了一坨乱码假装是 patch」的情况。模型有时候会编造 patch（特别是上下文压缩之后忘了文件原始内容），不校验就直接 apply 会破坏文件。
 
-**2. `run tests` 退出码**：任务结束前必须跑一次相关测试，exit code 非 0 直接判定为「任务未完成」，goal 不收敛 loop 强制继续。这层 verifier 防止「模型改完代码不跑测试就宣称完成」的情况。很多 agent 改完代码就停了，但没运行就根本不知道改对没。
+**2. `run tests` 退出码**：如果宿主工作流配置了相关测试，非 0 可以作为失败信号并反馈给 loop。源码样本不能证明每个任务都会自动跑测试，也不能把测试通过解释成业务完成。
 
-**3. `execpolicy::Decision`**：每条 shell 命令执行前过三态决策器：`Allow` 才执行（白名单内或低风险）、`Prompt` 走用户审批（中风险需要确认）、`Forbidden` 直接 block（黑名单内或高风险）。这层 verifier 防止「模型一时糊涂跑了 rm -rf /」的情况。execpolicy 拦在 sandbox 之前，是命令级的硬墙。
+**3. `execpolicy::Decision`**：每条 shell 命令执行前过三态决策器：`Allow`、`Prompt` 或 `Forbidden`。它是命令级策略，不是结果 verifier；真正的隔离和风险边界还取决于 sandbox、权限与部署配置。
 
 **4. `goals.rs` 收敛检测**：Goal 的 `token_budget` 耗尽时走 `GOAL_BUDGET_LIMITED_METRIC` 指标上报加 steering（注入 system message 引导模型「先把当前进度叙述清楚再退出」），强制 loop 不能在没说清楚的情况下硬退。这层 verifier 防止「token 烧完模型 silent fail」的情况。没有 steering 模型会直接断在某个工具调用中间，用户看到一半的执行不知道发生了什么。
 
-四个 verifier 串起来形成的网络让 loop 完全不需要相信模型自评：任何一层 fail 都强制继续，全部 pass 才算完成。代价是这套只在 coding 场景生效。让 Codex 写 PRD、做调研，4 个 verifier 全部失效（没有 exit code 可看、没有 tests 可跑），所以 Codex 离开 coding 场景就跟其他三家一样需要其他兜底。
+这些信号组合后能提高可审计性，但“任一失败都继续、全部通过就完成”并不是这四个源码片段共同保证的协议。它们主要适用于 coding；写 PRD 或做调研时，要另行定义结果评审和终止条件。
 
 ### Claude Code · 60 行算法判 token 收敛速率
 
 Claude Code 在 verifier 设计上的出发点是：作为 IDE 集成的 coding agent，硬 verifier（exit code、tests）的接入成本太高（用户的项目可能没测试、测试可能很慢、IDE 不该擅自跑测试），但完全靠模型自评又会出现「模型啰嗦没完没了」（特别是用户问个简单问题模型却写了一大篇分析）。
 
-所以 Claude Code 选择把软 verifier 做得很深：用 token 收敛速率做主要判退信号，便宜（不用跑外部命令）、快速（每轮就能算）、对场景普适（任何任务都能算 token 增量）。
+所以 Claude Code 选择把软 verifier 做得很深：用 token 收敛速率做主要判退信号，便宜（不用跑外部命令）、快速（每轮就能算）。它适合能观察 token 增量的任务，但阈值仍要按模型和工作流校准。
 
 实际实现在 `query/tokenBudget.ts` 几十行，把按 token 收敛速率判退做成一个标准算法：
 
@@ -163,19 +154,19 @@ export function checkTokenBudget(
 
 </SourceBlock>
 
-三个数字决定 loop 形态：`0.9` 是软边界（到 90% token 预算前每轮都 nudge 模型继续）、`500` 是 token 增量阈值（每轮新增不到 500 token 算「没做什么实事」）、`3` 是连续轮数（连续 3 轮都低于增量阈值就判 diminishing returns）。三者组合判定「已经在小修小补，差不多得了」这个状态。这是软 verifier 工程化的代表，几十行代码做出了所有场景都通用的判退算法。
+三个数字决定 loop 形态：`0.9` 是软边界，`500` 是 token 增量阈值，`3` 是连续轮数。三者组合后，源码把低增量状态标成 diminishing returns。它展示了如何把启发式写进运行时，但没有证明这组常量适合所有模型或任务。
 
-这套设计有一个特别巧妙的地方：算法看的不是绝对 token 数（绝对数因任务复杂度差异巨大）而是 token 增量趋势（不管任务多复杂，只要连续 3 轮增量都很小就说明在打转）。这种相对趋势的设计让算法不需要为每个任务调阈值。
+算法看的是 token 增量趋势，而不是绝对 token 数。相对趋势更容易迁移，但 `500` 和连续轮数仍然是阈值，换模型或任务后需要重测。
 
 但 Claude Code 这套做得再好也只是软 verifier，没有硬 verifier 接口。`query.ts` 1729 行单文件没开放外部 hook，想让 loop 强制等 `pnpm test` pass 再退出，只能 fork 整个文件改。`stopHooks` 系统只允许反向门控（阻止模型自停，让 loop 继续跑），不接「必须先通过外部检查」这种正向要求（强制必须 pass 才能退）。
 
-这是 Claude Code 在 verifier 上明显的盲点：对于需要严格保证「测试通过才能 PR」的工作流，Claude Code 不适合直接用。
+这份快照的边界很清楚：Claude Code 没有内置的正向门禁，不能配置成“外部测试通过后才能退出”。需要「测试通过才能 PR」的工作流，要由宿主另接门禁或维护 fork；是否适合取决于外围集成。
 
 ### OpenClaw · verifier 中间件化加 4 种 loop detector
 
 OpenClaw 在 verifier 设计上的出发点是：作为通用 agent 控制面（不只服务 coding），verifier 不能写死在 loop 里。不同企业、不同业务场景对「什么算完成」的定义完全不同（销售 agent 完成等于 CRM 字段全填、客服 agent 完成等于工单关闭、coding agent 完成等于 tests pass），如果 verifier 是写死的就没法适配多样性。
 
-最好的办法是把 verifier 做成中间件接口，让具体的检查逻辑由使用者自己注册。
+一种可行做法是把 verifier 做成中间件接口，让使用者注册具体的场景检查，而不是把完成定义写死。
 
 实际实现是 `tool-policy-pipeline` 把 verifier 抽象成可注册的中间件，十几个 hook 点（`before_tool_call`「调用前」、`after_tool_call`「调用后」、`tool_result_persist`「结果持久化前」等）让外部任意挂 lint check、typecheck、human approval、业务规则验证。
 
@@ -208,15 +199,15 @@ export const GLOBAL_CIRCUIT_BREAKER_THRESHOLD = 30;
 
 **`ping_pong`**：识别 A→B→A→B 摆动。两个工具互相依赖时模型可能陷入「调 A 看到结果不满意调 B 修一下又回来调 A 看结果」的循环。这层拦截「两个工具互相 cancel 对方的工作」的情况。
 
-**`global_circuit_breaker`**：30 次总阈值兜底，再细的 detector 都漏掉时强制熔断。这是最后一道墙。前三种 detector 都是针对特定模式的，可能有未覆盖的死循环模式，全局阈值确保任何模式的死循环都会在 30 次内被拦下。
+**`global_circuit_breaker`**：启用 loop detection 后，30 次总阈值可作为模式无关的兜底。它只限制调用次数，不识别任务是否仍在推进；默认关闭时也不会生效。
 
 默认 `enabled: false`。OpenClaw 不强制每个 session 开 loop detection，因为有合法的高重复 workflow（比如 `watch + recompile` 这种持续监控类的工作就是天然要重复调用同一个工具几十次），开 loop detection 反而误伤。这是 OpenClaw 给用户的开关：需要的时候打开，不需要就关掉。
 
 ### Hermes · 单 loop 无硬 verifier，verifier 跨会话累积
 
-Hermes 在 verifier 设计上的出发点是：长跑助理（陪伴用户几个月几年）的 verifier 不该是「单次 loop 内一定要严格判对错」。这种严格性会让 agent 太死板没法处理多样性场景，反而损害用户体验。正确的方式是把 verifier 摊到时间轴上：单次 loop 不严格但每次 loop 结束后做事后分析写回 memory，下次类似任务 prefetch 出来注入 context，agent 就会越来越聪明。
+Hermes 把长跑助理的反馈拆到 loop 之后：每次运行做事后分析并写回 memory，下次类似任务可以 prefetch 这些记录。源码支持这条反馈路径，但不能据此断言后续运行一定更聪明；需要测量成功率、回归和错误记忆。
 
-实际实现上 Hermes 单 loop 跑 90 步（subagent 50 步），耗尽走 grace call、总结、停。`agent/insights.py` 不是运行时 verifier，它是**事后**的会话分析引擎，看 token、成本、工具分布：
+在本文固定的源码快照里，Hermes 单 loop 的父预算是 90 步、subagent 是 50 步，耗尽后进入 grace call 与总结。`agent/insights.py` 不是运行时 verifier，而是**事后**的会话分析引擎，看 token、成本、工具分布：
 
 <SourceBlock path="REF/hermes-agent/agent/insights.py" lines="1-17" system="hermes" summary="insights.py 是事后分析引擎，不是 loop 内 verifier">
 
@@ -240,79 +231,75 @@ Hermes 的 verifier 设计可以分三个时间维度：
 
 **运行时（loop 内）**：只有 `IterationBudget(90/50)` 软上限加 grace call 兜底。父 90 步、subagent 50 步耗尽后给模型一次 grace call 说最后一句话，再不够就剥工具强制总结。这层只保证 loop 不会无限跑，不保证任务做对。
 
-**跨会话（loop 之间）**：`memory_manager.prefetch_all()` 在 loop 开始前把「上次类似任务哪里出错、哪里做对」注入 context。这是 Hermes verifier 设计的核心创新：把 verifier 从「单次 loop 内的硬检查」变成「跨会话累积的经验」。同一个用户用一个月之后，Hermes 比第一天聪明得多（因为 memory 在累积、skill 在被触发、insights 在写回），verifier 的效果是涌现出来的而不是写死的。
+**跨会话（loop 之间）**：`memory_manager.prefetch_all()` 在 loop 开始前把相关历史注入 context。这提供跨会话上下文，但是否带来更高成功率、以及是否引入污染，需要用任务结果和 memory 审计验证。
 
 **训练侧（不参与正常运行）**：`environments/*.py` 里有 `evaluate()`、`score()` 方法（如 `yc_bench_env.py:475`），但那是 RL 训练数据收集，不参与正常 agent 运行。这部分是 Hermes 团队在做「让 agent 通过 RL 自我改进」的实验，跟用户实际跑 agent 无关。
 
-Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没法机器判断对错（用户问「这次任务做对了吗」，Hermes 给不出客观答案，只能让用户自己判断），依赖 memory 累积加 skill 自评。所以 Hermes 不适合「单次 loop 必须严格判对」的场景（CI、自动 merge、关键业务流程），更适合陪伴型助理。
+Hermes 提供了跨会话反馈路径，但没有在这个 loop 里提供业务结果门禁。它可以用于开放式助理；CI、自动 merge 或关键流程仍需宿主接入外部检查。反馈能否提高后续成功率、是否放大错误记忆，需要评测。
 
-## Verifier 已经形成的共识
+## 先写停止信号，再谈自治
 
-四家在 verifier 设计上有五个明显的共同认知，这是所有 agent 都该遵循的工程底线：
+从四个样本可以提炼出五个检查问题；它们不是现成的生产认证清单：
 
-**第一，永远要有硬上限（防止 loop 无限跑）**：Turn 计数、token budget、iteration cap、circuit breaker，每家都有自己的硬上限机制。模型再自信也卡得住。完全没有硬上限的 agent 一旦陷入死循环就会烧光 quota（见 Claude Code 注释里的「线上一天浪费 250K API 调用」案例）。
+**第一，为可能重复执行的路径设置止损**：可用 Turn 计数、token budget、wall-clock timeout 或 circuit breaker。具体组合取决于调用成本与副作用；至少要通过故障测试确认存在可达的停止路径。
 
-**第二，硬 verifier 看外部产物（不依赖模型自评）**：exit code、diff 合法性、policy 决策、lint 结果，这些都是机器可判断的信号。模型说「我做完了」不算数，必须有客观信号确认。Codex 和 OpenClaw 都把硬 verifier 做到这一层。
+**第二，完成门禁要读取任务外部信号**：exit code、lint、类型检查或人工审批可以比模型自评更可靠。diff 合法性只证明 patch 可解析，policy 决策只约束动作；不要把它们直接等同于任务完成。
 
-**第三，软 verifier 用预算和启发式（便宜但够用）**：token 增量、重试次数、调用模式哈希，这些信号成本低（不用跑外部命令）但能拦下大部分浪费。Claude Code 把软 verifier 做得很深，60 行算法覆盖主要场景。
+**第三，软 verifier 用预算和启发式控制资源**：token 增量、重试次数和调用模式哈希不需要外部命令，但误判率取决于任务分布。它们用于停止或提醒，不证明结果正确。
 
-**第四，放任型 verifier 是最后一道兜底（不能让 loop 只靠它）**：模型不再发 tool_use 即认为完成，是兜底机制不是主力。完全靠模型自评的 agent 一定不可信。
+**第四，放任型 verifier 只能兜底**：模型不再发 `tool_use` 只能说明它选择停止，不能单独证明任务完成。
 
-**第五，verifier 信号要可观测（暴露给监控）**：`transition.reason`（Claude Code）、`GOAL_*_METRIC`（Codex）、`LoopDetectorKind`（OpenClaw）都把退出原因显式暴露给监控系统。监控不能看 verifier 信号的 agent 出问题没法定位。
+**第五，记录 verifier 与停止原因**：`transition.reason`、`GOAL_*_METRIC` 和 `LoopDetectorKind` 是不同形态的运行信号。把它们与任务结果关联，才能区分正常完成、预算截断和策略拒绝。
 
-## 验证强度决定自治范围
+## 把证据强度和自治范围放在一起
 
 <Diagram
   src="/diagrams/05-tradeoff.svg"
   alt="四个系统在 verifier 严格度乘可扩展性两轴上的位置"
-  caption="横轴：单次 loop 内 verifier 严格度。纵轴：外部可挂载 verifier 的能力。Codex 把严格度拉到顶但钩子有限，OpenClaw 反过来。Claude Code、Hermes 落在中下半区。"
+  caption="横轴表示单 loop 中可复核信号的覆盖，纵轴表示宿主挂接检查的接口。这是源码快照的定性比较，不是可靠性评分。"
 />
 
 四家代表 verifier 设计的四种典型取舍：
 
-**让 loop 被外部信任（CI、自动 merge、关键业务流程）**：参考 Codex 的硬 verifier 4 件套（apply_patch 校验、tests 退出码、execpolicy 三态、goals.rs 收敛）。前提是任务有外部判官（tests、lint、type check、API schema），没有外部判官这套就用不上。这种严格性是 CI 自动 merge 的最低要求：没硬 verifier 就不该让 agent 自动 merge。
+**让 loop 进入 CI、自动 merge 或关键业务流程**：先定义真正能阻止发布的外部判据，例如测试、lint、类型检查、部署预检或人工审批。Codex 的 patch、tests、policy 和 Goal 信号可以提供素材，但它们不是默认串联的“四件套”，也不能替代仓库自己的保护规则。
 
-**省 token、避免无意义续写**：参考 Claude Code 的 TOKEN_BUDGET 算法（90% 阈值加连 3 次小于 500 token）。直接照搬三个常量也行，对任何场景都通用。这是软 verifier 工程化的代表作，60 行代码做出了普适算法。
+**省 token、避免无意义续写**：参考 Claude Code 的 TOKEN_BUDGET 算法（90% 阈值加连 3 次小于 500 token）。可以从这组常量开始，但换模型或任务后要重新校准；它不是通用的停止答案。
 
-**给二开方任意挂检查**：参考 OpenClaw 的中间件 pipeline 加 4 种 loop detector。tool-policy-pipeline 让 verifier 完全中间件化（外部任意挂 lint、typecheck、human approval、业务规则），4 种 loop detector 拦住主要的死循环模式。代价是调试链路长（一个工具调用过 5-6 层中间件，出问题难定位）。这是企业级、多租户场景的最优方案。
+**给二开方挂自定义检查**：参考 OpenClaw 的中间件 pipeline 和 loop detector。它便于接 lint、typecheck、人工审批或业务规则，代价是调试链路更长；是否适合多租户，要看隔离、事件契约和运维能力。
 
-**长期累积学习，不强求单 loop 严格**：参考 Hermes 的 memory.prefetch 加 insights 路线。把 verifier 摊到时间轴上，单 loop 不严格但跨会话累积变好。但单 loop 还是得有硬上限兜底（IterationBudget），不能完全没有。这是长跑陪伴型 agent 的最优方案。
+**长期保存反馈，不强求单 loop 严格**：参考 Hermes 的 memory prefetch 和事后 insights。跨会话记忆能让后续运行看到旧反馈，但是否改善结果需要按任务评测；单次运行仍要有预算上限和明确的失败状态。
 
-## 我的判断：先找事实，再谈评分
+## 停止条件要匹配任务后果
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: '4 个硬 verifier 串联加三态 execpolicy 加 GoalRuntimeEvent 状态机。verifier 工程化的天花板', risk: '强绑定 coding 场景，离开 tests、lint、diff 这些外部判官就失效。没有内置的 loop 模式检测' },
-    { system: 'Claude Code', value: '★★★★', reason: '`tokenBudget.ts` 几十行代码定义「什么叫小修小补」。算法可直接复用', risk: '没有硬 verifier 接口，想加外部检查只能 fork 1729 行单文件' },
-    { system: 'OpenClaw', value: '★★★★★', reason: 'verifier 中间件化加 4 种 loop detector 加 30 次 global circuit breaker。verifier 可扩展性第一', risk: '默认 `enabled: false`，需要使用者主动开。hook 链路长，调试要 --trace' },
-    { system: 'Hermes', value: '★★★', reason: 'memory.prefetch 加长期学习是独到设计。grace call 软兜底体面', risk: '运行时几乎无 verifier，单 loop 无法被外部信任。insights.py 只是事后报表，不参与决策' },
-  ]}
-  caption="评分依据：verifier 三层覆盖度加工程化程度加二开可扩展性"
-  headers={['系统', '评分', '亮点', '风险']}
-/>
+| 完成证据 | 借鉴路线 | 代价或边界 |
+| --- | --- | --- |
+| 有 tests、退出码或 patch grammar | Codex 的硬 verifier | 强证据只适用于对应领域 |
+| 进度可测量，但没有单一的通过/失败值 | Claude Code 的预算与 transition 信号 | 启发式可能过早停下 |
+| 需要用策略和工具事件阻止或解释继续 | OpenClaw 的 middleware hooks | 必须先稳定事件契约 |
+| 质量要在多次会话中积累 | Hermes 的 trajectory 与 memory 反馈 | 跨会话学习不能证明本次完成 |
 
-## 从一个领域验证器开始
+## 从一个可审计的领域验证器开始
 
-下面是从四家提炼的自己写 Verifier 配方。先把基础三层补齐，再加生产级特性，最后避开四个常见死路。
+自己写 Verifier 时，先写清楚完成证据和资源上限，再加入启发式停止、观测和人工复核。
 
 <BuildRecipe
   title="复刻方案"
   minimal={[
-    '至少有硬上限三件套：max_iterations、token_budget、wall_clock_timeout。三个变量先卡死，任何一个超限都强制停。这是最低底线（防止 agent 烧光 quota、卡死服务器）',
-    '至少有一个硬 verifier 兜底：coding 场景用 tests 退出码（最可靠的客观信号），非 coding 场景用 output schema 校验（让模型必须产出符合 schema 的最终结果）。别让模型自评决定停不停',
-    '至少暴露一个 transition.reason 标签（参考 Claude Code）让监控能看出 loop 为什么停。是 budget 耗尽？是 verifier 拒绝？是模型主动停？外部观察工具一眼就能看到',
+    '按成本和副作用配置 max_iterations、token_budget 或 wall_clock_timeout，并用故障测试确认停止路径；不是每个短任务都需要同时启用三项',
+    '给高风险任务接一个真正对应结果的外部信号。tests 退出码和 output schema 只证明各自覆盖的层面，不能单独代表业务正确',
+    '记录结构化 stop reason，至少区分正常结束、资源截断、策略拒绝和错误；标签集合应服务于实际重试与告警逻辑',
   ]}
   advanced={[
-    '参考 Claude Code 的 `0.9、500、3` 三常量加进 token budget 软 verifier 算法。用 token 增量趋势而非绝对 token 数做判退信号，对所有场景普适不用调参',
-    '参考 OpenClaw 的 4 种 detector（generic_repeat、poll_no_progress、ping_pong、global_circuit_breaker）。至少先加 generic_repeat（模型连续调同一工具）加 global_circuit_breaker（一次会话工具调用上限）这两个，能挡住 90% 的死循环',
-    '参考 Codex 的 execpolicy 三态（Allow、Prompt、Forbidden），shell 调用必须走这一道。不要直接 boolean 通过、拒绝。中间档 Prompt 让用户参与决策，这是 coding agent 的安全标配',
+    '参考 Claude Code 的 `0.9、500、3` 三常量加入 token budget 软 verifier。用 token 增量趋势做判退信号，但在自己的模型和任务集上重新校准',
+    '参考 OpenClaw 的 4 种 detector（generic_repeat、poll_no_progress、ping_pong、global_circuit_breaker）。先加 generic_repeat 与 global_circuit_breaker，再用运行日志补齐其他模式',
+    '高风险 shell 调用可以参考 execpolicy 的 Allow、Prompt、Forbidden 三态；具体决策还要结合 sandbox、挂载、凭据和审批策略',
     'verifier 失败必须可恢复：写 transition 标签加落盘可 replay，别直接 panic。硬 verifier 拒绝（如 tests fail）应该让 loop 继续（feed error 回模型），不是停掉整个 agent。把 verifier 失败写进事件流方便后续分析',
   ]}
   avoid={[
-    '别只信「模型说停了」：放任型 verifier 是兜底不是主力。模型经常在没真正完成任务时宣称完成。放任型 verifier 只在前两层都通过后才轮到决策',
+    '别把「模型说停了」直接写成业务完成。宿主可按任务把它与外部证据、资源状态或人工复核组合，而不是固定要求前两层全部通过',
     '别把 verifier 串成 boolean & boolean & boolean。会出现「4 个都过但任务没完成」的情况（每个 verifier 都通过但组合起来没保证任务真完成）。用投票机制或分类层级更合理',
     '别把 verifier 写死在 loop 主体。抽成 hook、middleware 才方便后续替换。不同场景需要不同 verifier 组合（CI 跑、本地 dev），写死意味着要改 loop 主体才能切换',
-    '别一上来就上 RL 评分。先把硬上限加硬 verifier 加软 verifier 三层补齐再考虑 RL。RL 评分需要大量训练数据，且评分模型本身可能有 bias。基础三层是必须的不是可选的',
+    '别一上来就上 RL 评分。先定义硬上限和一个可复核的完成信号，再判断软 verifier 是否能降低成本。RL 评分还需要训练数据与偏差评估，应该由任务风险决定是否引入',
   ]}
 />
 
@@ -321,12 +308,12 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 <Diagram
   src="/diagrams/05-failure-paths.svg"
   alt="Verifier 失败两条路径：硬 verifier 卡住（exit != 0），软 verifier 卡住（token + diminishing）"
-  caption="Path A：tests fail → goal 不收敛 → loop 强制下一轮。Path B：token >= 90% 预算 + 连续 3 轮小于 500 增量 → 判 diminishing returns → 强制停。"
+  caption="设计草案：外部检查失败可进入修复或人工处理；Claude Code 当前快照的 0.9 / 500 / 3 启发式可触发资源止损。两条路径都不是 Codex 默认完成协议。"
 />
 
-把 verifier 拆三层最大的好处：监控能区分「loop 还在干活」、「loop 在原地打转」、「loop 应该停了」三种状态。把这三种状态混成一个 boolean，agent 系统永远看不清。
+把 verifier 拆成几类信号后，监控更容易区分「loop 还在干活」、「loop 在原地打转」和「loop 应该停了」。如果把这些状态混成一个 boolean，后续诊断会丢失信息。
 
-## 沿着验证路径读源码
+## 核对停止信号的实现
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -361,17 +348,17 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 
 按照「**判定依据来自哪里**」来分：
 
-**硬 verifier** 看外部产物：exit code、patch valid、lint pass、type check pass、schema 校验、外部 API 返回 200。判定结果是布尔，模型无法影响。Codex 的 4 件套全是硬 verifier。
+**硬 verifier** 读取宿主可复核的信号，例如测试、lint、类型检查或人工批准。patch valid、schema valid 和 HTTP 200 只验证各自那一层，不能自动升级成“任务正确”。Codex 的 patch、policy、tests 和 Goal 状态也分属不同职责。
 
 **软 verifier** 看内部预算与启发式：token 增量、重试次数、tool 调用模式哈希、cost 阈值、调用频率。判定结果通常是「diminishing returns」或「circuit breaker」一类的预防性熔断。Claude Code 的 `tokenBudget.ts` 是软 verifier 的工程化代表。
 
 **放任型 verifier**（lazy verifier）信模型自己说停：assistant message 不再带 `tool_use` block、`output_type: completed`、`stop_reason: end_turn`。本质是把决策权交回模型。
 
-三层并不互斥。一个良好的 loop 同时具备三层，三层级联：先问硬 verifier（任务有没有外部完成信号？），再问软 verifier（再继续还有收益吗？），最后才看放任型 verifier（模型自评是否结束？）。
+三类信号并不互斥。一个工作流可以组合外部完成检查、资源启发式和模型停止信号，但顺序与成员应跟随任务后果，不必固定成三层级联。
 
-**为什么不能只靠放任型 verifier？** 因为模型的「自信」和「任务完成」是脱钩的。生产里看到的失败案例 80% 都是模型说「我已经做完了」但 lint 没过、没跑测试、漏改了文件。
+**为什么不能只靠放任型 verifier？** 因为模型的「自信」和「任务完成」是脱钩的。模型说「我已经做完了」时，仍可能存在 lint 未通过、测试未运行或文件漏改；本章没有生产样本，不给这个失败模式编一个占比。
 
-**源码定位**：[`codex/codex-rs/core/src/goals.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/goals.rs) 是硬 verifier 集中地，`claude-code/src/query/tokenBudget.ts` 是软 verifier 的算法，放任型 verifier 在每个系统都简单到不用专门文件。
+**源码定位**：Codex 的 `goals.rs` 记录 goal 状态与预算，`execpolicy` 约束命令，`apply_patch` 验证编辑格式；它们不是一个默认串联的硬 verifier。`claude-code/src/query/tokenBudget.ts` 展示预算启发式。
 **追问**：「Verifier 和 sandbox 是一回事吗？」不是。Sandbox（chapter 13）防 agent 干坏事（限制可执行的命令），verifier 判 agent 干完了没。两者维度正交。
 </details>
 
@@ -387,9 +374,9 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 
 状态机的好处是**所有判定都在一个地方**。Claude Code 把 verifier 逻辑散在 `query.ts` 1729 行单文件里，调试时要在十几个分支跳。Codex 一个文件，状态明确（`TurnStarted`、`ToolCompleted`、`TurnFinished` 等），可以画状态图核对。
 
-代价是首次阅读门槛高。新工程师上手 1500 行 Rust 状态机，至少要花一天。但维护期收益很大：加新的 verifier 信号（比如「test coverage 小于阈值」也算 goal 未完成）就是新增一个 enum variant 加处理逻辑，不需要在整个 codebase 里 grep。
+代价是状态和持久化路径较长。阅读成本取决于 Rust 熟悉度、调用链与测试覆盖，不能从行数换算成一天。新增字段或事件是否只改一个 enum，也要沿调用方和存储 schema 验证。
 
-实操建议：如果你的 verifier 信号超过 4 种，立刻拆状态机。3 种以下，散在 loop 主体里更轻。
+实操建议：当状态转移开始在多个分支重复、需要持久化或难以覆盖测试时，再抽状态机。信号数量本身不是可靠阈值。
 
 **源码定位**：[`codex/codex-rs/core/src/goals.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/goals.rs) 全文，重点看 `GoalRuntimeEvent` 和 `GoalRuntime::handle_event`。
 **追问**：「Rust 状态机这么大不会有性能问题吗？」Rust enum match 是 O(1) 分发，状态机大小不是性能瓶颈。瓶颈一般在 LLM 调用本身。
@@ -398,22 +385,14 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 <details>
 <summary>**Q3 · 工程**：Claude Code 用 `0.9 / 500 / 3` 三个常量定义「diminishing returns」。这三个数字为什么是这三个？</summary>
 
-每个常量都对应一个工程权衡：
+源码能确认三件事：`0.9` 决定何时进入预算末段，`500` 定义低增量，`3` 要求连续出现。三项组合才触发 diminishing returns。
 
-**`0.9`（COMPLETION_THRESHOLD）**：触发收敛检查的预算门限。低于 0.9 时不检查（说明 loop 还有充足预算，不必焦虑），超过 0.9 才开始问「再继续值得吗？」。0.9 是经验值，0.8 太早（loop 经常被打断，影响完成率），0.95 太晚（user 已经感觉到拖了）。
+源码没有附带阈值评测，也没有说明它们针对哪些 Claude 型号调过。因此不能从常量反推出“300 会误杀、800 会放过重复”之类的结论。
 
-**`500`（DIMINISHING_THRESHOLD）**：单次 turn 的 token 增量阈值。新增小于 500 token 通常意味着模型在 polish 而非有意义推进。500 是 Anthropic 内部测试出来的，300 容易误判（一个短确认加简短回答可能就触发），800 太宽（模型可能用 800 token 重复同样的话）。
-
-**`3`（continuationCount）**：连续多少轮小于 500 token 才算 diminishing。1 太敏感（偶发 short turn 触发），5 太迟（已经浪费了 5 个 turn 才停）。3 是个折衷。
-
-把三者组合：必须满足「预算超 90%」且「连续 3 次新增小于 500 token」才停。三条条件取 AND，避免 false positive。
-
-为什么 Claude Code 把这些写死成常量而不是配置项？因为这套阈值是为 Claude 模型加 4-Sonnet、4.5-Opus 调出来的，换 GPT 或 Gemini 需要重新校准。固定常量加注释更明确，外部调用方知道这是实测出来的而非随意编的。
-
-实操建议：移植到你自己的 agent 时，先用这三个数跑一周，看 transition.reason 分布。如果 `diminishing` 触发太多（误杀），把 500 调到 700。触发太少（loop 浪费），把 0.9 调到 0.85。
+移植时，把 `0.9 / 500 / 3` 当成待验证的默认值。记录每次 stop/continue、任务结果和人工复核，再调整其中一个变量；不要同时改三项，否则无法解释效果。
 
 **源码定位**：`claude-code/src/query/tokenBudget.ts:1-82`（完整算法）。
-**追问**：「为什么不用一个动态算法（如指数加权平均）？」维护成本远高于固定常量。Anthropic 实测三个常量已能覆盖 95% 场景，剩下 5% 让 user 用 `--max-turns` 兜底。
+**追问**：「为什么不用一个动态算法（如指数加权平均）？」固定常量更容易审阅，但源码只展示了 `0.9 / 500 / 3`，没有随附评测样本。换模型或任务后，应重新记录 stop/continue 结果，再决定是否调整。
 </details>
 
 <details>
@@ -458,12 +437,12 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 为什么要标签化？三个原因：
 
 1. **监控可读性**：看 dashboard 时区分「这次正常完成」和「这次被预算砍掉」一目了然，不用看完整 trajectory。
-2. **聚合分析**：统计一周内 `token_budget_exhausted` 占比，如果超过 20% 说明 budget 太紧或 prompt 设计有问题。
+2. **聚合分析**：按周观察 `token_budget_exhausted` 占比与任务成功率的关系。先建立基线，再决定告警阈值；单个比例不能独立解释是预算太紧还是 prompt 有问题。
 3. **重试策略**：`max_tokens` 可以自动 retry（增大 budget），`error` 不可以，`permission_denied` 提示用户而非 retry。标签让自动化流程有依据。
 
 **反例**：如果你的 agent loop 只返回 `success: bool`，监控完全分不出「完成了」和「被 budget 砍了，任务没做完」。这两个 case 的处理策略完全不同。
 
-实操建议：哪怕你的 agent 只有最简单 loop，至少标记 3 个标签：`completed`、`truncated`、`error`。`transition.reason: truncated` 是 production agent 的标配。
+实操建议：从能驱动处理逻辑的标签开始，例如 `completed`、`truncated`、`error`。字段名不是行业标准；关键是调用方能区分是否可重试、是否需要人工处理。
 
 **源码定位**：`claude-code/src/query.ts` 全文 grep `transition` 看所有 reason 类型。
 **追问**：「OpenClaw、Codex、Hermes 也有 transition reason 吗？」有但不一样。Codex 走 `metric: GOAL_BUDGET_LIMITED_METRIC` 这类指标，OpenClaw 用 `LoopDetectorKind`，Hermes 直接在 grace call 里写理由。
@@ -474,7 +453,7 @@ Hermes 选了「短期不严格、长期收敛」的路。代价是单 loop 没�
 
 非 coding 场景没有天然的外部判官，需要**自己造**一个。常用 4 种思路：
 
-**方案 1：Schema 校验**。要求输出是结构化的（JSON schema、TypeScript interface）。「周报必须有 5 个 section：本周完成、下周计划、blocker、metrics、链接」。每段长度至少 X 字符。Schema 不过等于任务未完成。
+**方案 1：Schema 校验**。要求输出是结构化的（JSON schema、TypeScript interface）。「周报有本周完成、下周计划、blocker、metrics、链接」。Schema 只能验证字段、类型和约束，不能判断事实是否正确或内容是否有用。
 
 ```ts
 interface WeeklyReport {
@@ -486,31 +465,31 @@ interface WeeklyReport {
 }
 ```
 
-Schema 是硬 verifier，结构不对就 reject，loop 强制继续。
+宿主可以把 schema 失败接成 reject 并让 loop 继续；这是工作流配置，不是 schema 自带的控制流。
 
 **方案 2：LLM-as-judge**。让一个独立的小模型读输出，按 rubric 打分。「评分小于 7 分则 loop 继续」。注意是**独立模型**（不是同一个 loop 的模型），避免自己评自己。Hermes 的 `evaluate()` 走这条路。
 
-**方案 3：人工 checkpoint**。某些场景（合规报告、合同审核）必须人审。把「等待人工 approve」当成硬 verifier，approve 之前 loop 不退出。Codex 的 `approval_mode: on-request` 就是这个机制。
+**方案 3：人工 checkpoint**。合规报告或合同审核可由宿主加入人工审批状态，并在批准前阻止发布或结束。Codex 的 `approval_mode: on-request` 面向工具调用审批，不等同于内容完成 checkpoint；宿主需要单独实现后者。
 
-**方案 4：参考样本对比**。维护一份 5-10 个高质量样本（黄金标准）。生成完用 embedding similarity 比对（cosine 大于 0.7），低于阈值则 loop 继续。适合「同一类任务反复做」的场景（如客服回复、固定模板）。
+**方案 4：参考样本对比**。维护一组经人工确认的样本，生成后用 embedding similarity 做辅助信号。样本数量和 cosine 阈值必须按任务校准；相似不等于正确，不能单独决定继续或停止。
 
 实际选型：
 
 - 周报：方案 1（schema 校验，最简单）。
 - 调研：方案 2（LLM judge，rubric 有 3-5 维度：覆盖度、引用数、深度）。
-- 合规报告：方案 3（人工 checkpoint，必须）。
+- 合规报告：按组织流程接人工 checkpoint。
 - 客服回复：方案 4（embedding 对比）。
 
 混合也很常见：方案 1 加方案 2 组合。先 schema 卡住格式，再 LLM judge 卡住质量。
 
 **源码定位**：[`hermes-agent/environments/benchmarks/yc_bench/yc_bench_env.py:475`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/environments/benchmarks/yc_bench/yc_bench_env.py#L475)（evaluate() 实现），schema 验证可参考任何 JSON schema 库。
-**追问**：「LLM judge 不会有偏见吗？」会。校准方法：拿 100 个人工标注样本跑一次，看 LLM judge 跟人工的 agreement rate。如果小于 70% 要么换 prompt 要么换 judge model。
+**追问**：「LLM judge 不会有偏见吗？」会。先准备一组人工标注样本，按任务类型比较 judge 与人工的一致率，并由团队预先定义可接受门槛；低于门槛时再调整 prompt 或模型。
 </details>
 
 <details>
-<summary>**Q7 · 架构**：Hermes 的 verifier 设计被吐槽「单 loop 几乎没硬 verifier」，但它能在长期任务上效果不错，为什么？</summary>
+<summary>**Q7 · 架构**：Hermes 没有单 loop 硬门禁，跨会话反馈补上了什么，又没补上什么？</summary>
 
-Hermes 选了「短期不严格，长期收敛」的设计哲学，靠**跨 session 的 memory 累积**补偿单 loop 的弱判定。具体三件事：
+Hermes 用跨 session memory 保存历史反馈，但这是一条可用机制，不是长期收敛的证据。源码里可以看到三件事：
 
 **事件回放**：每个 session 的 trajectory 都写进 SQLite（`agent/insights.py` 分析），`memory_manager.prefetch_all()` 在每次 loop 开始前注入「上次类似任务哪里出错」「哪里做对」的经验。所以单 loop 没硬 verifier，但**模型有上下文知道哪里容易出错**。
 
@@ -518,9 +497,9 @@ Hermes 选了「短期不严格，长期收敛」的设计哲学，靠**跨 sess
 
 **Grace call 兜底**：Iteration budget 耗尽时强制让模型做最后一次「总结当前状态」的调用，输出会保留下来给下次会话作 memory。这样即使 loop 强行结束，下次启动时模型能从总结里看到「上次卡哪儿了」。
 
-**为什么对长期任务有效？** 因为长期任务的关键不是「这次必须完美」，而是「整体趋势向完成靠近」。Hermes 的 trajectory 加 memory 加 skill 三件套合起来形成一种跨 session learning，比单 loop verifier 更适合长期 agent。
+**它可能解决什么？** 后续会话能读到先前轨迹、skill 约束和收尾摘要，减少上下文完全丢失。收益要用重复任务成功率、人工纠错量和 memory 污染率验证。
 
-**为什么对短期任务弱？** 一次性 CI 任务、自动 merge PR 这种需要外部信任的场景，Hermes 没法保证。这就是为何 Codex 在 CI 场景压制 Hermes。
+**它没解决什么？** 一次性 CI 或自动 merge 仍需要当前运行的外部 oracle。Codex 更容易接 coding 信号；这不等于对所有 CI 工作负载有已测优势。
 
 实操建议：
 
@@ -537,13 +516,13 @@ Hermes 选了「短期不严格，长期收敛」的设计哲学，靠**跨 sess
 
 需要，因为两者解决的问题不一样。
 
-`max_iterations`、`wall_clock_timeout` 是**硬上限**（hard cap），保证 loop 不会无限跑。它们的角色是「电源保险丝」：确保 worst case 系统不会失控。
+`max_iterations`、`wall_clock_timeout` 是**硬上限**（hard cap），用来限制 loop 的运行时间和花费。它们像「电源保险丝」，只能约束一类失控路径，不能证明任务正确或消除所有运维风险。
 
 Verifier 是**决策层**，告诉系统**这次该停了**（在硬上限之前）。它的角色是「方向盘」：让 loop 知道何时是合适的退出点。
 
 只有硬上限的问题：
 
-- **过早停止**：loop 还在做有意义的事，max_iterations 到了就 cut，任务 50% 进度被 truncate。
+- **过早停止**：loop 还在推进时触达 `max_iterations`，未完成任务被截断。
 - **过晚停止**：loop 已经在原地打转 10 轮了，max_iterations 等于 30 还没到，浪费 20 轮 token。
 - **看不出原因**：日志只看到 `iteration_exceeded`，分不出「任务太大没做完」和「loop 卡住了」。
 
@@ -553,12 +532,12 @@ Verifier 是**决策层**，告诉系统**这次该停了**（在硬上限之前
 - 硬 verifier 判任务完成，第 8 轮就停（不用走完 max_iterations）。
 - transition.reason 区分「task_complete」「diminishing」「loop_stuck」「iteration_max」「timeout」5 种，监控可读。
 
-**实际工程比例**：硬上限触发的真实生产 case 通常小于 5%。verifier 在 50% 以上的 loop 中决定了退出时机。所以 verifier 才是主力，硬上限是兜底。
+硬上限和 verifier 各自触发多少次，取决于任务集、预算和模型。把 `transition.reason` 记入日志，才能知道哪个机制在你的系统里是主力，哪个只是兜底。
 
 实操建议：起步阶段先把硬上限做对（max_turns、token_budget、wall_clock），同时立刻加 transition.reason 标签。verifier 哪怕只做最简单的 diminishing returns 也能让监控立刻可读。
 
 **源码定位**：Claude Code 的 `tokenBudget.ts` 是 verifier 与硬上限结合的范例。Codex 的 `goals.rs` 把两者都装进状态机。
-**追问**：「Wall clock timeout 设多少合适？」90% 的 agent 任务在 5 分钟内完成，所以 timeout 设 10-15 分钟。设 60 分钟以上意味着你应该让任务跑后台（chapter 18 cron、background tasks）而不是 sync 等。
+**追问**：「Wall clock timeout 设多少合适？」不要把别人的任务分布当默认值。先记录自己的 wall-clock 分布，再按 p95/p99 和可接受的等待时间设 timeout；长任务才考虑转到后台（chapter 18 cron、background tasks）。
 </details>
 
 <details>
@@ -600,15 +579,15 @@ Verifier middleware 是把「判断 loop 该不该停」这件事变成可插拔
 
 三层架构：
 
-**Layer 1 · 硬上限（永远启用）**：
+**Layer 1 · 资源上限（按运行风险配置）**：
 
 ```ts
 { max_iterations: 30, token_budget: 100_000, wall_clock_seconds: 600 }
 ```
 
-任何 agent 都强制有这三个。这是 verifier 的兜底。
+这三个数只是接口示例，不是推荐默认值。短任务可只设关键上限；长任务需要结合单次成本、并发和副作用校准。
 
-**Layer 2 · 软 verifier（默认启用、可调）**：
+**Layer 2 · 软 verifier（可选实验配置）**：
 
 ```ts
 {
@@ -618,7 +597,7 @@ Verifier middleware 是把「判断 loop 该不该停」这件事变成可插拔
 }
 ```
 
-参考 Claude Code 算法加 OpenClaw 检测器，作为默认。
+这里复用了 Claude Code 当前快照的常量和 OpenClaw detector 名称，只适合作为待校准起点。
 
 **Layer 3 · 硬 verifier（user 注册）**：
 
@@ -633,7 +612,7 @@ Verifier middleware 是把「判断 loop 该不该停」这件事变成可插拔
 { verifiers: [human_approve, response_length_min(100)] }
 ```
 
-每个硬 verifier 是一个 `(state) => { passed: bool; reason: string; can_retry: bool }` 函数。loop 在每个 turn 结束时跑一遍所有 verifier，**全部通过**才允许放任型 verifier 收尾。
+每个 verifier 可以返回 `(state) => { passed: bool; reason: string; can_retry: bool }`。哪些检查采用 all-pass、投票或人工覆盖，应由宿主根据误判代价配置；下面代码只是本站的接口草案。
 
 **Transition reason 标签**：
 
@@ -665,9 +644,9 @@ console.log(result.transition.reason);
 
 **为什么不全部沿用 Codex？** Codex 的硬 verifier 写死在 GoalRuntimeEvent 里，非 coding 场景没法用。我的设计把硬 verifier 抽成 user-supplied 函数，coding 场景塞 tests，非 coding 场景塞 schema 或 judge。
 
-**为什么不全部沿用 OpenClaw？** OpenClaw 中间件灵活但默认什么都没开，每个项目要自己装。我的设计提供合理默认（token budget 加 2 个 detector）让小项目零配置可用。
+**为什么不全部沿用 OpenClaw？** OpenClaw 让宿主自行装配检查。这里给出 token budget 加两个 detector 的示例 preset，实际默认值必须通过目标任务的误报、漏报和成本数据决定。
 
-工程量：约 4-6 周一人，外加 1 周写 docs。比照搬任何一家都轻，但 cover 80% 实际场景。
+工程量要从 verifier 数量、宿主接入点、回放存储和评测样本倒推；在这些范围明确前，固定周数没有参考价值。
 
 **源码定位**：综合参考 [`codex/codex-rs/core/src/goals.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/goals.rs)、`claude-code/src/query/tokenBudget.ts`、[`openclaw/src/agents/tool-loop-detection.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/tool-loop-detection.ts)。
 **追问**：「这套框架能开源吗？」能。Verifier 抽象不依赖具体 model provider，跟 LangChain 这种偏 protocol 的框架正交。可作为独立 lib（`@agent/verifier-kit`）发到 npm。

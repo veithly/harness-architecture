@@ -1,6 +1,9 @@
 ---
-title: 04 · 工具系统
-description: schema / dispatch / 权限 / 协议适配：四家把工具"装上 agent"的真正方法
+title: 04 · 工具系统：调用能执行，也能拦住
+description: 设计可验证的 tool schema、dispatch 和权限链，知道何时串行、并行或拒绝调用。
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 sidebar:
   order: 4
 ---
@@ -8,29 +11,17 @@ sidebar:
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## 工具边界从 schema 开始
+## 工具调用先过哪一道门
 
-<Verdict tldr="工具系统是 agent 跟世界交互的唯一通道。没有工具，agent 只能输出文字（没法读文件、没法跑命令、没法发请求）。但给 agent 加工具远比想象的复杂，需要回答五个问题：用什么 schema 描述工具（让模型理解参数和返回值）；多个工具同时被模型要求调用时是串行还是并行（并行快但失败处理复杂）；工具调用前怎么做权限拦截（不能让模型随便 `rm -rf /`）；MCP（Model Context Protocol）怎么集成（让 agent 接入外部工具生态）；不同模型的协议差异（OpenAI 的 function calling、Anthropic 的 tool_use、Gemini 的 function declarations）怎么屏蔽。四家答案完全不同。Codex 走 Responses function_tool 加 apply_patch 内嵌 DSL 加 execpolicy 三维矩阵路线，apply_patch 走特例避开 function args 大小限制能塞下任意大 diff，execpolicy 每条命令过 allow、ask、deny 三档审查，配合 approval_mode 和 sandbox_mode 形成三维权限矩阵。Claude Code 走 tool_use block 加同 turn 多工具并行加 canUseTool 钩子加 permission mode 路线，代码自己数 tool_use block 不信 stop_reason，permission mode 四档（plan、acceptEdits、bypassPermissions、default）一键切场景。OpenClaw 走 tool-catalog 11 大类加 tool-policy-pipeline 中间件链加 4 档 profile 路线，按场景预配置工具集，三个 hook 点（before_tool_call、after_tool_call、tool_result_persist）让权限和审计完全中间件化。Hermes 走 registry 单源加 adapter 多协议加 skills_guard 硬 deny 路线，registry 只写一次工具定义，三个 adapter 各自翻译成 OpenAI、Anthropic、Gemini 格式。要做 coding agent 参考 Codex execpolicy 加 apply_patch，要做 IDE 工具参考 Claude Code 并行 dispatch 加 permission mode，要做企业级控制面参考 OpenClaw 11 大类加中间件链，要做多模型兼容参考 Hermes registry 加 adapter。" />
+<Verdict tldr="工具一旦能写文件、发请求或启动进程，schema 的方便就会和权限的可控发生冲突。本文追踪一次 tool call 经过协议、dispatch 和 policy 的路径，比较只在并行、隔离或多模型兼容改变决策时才展开。" />
 
-## 一套工具栈的四层
+## 先把工具边界写清楚
 
-<details>
-<summary>读前提示（按需展开）</summary>
-
-- **工具系统是 agent 跟世界交互的唯一通道**：要答五个问题——schema、并行 dispatch、权限拦截、MCP 集成、多模型协议差异。
-- **权限层分歧最大**：Codex 用 execpolicy 加 approval_mode 加 sandbox_mode 三维矩阵，Claude Code 用 permission mode 四档，OpenClaw 用 tool-policy-pipeline 中间件链，Hermes 用 skills_guard 硬 deny。
-- **dispatch 策略决定响应速度**：并行快但失败处理复杂。
-- **自己动手第一优先**：先做工具调用前的权限拦截，不能让模型随便 rm -rf /。
-
-</details>
-
-任意一个 agent 的工具栈都是 4 层：
+为了比较，本文把工具栈拆成 4 层：
 
 <Diagram
   src="/diagrams/04-tool-system-base.svg"
@@ -52,29 +43,29 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## 四套工具系统，四种边界
+## 只比较会改变执行决策的实现
 
 ### Codex · function_tool 加 apply_patch DSL 加 execpolicy 形成三维权限矩阵
 
-Codex 在 工具系统上的出发点是：作为 OpenAI 自家的 coding agent，应该最大化复用 OpenAI 自己的 Responses API 能力（function_tool）而不是发明新协议。但 function calling 在大 patch 场景下有硬伤，function arguments 通常上限 8-16K token，一个真实的 refactor patch 经常上千行函数调用根本塞不下，这个工具必须特殊处理。
+Codex 在工具系统上的出发点是复用 Responses API 的 `function_tool`，而不是再发明一套协议。大 patch 会碰到 provider 和模型各自的输入限制；当前源码没有一个可移植的容量上限，因此 `apply_patch` 采用了不同的承载方式。
 
-同时，coding agent 跑命令的风险远高于聊天 agent（可能 `rm -rf /`、可能修改系统配置），必须有比 sandbox 更早一层的命令级审查。
+同时，coding agent 会直接触碰文件和进程。命令策略、用户审批和 sandbox 解决的是不同边界，是否需要每一层取决于部署威胁模型。
 
-工具注册大部分走标准 Responses function_tool 路线，每个工具是 JSON schema（参数、返回值、描述都用 schema 表达）。`apply_patch` 是唯一的特例。它不走标准 function call，而是把 V4A diff 格式（详见 06 章）直接教给模型，让模型在 assistant message 里 inline 输出整段 patch，由 Rust 端的 `apply-patch` crate 解析执行。
+工具注册大部分走标准 Responses function_tool 路线，每个工具是 JSON schema（参数、返回值、描述都用 schema 表达）。在这个源码快照里，`apply_patch` 是一个特例。它不走标准 function call，而是把 V4A diff 格式（详见 06 章）直接教给模型，让模型在 assistant message 里 inline 输出整段 patch，由 Rust 端的 `apply-patch` crate 解析执行。
 
-这种内嵌 DSL 设计专门为了塞下任意大的 diff（function args 上限不约束消息正文）。
+这种内嵌 DSL 把 patch 从 function-call 参数移到 assistant 输出；容量边界因此改变，但仍受上下文、输出和 provider 限制，不能理解为无限大。
 
-权限层叫 `execpolicy`（详见 07 章），是 Codex 工程细节最多的部分之一。每次 shell 命令执行前过一道规则审查（allow、ask、deny 三档），规则用 Starlark DSL（一种类 Python 的配置语言）描述，可以 git 入仓、可以自带测试用例（match、not_match 让 CI 验证规则正确性）。
+权限层叫 `execpolicy`（详见 07 章），是 Codex 中实现较集中的部分之一。每次 shell 命令执行前过一道规则审查（allow、ask、deny 三档），规则用 Starlark DSL（一种类 Python 的配置语言）描述，可以 git 入仓、可以自带测试用例（match、not_match 让 CI 验证规则正确性）。
 
 这套命令级审查配合 `approval_mode` 三档（auto 自动批准、on-request 按需问用户、off 关闭审批）和 `sandbox_mode` 三档（read-only 只读、workspace-write 工作区可写、danger-full-access 全开），形成一个三维权限矩阵（命令 × 审批 × 沙箱）。
 
-Codex 用户在不同场景下选不同组合（CI 跑可以 auto 加 workspace-write，本地 dev 可以 on-request 加 read-only），灵活度极高。
+Codex 用户可以按场景组合这些模式（例如自动化任务用 auto 加 workspace-write，本地开发用 on-request 加 read-only）；可组合项较多，但效果仍要按部署边界验证。
 
-MCP 支持在 `codex-rs/mcp-client`、`codex-rs/mcp-server`、`codex-rs/mcp-protocol`、`codex-rs/mcp-types` 四个 crate 里完整实现（同时支持作为 MCP client 调外部服务、作为 MCP server 让外部 IDE 调用）。MCP 工具被注册成普通 function_tool 对模型透明。模型看到的是「这里有这些工具可用」，不区分本地工具还是 MCP 工具，简化模型决策。
+MCP 相关实现分布在 `codex-rs/mcp-client`、`codex-rs/mcp-server`、`codex-rs/mcp-protocol`、`codex-rs/mcp-types` 四个 crate 中，覆盖 client、server、protocol 和 types。MCP 工具被注册成普通 function_tool；在模型接口上，本地工具和 MCP 工具使用同一种 schema。
 
 ### Claude Code · 同 turn 多工具并行加 canUseTool 钩子加 permission mode 四档
 
-Claude Code 在 工具系统上的出发点是：作为 IDE 集成的 coding agent，一次用户请求经常需要多个独立工具配合（比如修这个 bug 要同时 Read 多个文件、Grep 关键字、Glob 找类似 pattern）。串行跑用户要等好几秒，并行跑体验立刻流畅。Anthropic 的 tool_use block 协议天然支持一个 assistant message 里多个 tool_use block，Claude Code 把这个能力完全用上。
+Claude Code 在工具系统上的出发点是：作为 IDE 集成的 coding agent，一次用户请求经常需要多个独立工具配合（比如修这个 bug 要同时 Read 多个文件、Grep 关键字、Glob 找类似 pattern）。串行会增加往返等待，并行可减少等待，但也要处理部分失败。Anthropic 的 tool_use block 协议支持一个 assistant message 里多个 tool_use block，Claude Code 用它来并行调度。
 
 实际实现用 Anthropic 原生的 tool_use block 协议。模型在 assistant message 里输出多个 tool_use block（每个 block 一个工具调用），harness 收完整个 message 后扫一遍所有 tool_use block，全部塞给 `dispatchToolUseBlocks` 用 Promise.all 并行执行。
 
@@ -83,13 +74,13 @@ Claude Code 在 工具系统上的出发点是：作为 IDE 集成的 coding age
 权限层有两个机制配合：
 
 - `canUseTool` 钩子允许 runtime 在每次工具调用前做过滤。一个工具被拒，harness 拼出一个 deny tool_result（带拒绝原因）回给模型，让模型自己看到「这次不能调」然后换个方案（而不是直接 throw error 中断 loop）。
-- `permission mode` 四档提供场景模式一键切换：`plan` 模式把工具调用层完全关掉强制模型只能在 text 块里说话（做 PRD 设计、需求讨论时用），`acceptEdits` 编辑工具自动批准（专注 coding 时用），`bypassPermissions` 全自动批准（CI 跑测试用），`default` 逐个问用户（默认安全模式）。
+- `permission mode` 四档提供场景模式切换：`plan` 关闭工具调用，`acceptEdits` 自动批准编辑，`default` 按调用询问；`bypassPermissions` 会跳过权限询问，只有在隔离且受信任的自动化环境中才应显式启用，不能当作 CI 默认。
 
-内置工具集（Edit、Read、Bash、Glob、Grep、Task、TodoWrite、WebFetch、WebSearch 等 12 多个工具）加 MCP 工具一起进 tool_use schema 对模型透明。模型不需要区分这是内置工具还是 MCP 工具，只看 schema 决定调用，降低决策复杂度。
+内置工具集（Edit、Read、Bash、Glob、Grep、Task、TodoWrite、WebFetch、WebSearch 等）加 MCP 工具一起进入 tool_use schema。模型在同一接口上根据 schema 决定调用，不需要处理两套协议。
 
-### OpenClaw · 工具栈拆成 11 大类加 4 档 profile 加中间件链，工程细节最多
+### OpenClaw · 工具栈拆成 11 大类加 4 档 profile 加中间件链
 
-OpenClaw 在 工具系统上的出发点是：作为通用 agent 控制面（同时支持 coding、messaging、automation 等多种工作负载），工具不能像 Codex 那样一坨 coding 工具堆在一起。messaging 场景的 agent 不需要 fs 工具，coding agent 不需要 messaging 工具，强行让所有工具都对所有场景开放只会让模型决策更难（工具列表太长选错率上升）。
+OpenClaw 在工具系统上的出发点是：作为通用 agent 控制面（同时支持 coding、messaging、automation 等多种工作负载），不同场景需要不同工具面。messaging 场景的 agent 通常不需要 fs 工具，coding agent 通常不需要 messaging 工具；把所有工具同时开放可能增加选择负担，实际影响要用任务日志验证。
 
 OpenClaw 把工具按职能分大类，每个工具明确归属某些场景 profile，启动时按 profile 过滤。一个 messaging agent 启动时只看到 messaging、web、memory 这几类工具。
 
@@ -117,9 +108,9 @@ const CORE_TOOL_SECTION_ORDER: Array<{ id: string; label: string }> = [
 
 </SourceBlock>
 
-`ToolProfileId` 4 档分别对应不同 agent 形态：`minimal`（最小工具集，比如纯聊天 agent）、`coding`（开 fs、runtime、web 等 coding 必需类）、`messaging`（开 messaging、web、memory，专门给客服、通讯 agent 用）、`full`（全开，给万能助理用）。这种按场景预配置让企业部署时不需要逐个工具决策，选 profile 一键完成。
+`ToolProfileId` 4 档分别对应不同 agent 形态：`minimal`（最小工具集，比如纯聊天 agent）、`coding`（开 fs、runtime、web 等 coding 常用类）、`messaging`（开 messaging、web、memory，给客服、通讯 agent 用）、`full`（全开，给需要较宽工具面的 agent 用）。这种按场景预配置可以减少逐项配置，但仍要检查 profile 是否覆盖部署需求。
 
-`tool-policy-pipeline.ts` 是 OpenClaw 工程细节最多的地方。把「工具调用前后该做什么」全部做成中间件链。`before_tool_call`（调用前）、`after_tool_call`（调用后）、`tool_result_persist`（结果持久化）三个 hook 点都可注册外部 plugin，让权限检查、审计、缓存、mocking 等都中间件化。想给某个工具加「调用前过 LLM 判断意图是否符合公司政策」的检查？
+`tool-policy-pipeline.ts` 是 OpenClaw 中实现较集中的部分。它把「工具调用前后该做什么」组织成中间件链。`before_tool_call`（调用前）、`after_tool_call`（调用后）、`tool_result_persist`（结果持久化）三个 hook 点都可注册外部 plugin，让权限检查、审计、缓存、mocking 等逻辑进入同一条管线。想给某个工具加「调用前过 LLM 判断意图是否符合公司政策」的检查？
 
 写个 plugin 注册到 `before_tool_call` 即可。
 
@@ -129,13 +120,13 @@ const CORE_TOOL_SECTION_ORDER: Array<{ id: string; label: string }> = [
 - `tool-fs-policy.ts`：文件系统专用的二级权限层（详见 06 章 workspaceOnly 设计，不同于通用的 hook）。
 - `tool-mutation.ts`：把工具调用结果做加工再回给模型（比如自动截断超长结果、屏蔽敏感字段、添加上下文 hint）。
 
-这十几个文件加起来构成了 OpenClaw 的工具中间件能力上限。
+这些文件共同构成了该源码快照里的工具中间件实现。
 
-工具事件桥到独立的 `tool` 流（`subscribeEmbeddedPiSession`），订阅这个流的外部观察者能看到所有工具活动（每个 tool call 一个事件 + 参数 + 结果）。这是审计 / 调试 / 监控的核心入口：企业部署时可以挂个外部 logger 订阅这条流把所有工具调用写库，事后追溯不需要从 rollout 文件里捞。
+工具事件桥到独立的 `tool` 流（`subscribeEmbeddedPiSession`），订阅者可以接收该流公开的 tool call、参数和结果事件。它可作为审计、调试和监控的一个入口；企业部署仍要按敏感字段、留存和完整性要求设计外部日志。
 
 ### Hermes · 单源 registry 加多模型 adapter 加 skills_guard 硬 deny
 
-Hermes 在 工具系统上的出发点是：长跑 agent 经常需要换模型（一个任务 GPT 便宜、一个任务 Claude 强、一个任务 Gemini 多模态好）。如果工具定义跟模型协议绑定，每换一次模型就要重写工具，这成本不能接受。Hermes 必须把工具定义和模型协议解耦：工具定义用一种统一格式，runtime 按当前模型翻译成对应协议。
+Hermes 在工具系统上的出发点是：长跑 agent 可能需要换模型（例如分别选择 GPT、Claude 或 Gemini）。如果工具定义跟模型协议绑定，每次切换都会增加维护成本。Hermes 因此把工具定义和模型协议解耦：工具定义用一种统一格式，runtime 按当前模型翻译成对应协议。
 
 实际实现是 registry 里只写一次工具定义（用 OpenAI function calling 风格作为 internal 格式，因为这是社区最广泛支持的格式），三个 adapter 文件各自负责一种协议：
 
@@ -143,7 +134,7 @@ Hermes 在 工具系统上的出发点是：长跑 agent 经常需要换模型�
 - `bedrock_adapter.py`：处理 AWS Bedrock 的 Anthropic 模型（基本同 anthropic_adapter 但有些 Bedrock 特有的字段）。
 - `gemini_native_adapter.py`：处理 Gemini 的 functionDeclarations 加 functionCall 格式（注意 thinking 模式与 text content 混合的处理）。
 
-三个 adapter 的存在让换模型这件事变成改一行配置而不是改全部工具。
+三个 adapter 让工具定义可以复用；切换模型通常只需调整 provider 配置，但协议差异仍要通过集成测试核对。
 
 权限层走 per-tool permission check 加 skills_guard 双层。`skills_guard` 是硬 deny 工具，在每次 dispatch 前用一个独立 LLM 判断这次调用是不是合法或危险（比如 `rm -rf /`、试图读 `~/.ssh`、试图执行 `curl | bash` 等危险路径），命中就直接拦截不让工具执行。
 
@@ -151,21 +142,21 @@ permission check 在每个工具函数内部（每个工具自己判断需不需
 
 工具默认串行执行（trajectory 模型假设单线时间轴。一个 trajectory 文件记录每一步发生的事，并发会让 trajectory 顺序混乱）。并行要显式 spawn subagent，subagent 自己独立一条 trajectory 加工具栈。这种设计让 trajectory 始终是一条线性故事，调试、复盘、训练数据生成都方便。
 
-MCP 通过 runtime 配置注入：`~/.hermes/config.json` 里写 `mcp_servers` 字段，运行时 server 把每个 MCP tool 桥接成 registry 中的普通 tool 对模型透明。这种设计让 MCP 工具的扩展性极好：用户安装新 MCP server 只需改 config，不用改 Hermes 源码。
+MCP 通过 runtime 配置注入：`~/.hermes/config.json` 里写 `mcp_servers` 字段，运行时 server 把每个 MCP tool 桥接成 registry 中的普通 tool。这个路径把新增 MCP server 主要收敛为配置变更，通常不用改 Hermes 源码。
 
-## 工具系统已经形成的共识
+## 先固定 schema、policy 和 trace
 
-四家在工具系统设计上有四个明显的共同认知，这是所有 agent 都该遵循的工程底线：
+四个样本在工具系统设计上有四个可复用的观察；是否采用仍要按工具副作用和部署场景验证：
 
-**1 · 工具签名必须用 JSON schema 描述（不是自然语言）**：四家都用 JSON schema 表达工具的输入参数和返回值类型。即使是 Codex 的 apply_patch 这种 DSL，schema 槽位也保留（参数等于 `diff` 字符串）。原因简单：模型对 JSON schema 的解析准确率显著高于自然语言（schema 是结构化约束，模型不用猜参数类型和是否必填），工具调用失败率能从 10% 降到 1% 以下。
+**1 · 工具签名用 JSON schema 描述，而不是只写自然语言**：四家都用 schema 表达工具输入。即使是 Codex 的 apply_patch DSL，也保留了结构化槽位。schema 能让类型、必填项和校验错误显式化；具体调用失败率要在目标模型和工具集上测。
 
-**2 · 必须有显式权限层（不论实现方式）**：四家都有专门的 permission 层（不管是 execpolicy、canUseTool、tool-policy-pipeline、per-tool check），从不让工具直接执行没有任何拦截。这是 agent 安全的最低底线。一个能 `rm -rf /` 的 agent 在生产环境是定时炸弹。
+**2 · 高影响工具要有显式权限层**：四个样本都在工具执行前提供某种拦截（execpolicy、canUseTool、tool-policy-pipeline 或 per-tool check）。是否需要审批、隔离或拒绝，仍要按工具副作用和部署威胁模型配置；不要把一个样本的默认模式当成通用安全底线。
 
-**3 · 必须支持 MCP（让 agent 接外部生态）**：四家都支持 MCP，但桥接方式不同。Codex 用专门的四个 crate（mcp-client、mcp-server、mcp-protocol、mcp-types）把 MCP 做成一等公民。OpenClaw 通过 plugin 机制接入。Claude Code 和 Hermes 把 MCP 工具吃成普通 tool 对模型透明。MCP 是 2024 年开始 Anthropic 推动的工具协议标准，已经形成生态（数百个 MCP server），不支持 MCP 等于跟整个生态隔绝。
+**3 · 如果要接外部工具，再评估 MCP**：四个样本都能接 MCP，但桥接方式不同。Codex 用独立 crate，OpenClaw 走 plugin，Claude Code 和 Hermes 把 MCP 工具映射成普通 tool。MCP 能降低接入成本，但并非每个 agent 都需要；引入前还要评估供应链、权限和可观测性。
 
-**4 · 工具调用必须有事件流（用于审计、调试）**：四家都把工具调用做成可观察的事件流（trajectory、tool stream、event stream）。每次工具调用都是一个独立事件（哪个工具、什么参数、什么结果、什么时间），外部观察者订阅就能完整还原 agent 行为。这是企业生产环境的硬要求，出问题必须能追溯。
+**4 · 有副作用的工具要留下可检索记录**：四个样本都暴露了不同形式的 rollout、trajectory 或 tool event。是否单独建立事件流取决于审计和调试需求；至少要记录工具、参数摘要、结果状态和时间，并处理敏感数据。
 
-## 粒度、权限与并行怎么取舍
+## 把速度和拒绝路径放在一起
 
 <Diagram
   src="/diagrams/04-tradeoff.svg"
@@ -175,46 +166,42 @@ MCP 通过 runtime 配置注入：`~/.hermes/config.json` 里写 `mcp_servers` �
 
 四家代表了工具系统设计的四种典型取舍：
 
-**做 coding agent 加复用 OpenAI Responses 生态**：参考 Codex 的 function_tool 加 apply_patch DSL 加 execpolicy 路线。直接对接 OpenAI Responses API（不用发明协议）。apply_patch 用 DSL 解决大 diff 问题。execpolicy 三维权限矩阵覆盖几乎所有 coding 场景的安全需求。代价是二开钩子止于 execpolicy（想加自定义 verifier、自定义中间件只能 fork），非 coding 场景没有等价的硬权限层。适合 OpenAI 生态内的 coding agent。
+**做 coding agent 加复用 OpenAI Responses 生态**：参考 Codex 的 function_tool 加 apply_patch DSL 加 execpolicy 路线。直接对接 OpenAI Responses API（不用发明协议）。apply_patch 用 DSL 改变大 diff 的承载方式。execpolicy 三维权限矩阵覆盖命令执行这一类 coding 风险，但不能代替其他安全边界。代价是二开钩子止于 execpolicy（想加自定义 verifier、自定义中间件通常需要 fork 或包裹），非 coding 场景没有等价的命令级权限层。适合 OpenAI 生态内的 coding agent。
 
-**要工具调用极致体验（多工具并行加灵活权限模式）**：参考 Claude Code 的 tool_use 加并行 dispatch 加 permission mode 路线。同一 turn 多工具并行让用户体验流畅。canUseTool 钩子让 runtime 能动态过滤工具。permission mode 四档（plan、acceptEdits、bypassPermissions、default）一键切换适应不同场景。代价是 stop_reason 不可靠要自己数 block（已经处理），钩子接入点有限（只有 canUseTool 一个 hook，没有 OpenClaw 那种完整中间件链）。适合 IDE、桌面、工具型 agent。
+**需要同一轮多工具并行和多种权限模式**：参考 Claude Code 的 tool_use 加并行 dispatch 加 permission mode 路线。同一 turn 的独立工具并行可以减少等待；canUseTool 钩子让 runtime 动态过滤工具。permission mode 四档（plan、acceptEdits、bypassPermissions、default）按场景切换。代价是 stop_reason 不可靠要自己数 block，钩子接入点也较少，没有 OpenClaw 那样的多层中间件链。适合 IDE、桌面、工具型 agent。
 
-**做企业级控制面（最强中间件能力加多场景 profile）**：参考 OpenClaw 的 tool-catalog 加 tool-policy-pipeline 加 profile 路线。11 大类加 4 档 profile 让多场景部署一键切换。tool-policy-pipeline 中间件链让权限、审计、缓存、mocking 全部插件化。十几个专门工具子系统（loop detection、fs policy、mutation 等）覆盖企业级所有诉求。代价是钩子多了调试链路长（一个工具调用要过 5-6 层中间件，出问题难定位），profile 4 档对极端定制场景仍嫌粗。适合 SaaS、多租户、企业 agent 平台。
+**需要多租户控制面和多种工具 profile**：可以看 OpenClaw 的 catalog、policy pipeline 和 profile。中间件承载权限、审计、缓存和 mocking；代价是调试链路更长，4 档 profile 对定制部署也可能过粗。
 
-**做多模型兼容（同一套工具跑 OpenAI、Anthropic、Gemini）**：参考 Hermes 的 registry 加 adapter 路线。一份 registry 定义跑三种协议。skills_guard 在 dispatch 前用 LLM 判断危险动作（比硬编码规则更灵活）。MCP 透明桥接让生态扩展容易。代价是默认串行不并行（trajectory 模型限制），权限分散在每个工具函数内部（难做全局策略改动）。适合长跑助理、跨模型实验、研究型 agent。
+**做多模型兼容（同一套工具跑 OpenAI、Anthropic、Gemini）**：参考 Hermes 的 registry 加 adapter 路线。一份 registry 定义跑三种协议。skills_guard 在 dispatch 前用 LLM 判断危险动作，能处理语义规则，也会引入模型误判。MCP 桥接缩短了外部工具接入路径。代价是默认串行不并行（trajectory 模型限制），权限分散在每个工具函数内部（难做全局策略改动）。适合长跑助理、跨模型实验、研究型 agent。
 
-## 我的判断：工具少一点，边界硬一点
+## 高风险工具先收紧策略
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★☆', reason: 'apply_patch DSL 加 Responses function_tool 加完整 MCP 4 crate 加 execpolicy 三维权限矩阵', risk: '二开只能 fork。非 coding 场景没有等价的硬权限层' },
-    { system: 'Claude Code', value: '★★★★★', reason: '同一 turn 多 tool_use block 并行 dispatch 加 canUseTool 钩子加 permission mode 加内置加 MCP 同栈', risk: '`stop_reason` 不可靠要自己数 block。钩子接入点有限，无 tool-policy 中间件链' },
-    { system: 'OpenClaw', value: '★★★★★', reason: '工具栈分得最细（tool-policy、tool-fs-policy、tool-mutation、tool-loop-detection 等十几个文件），中间件能力最强', risk: '钩子多了调试链路长。profile 4 档对极端定制场景仍嫌粗' },
-    { system: 'Hermes', value: '★★★★☆', reason: '一份 registry 定义跑三种协议加 skills_guard 硬 deny 加 MCP 透明桥接', risk: '默认串行不并行。权限分散在每个工具函数内部，难做全局策略' },
-  ]}
-  caption="评分依据：协议覆盖加中间件能力加 MCP 支持加权限层完整度"
-  headers={{ system: '系统', value: '评分', reason: '亮点', risk: '风险' }}
-/>
+| 工具约束 | 借鉴路线 | 代价或边界 |
+| --- | --- | --- |
+| 同一轮有独立、无副作用调用 | Claude Code 的并行 tool_use | 失败聚合和顺序语义要自己定义 |
+| 多模型协议需要统一 registry | Hermes adapter 与 schema 转换 | 最小公分母会丢 provider 特性 |
+| 多通道运行需要 policy middleware | OpenClaw tool-policy pipeline | 链路长，通常需要保留 trace；是否全量留存取决于审计与隐私边界 |
+| coding 工具需要严格 patch 和 shell 门禁 | Codex 的工具与 execpolicy | 抽象绑定 coding 工作流 |
 
-## 从最小工具系统开始
+## 从一个可拒绝的工具开始
 
-下面是从四家提炼的「自己写工具系统」配方。先把基础打牢，再加生产级特性，最后避开四个常见死路。
+自己写工具系统时，先把工具声明、执行结果和策略边界分开，再补观测、循环检测和 provider adapter。
 
 <BuildRecipe
   minimal={[
-    '工具用 JSON schema 表达（OpenAI function calling 风格起步）：schema 是结构化约束，比自然语言描述准确率高 10 倍以上。模型不用猜参数类型和是否必填，工具调用失败率从 10% 降到 1% 以下',
-    '加一层 permission check 在每个工具调用前过一次：不论是简单的 allowlist 或 denylist 还是复杂的 approval mode，都比直接执行安全得多。这是 agent 上生产的最低底线',
-    '保留工具调用日志（哪个工具、什么参数、什么结果、什么时间）：出问题必须能追溯（用户投诉 agent 改了我的文件时你需要看哪个工具改的、改了什么）',
+    '工具用 JSON schema 表达（可从 OpenAI function calling 风格起步）：schema 把参数类型和必填项变成可校验契约；用真实任务记录 parse error、missing field 和 wrong-tool rate',
+    '按工具风险做 permission check：只读查询、工作区写入和外部副作用不应共用一条默认规则。策略是否询问用户、拒绝或自动放行，应由威胁模型与部署边界决定',
+    '保留工具调用日志（哪个工具、什么参数、什么结果、什么时间）：出问题时应能追溯（用户投诉 agent 改了我的文件时，需要知道哪个工具改了什么）',
     '提供 dry-run 模式让用户在调用前看到将要执行的命令：危险命令第一次跑前先 dry-run，避免「模型一时糊涂跑了 rm -rf /」的灾难',
   ]}
   advanced={[
     '抽象 adapter 层让同一个 tool 定义跑多种协议（参考 Hermes 的 anthropic_adapter、bedrock_adapter、gemini_native_adapter）：换模型不用重写工具，是多模型 agent 的关键',
-    'before/after tool call hook 系统允许外部插中间件（参考 OpenClaw 的 tool-policy-pipeline）：verifier、审计、缓存、mocking 都能中间件化，二开友好度极高',
-    '工具 profile 分档（参考 OpenClaw 的 minimal、coding、messaging、full 四档）：不同场景按需开关工具，减少工具列表长度，降低模型选错率（超过 15 个工具后选错率显著上升）',
+    'before/after tool call hook 系统允许外部插中间件（参考 OpenClaw 的 tool-policy-pipeline）：verifier、审计、缓存、mocking 可以进入同一管线，便于插入额外逻辑',
+    '工具 profile 分档（参考 OpenClaw 的 minimal、coding、messaging、full）：按场景开关工具，减少无关选项。工具数量和模型选错率要用自己的任务日志校准，不要套用固定阈值',
     '工具调用事件流单独发到一条 stream（参考 OpenClaw 的 subscribeEmbeddedPiSession）：外部审计、实时监控、训练数据采集都从这条流走，不污染主 conversation',
   ]}
   avoid={[
-    '把权限检查写在每个工具函数内部：违反 DRY、难做全局策略改动（想给所有工具加 LLM 判意图这一层就要改 N 个工具）。用中间件链才是正确做法',
+    '把权限检查写在每个工具函数内部：违反 DRY、难做全局策略改动（想给所有工具加 LLM 判意图这一层就要改 N 个工具）。若需要跨工具的统一策略，可以集中到中间件链',
     '`stop_reason === "tool_use"` 当唯一信号：Anthropic API 的 stop_reason 不可靠（实测有时候 stop_reason 是 end_turn 但有 tool_use block），代码自己数 block 数量才稳',
     '内置工具和 MCP 工具走两条 dispatch 路径：模型决策时要分别处理两种工具（增加复杂度），且 UI 渲染逻辑也要写两套。统一走一条路径让模型透明',
     '一开始就上工具并行：并行处理失败、state isolation、顺序问题都比串行复杂得多。先把串行 dispatch 稳定下来（包括 timeout、retry、错误处理），再考虑并行优化',
@@ -229,7 +216,7 @@ MCP 通过 runtime 配置注入：`~/.hermes/config.json` 里写 `mcp_servers` �
   caption="OpenClaw 风格的四钩子点示意。Codex 走 execpolicy 静态规则，Claude Code 给 canUseTool 一个钩子，Hermes 在工具函数内部分散判断。"
 />
 
-## 沿着 dispatcher 读源码
+## 核对一次调用的执行链
 
 <SourceTrail
   entries={[
@@ -255,9 +242,9 @@ MCP 通过 runtime 配置注入：`~/.hermes/config.json` 里写 `mcp_servers` �
 
 ### 练习
 
-1. **🟢 入门**：给你的 agent 加一个 `before_tool_call` 钩子。最简实现：打印 `[tool] {name}({args})`，不修改也不拦截，仅观察。看一周后，最高频的工具调用 top 3 是哪三个。
+1. **🟢 入门**：给你的 agent 加一个 `before_tool_call` 钩子。最简实现：打印 `[tool] {name}({args})`，不修改也不拦截，仅观察。等收集到足够的真实调用后，再决定哪些工具值得进入默认 profile。
 2. **🟠 进阶**：实现一个最小版 `apply_patch` DSL：模型在 assistant 文字里输出 `*** Begin Patch ...` 块，你的代码解析并应用到文件。比起 function_call 传 string，能塞多大的 diff？
-3. **🔴 挑战**：实现 OpenClaw 风格的 `tool-loop-detection`：连续 5 次调同一个工具且参数变化 < 10% 就拦截，把「你在死循环」注入回模型。给一份 trajectory 数据复现死循环加你的检测器在第几步阻止它。
+3. **🔴 挑战**：实现一个 `tool-loop-detection` 练习版：先用“连续 5 次同工具、参数变化很小”作为测试参数，再用正常重试与死循环 trajectory 调阈值。报告它在哪一步拦截，以及误报了什么。
 
 ### 复盘题
 
@@ -329,17 +316,17 @@ OpenClaw 和 Hermes 都偏 Codex 风格（串行），原因是 trajectory 模�
 <details>
 <summary>**Q4 · 架构**：Codex 的 `apply_patch` 不走 function call，而是让模型在 assistant 文本里 inline 输出 V4A diff，为何？</summary>
 
-核心约束：**function_call 的 arguments 字段有大小限制**。OpenAI Responses API 默认 32K-128K，超过会被截断。Anthropic `tool_use` 的 input 也有类似限制。一份真实的代码 patch 经常 5K-30K 行，序列化成 JSON 字符串会触上限。
+核心约束：**function_call 的 arguments 字段有大小限制**。具体上限由 provider、模型和 SDK 配置决定，不能用一组跨 provider 的固定数字概括。大 patch 需要拆分、改用正文承载，或在宿主侧做专门的上传协议。
 
-`apply_patch` DSL 把 patch 直接放在 assistant 的 text content 里（不是 tool_use args 里），模型输出 `*** Begin Patch ... *** End Patch` 块，Codex 用 `apply-patch` crate 解析。绕过了 function_call 的大小限制，单次 patch 想多大就多大。
+`apply_patch` DSL 把 patch 放在 assistant 的 text content 里，而不是 tool_use args。模型输出 `*** Begin Patch ... *** End Patch`，Codex 再用 `apply-patch` crate 解析。它避开了 arguments 这条承载路径，但仍受模型输出、context、provider 和宿主限制，不能视为无限容量。
 
 代价：
 
-1. **模型要学一种新 DSL**：Codex 的 system prompt 里专门有一段教模型 V4A 格式，prompt 长度增加 500 token 左右。
-2. **解析必须健壮**：模型可能输出 malformed patch（缺 `*** End Patch`、patch 行少空格等），Codex 的 `apply-patch` crate 是个独立 module，做了大量容错。
+1. **模型要学一种新 DSL**：Codex 的 system prompt 包含 V4A 说明。它增加多少 prompt 与输出开销，应在固定 tokenizer 和模型版本上测量。
+2. **解析要覆盖常见 malformed 输入**：模型可能缺 `*** End Patch` 或少写 patch 行空格；Codex 的 `apply-patch` crate 在这份快照里提供了多处容错，具体覆盖范围仍应由测试样本确认。
 3. **可观测性变差**：普通 function_call 容易在 trajectory log 里 grep `apply_patch(`。DSL 嵌在文本里要专门 parser 才能识别。
 
-Claude Code 选了另一路：内置 `Edit` 和 `MultiEdit` tool，每个 edit 是一个独立 tool_use，每个限制内（一两百行）。代价是大 refactor 要分多个 tool_use（甚至跨多 turn）。
+Claude Code 选了另一路：内置 `Edit` 和 `MultiEdit`，每个 edit 是一个独立 tool_use。编辑大小受当前工具实现与 provider payload 限制；大 refactor 往往要拆成多个 tool_use，具体分块应通过集成测试确定。
 
 实操建议：
 
@@ -347,7 +334,7 @@ Claude Code 选了另一路：内置 `Edit` 和 `MultiEdit` tool，每个 edit �
 - 项目成熟需要支持大 refactor：参考 Codex `apply_patch` DSL，但务必保留 `Edit` 兜底。
 
 **源码定位**：[`codex/codex-rs/apply-patch/src/lib.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/apply-patch/src/lib.rs)（DSL 实现），[`codex/codex-rs/apply-patch/apply_patch_tool_instructions.md`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/apply-patch/apply_patch_tool_instructions.md)（教模型的 prompt）。
-**追问**：「Aider 用的 diff 格式跟 V4A 一样吗？」不一样。Aider 用 unified diff（标准 git diff 风格），V4A 是 OpenAI 内部设计的，结构更严格便于解析。两套都比 function_call args 强。
+**追问**：「Aider 用的 diff 格式跟 V4A 一样吗？」不一样。Aider 用 unified diff（标准 git diff 风格），V4A 是 OpenAI 内部设计的，结构更严格便于解析。两者都把 patch 内容移出 function_call args；哪种更合适，要按 payload 上限、解析失败率和审计方式测量，不能仅凭格式下结论。
 </details>
 
 <details>
@@ -357,7 +344,7 @@ Tool middleware 是工具调用前后插入的处理逻辑链，类似 web frame
 
 Claude Code 的 `canUseTool` 是**单点钩子**：在 tool 执行前问一次「这次能不能调」，返回 yes 或 no。简单易用，但只能做权限判断，不能改写 args、不能记录、不能 mutate result。
 
-OpenClaw 的 `tool-policy-pipeline` 是**完整中间件链**：
+在这份 OpenClaw 快照里，`tool-policy-pipeline` 是一条**多阶段中间件链**：
 
 1. **`before_tool_call`**：可拒绝、可改写 args、可注入 metadata、可触发 confirmation。
 2. **`tool-mutation`**：执行后改写 result（比如对大 result 截断、对二进制做 base64）。
@@ -365,11 +352,11 @@ OpenClaw 的 `tool-policy-pipeline` 是**完整中间件链**：
 4. **`tool_result_persist`**：把整条记录写进持久化存储。
 5. **`tool-loop-detection`**：检测连续相同调用，注入「你在死循环」信号。
 
-差别在「能不能链式组合」。Claude Code 一个 `canUseTool` 拦完就完了。OpenClaw 可以叠 5 个 middleware，按注册顺序依次过。企业场景里 middleware 链是刚需（合规需要 audit log 加 telemetry 加 rate limit 同时启用，不能只挑一个）。
+差别在「能不能链式组合」。Claude Code 在这个路径上暴露一个 `canUseTool`，OpenClaw 可以按注册顺序叠加多层 middleware。是否同时需要审计、telemetry、限流和人工批准，要看数据类型、租户边界与合规要求。
 
-代价：调试链路变长，一个 tool 调用要 trace 5 个 middleware。OpenClaw 在 dev mode 提供完整 trace，prod 关掉只留 essential。
+代价：调试链路变长，一个 tool 调用要 trace 5 个 middleware。OpenClaw 在 dev mode 提供更详细的 trace，prod 则只保留 essential；这是该快照的运行配置，不代表所有部署都如此。
 
-实操建议：起步用单点（Claude Code 风格），生产前最少加 3 层（permission、log、rate limit），合规要求高时上完整 pipeline。
+实操时先列威胁模型，再配置 permission、日志、限流或审批。当多个策略需要独立演进和复用时，多阶段 pipeline 才可能抵消更长调试链路的成本；简单工作负载可以从较少 hook 起步。
 
 **源码定位**：[`openclaw/src/agents/tool-policy-pipeline.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/tool-policy-pipeline.ts)，对比 `claude-code/src/hooks/useCanUseTool.tsx`。
 **追问**：「Express middleware 和 tool middleware 设计是不是一样？」思路一样（next() 链），但 tool middleware 多了双向：既能改 args 也能改 result。Express 的 middleware 只走单向（request → response）。
@@ -382,24 +369,24 @@ OpenClaw 的 `tool-policy-pipeline` 是**完整中间件链**：
 
 1. Schema：`name: web_search`，`parameters: { query: string, max_results: number (default 5), recency_days?: number }`。
 2. Result 格式约定：`{ items: [{ title, url, snippet, published_at }], total: number, truncated: bool }`。
-3. 一定要返回结构化数据，**别返回原始 HTML**。模型读 HTML 容易被 prompt injection 攻击（chapter 03 §Q4）。
-4. URL 必须是绝对 URL（不要 `/foo/bar`）；published_at 必须 ISO 格式。
+3. 建议返回结构化数据；原始 HTML 若未经清洗或隔离就进入模型，可能扩大 prompt injection 面（chapter 03 §Q4）。
+4. 如果下游按 URL 和日期解析，使用绝对 URL 与 ISO 格式；其他格式应在 schema 中明确约定。
 
 **Permission 层**：
 
-1. 默认 allow（搜索是 read-only），但加 rate limit（如 10 req/min/user）。
+1. 默认 allow（搜索是 read-only），但加 rate limit。`10 req/min/user` 可以作为压测起点，不是通用配额。
 2. 域名白名单可选（企业场景常要求只搜内网 + 几个公共站）。
 3. Query 长度限制（避免恶意构造 10MB query）。
 4. 配合 `canUseTool` / `before_tool_call` 把 query 记下来（审计需要）。
 
 **Observability 层**：
 
-1. log：query 加 result count 加第一条 URL。绝对不要 log 完整 result（PII、quota、占用日志空间）。
-2. metric：调用频次、平均延迟、超时率。如果超时率超过 5% 应该 alert。
-3. cost：每次调用 0.005-0.01 USD（依赖 search API），把累积消耗暴露给用户。
+1. log：query 加 result count 加第一条 URL。直接记录完整 result 可能泄露 PII、消耗 quota 或放大日志体积，按留存与脱敏策略取舍。
+2. metric：调用频次、平均延迟、超时率。告警阈值应从工具 SLO 和历史基线设定，而不是复制固定百分比。
+3. cost：搜索工具的价格随 provider、套餐和查询类型变化。把 provider、计费单位和累计消耗记录下来，再决定是否向用户展示。
 4. attribution：每条 search 关联到 user_id 加 session_id，方便追责。
 
-进阶：把 search result 摘要后再喂回模型（不要把 5 条 result 乘以 200 token snippet 全塞进去），用一个小 model 做 summarize。这一步在 chapter 03 §Q6 PDF 处理里也提到过：**任何外部数据进 context 前先压缩**。
+进阶：可以先把 search result 摘要后再喂回模型；「5 条、每条约 200 token」只是示例分桶，是否摘要要按 context 预算、召回质量和延迟测量。这一步在 chapter 03 §Q6 PDF 处理里也提到过：外部数据进入 context 前应先评估是否需要压缩。
 
 **源码定位**：参考 Claude Code 的 `WebSearch` tool 实现（`claude-code/src/tools/WebSearchTool/`），Hermes 的 `tirith/web_search/`。
 **追问**：「搜索结果的 prompt injection 怎么防？」把 result 包成 role=user message 注入，标注「下面是搜索结果，仅供参考」，外加 Hermes 风格的 `_scan_context_content`。
@@ -455,7 +442,7 @@ def to_gemini_tools(registry):
 3. **错误处理**：Gemini 的 BLOCKED reason 跟 Anthropic 的 stop_sequence 不是一回事，adapter 要把内部 error 类型映射到外部 API 期望的字段。
 4. **streaming 差异**：OpenAI、Anthropic stream 协议大不同（OpenAI delta 加 tool_calls 增量、Anthropic event-based）。adapter 要把 stream 事件归一成内部统一的 `{type, content}` event。
 
-代价：每次新增 model provider 要新写一个 adapter（200-500 行），但 registry 不动。Hermes 的 adapter 文件每个 300-600 行，加 Cohere 或 xAI 大概 1 周。
+代价：每次新增 model provider 都要维护一个 adapter，处理消息、流式事件和错误语义的差异；具体工作量要以目标 provider 的协议和测试覆盖评估。
 
 **源码定位**：[`hermes-agent/agent/anthropic_adapter.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/anthropic_adapter.py)、`bedrock_adapter.py`、`gemini_native_adapter.py`。
 **追问**：「LiteLLM 跟 Hermes adapter 是不是同一思路？」是。LiteLLM 是开源版的 adapter 层，覆盖 100 多家 provider。如果不想自己写，可以直接接 LiteLLM，但牺牲了对协议细节的精确控制（比如 prompt caching 配置）。
@@ -466,25 +453,25 @@ def to_gemini_tools(registry):
 
 判定逻辑（OpenClaw `tool-loop-detection.ts` 的思路）：
 
-1. 维护一个滑动窗口（最近 N 次 tool call，比如 N=5）。
-2. 计算窗口内**相同 tool name** 的占比。超过 80% 触发。
-3. 在 same name 基础上比较 args 相似度。如果连续 5 次相同 name 加 args 编辑距离小于 10%，触发。
+1. 维护一个滑动窗口（最近 N 次 tool call；N 是待校准参数）。
+2. 计算窗口内**相同 tool name** 的占比，并从已标注 trajectory 选择触发阈值。
+3. 在 same name 基础上比较 args 相似度。连续重复且参数变化很小时触发；窗口和编辑距离都要按工具类型校准。
 4. 命中后**注入信号到下一个 tool result**：把 result 替换或追加「[loop detected] 你在第 N 步连续调用了 X，建议尝试别的方案」。
 
 为什么不直接 deny？因为 deny 会让模型只能放弃，但有时它是合理重试（API 偶发失败、文件刚改完再读一次）。注入信号让模型自己决定换方向，相对温和。
 
 避免误杀的 3 个技巧：
 
-1. **only 相同 tool**：连续 5 次都调 `Read` 不算 loop（read 不同文件是正常 exploration），连续 5 次都调 `Bash` 同一个 command 才算。
-2. **args 相似度门限要严**：编辑距离小于 10% 而不是 50%。10% 大概率是同一个 args 重打了一遍，50% 可能是参数偶然相似。
-3. **窗口大小要够大**：N=3 太敏感（模型可能合理 retry 3 次），N=10 又太慢。OpenClaw 默认 N=5 是个折衷。
+1. **工具名不能单独定罪**：连续调用 `Read` 可能是在看不同文件；只有调用名、参数与结果都没有推进时，才有较强的循环信号。
+2. **args 相似度门限要按工具分开**：读文件的路径变化和查询工具的文本变化含义不同。先用标注过的正常重试与死循环样本选阈值。
+3. **窗口按工具校准**：`N=5` 是 OpenClaw 当前源码快照中的默认值，可作为实验起点。用正常重试与已确认循环的标注样本比较误报、漏报和发现延迟后再调整。
 
 实测的常见 false positive：
 
 - 数据爬取 task：连续 10 次 `web_search` 不同 query。解决：把 search 排除在检测器之外（或者用 args 相似度兜底）。
 - TodoWrite：模型连续刷状态。解决：状态更新类 tool 排除。
 
-实操建议：先以 read-only 模式跑（detect 但不注入），看 1 周日志，确认 detector 行为合理后再开 inject 模式。Chapter 19（self-improvement）会讲怎么把 detector 的判定数据反过来训练 agent，让它学会「不要 loop」。
+实操建议：先以 read-only 模式运行，只记录不注入。积累覆盖主要工具和失败类型的代表性 trajectory，经人工复核误报与漏报后再开 inject；样本量由调用频率决定，不预设一周。
 
 **源码定位**：[`openclaw/src/agents/tool-loop-detection.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/tool-loop-detection.ts)，Hermes 在 `agent/loop_guard.py` 也有类似实现。
 **追问**：「死循环靠 token budget 兜底也行吧？」预算可以止损，但 detector 能更早发现。token 兜底是「跑空了再说」，detector 是「跑歪了立刻调」。
@@ -504,8 +491,8 @@ OpenClaw 4 档：
 
 为什么不让所有 agent 都用 `full`？三个原因：
 
-1. **prompt 长度**：每个工具的 schema 大概 200-500 token。20 个工具等于 4-10K token system prompt。subagent 用不上 `Edit` 还要付这个 cache。
-2. **决策准确性**：工具越多模型越难选。20 个工具的选择准确率比 5 个工具低 5-10%（个人实测，依赖具体模型）。
+1. **prompt 长度**：工具 schema 会占用上下文。把不适用的工具从 profile 中移除，并在目标模型上测量缓存命中和选择错误，而不是预设固定 token 成本。
+2. **决策准确性**：工具越多，候选之间越容易混淆，但幅度依赖模型、描述和任务。用同一评测集比较精简前后的 wrong-tool rate。
 3. **权限收敛**：subagent 不需要写文件，给它 `Edit` 就是给了潜在攻击面。最小权限原则。
 
 实操建议：
@@ -526,14 +513,14 @@ Codex、Claude Code、Hermes 都没有 profile 抽象，但用别的等价方案
 
 **核心层（必选）**：
 
-1. **registry 单源加 adapter 多协议**（参考 Hermes）。锁死一个 OpenAI function calling 风格的内部表示，三个 adapter（Anthropic、OpenAI、Gemini），新模型 1 周内能接入。
+1. **registry 单源加 adapter 多协议**（参考 Hermes）。先定义内部表示，再为需要的 provider 写 adapter；接入时间取决于协议差异和测试范围。
 2. **tool_use block 并行 dispatch**（参考 Claude Code 但加白名单）。所有 read-only tool 自动并行，所有 write 类 tool 串行。需要在 metadata 标注 `parallel_safe: bool`。
 3. **canUseTool 单点钩子**（参考 Claude Code）加 **after_tool_call hook**（参考 OpenClaw）。两点是中间件链的最小集，扩展性够，调试链路不至于太长。
 
-**中间件层（生产必选）**：
+**中间件层（本站方案，按风险选配）**：
 
-4. **tool-loop-detection**（参考 OpenClaw）：开 read-only mode，inject 信号到下一 result，N=5 窗口。
-5. **apply_patch DSL fallback**（参考 Codex）：当 `Edit` tool 的 args 超过 8K，自动 fallback 到 V4A DSL。
+4. **tool-loop-detection**（参考 OpenClaw）：先开 read-only mode；可从当前快照的 `N=5` 开始实验，再按标注 trajectory 校准。
+5. **apply_patch DSL fallback**（参考 Codex）：当集成测试出现稳定的 payload 截断或解析失败边界时切换传输方式，不预设通用的 `8K` 阈值。
 6. **execpolicy 静态规则**（参考 Codex）：每个 tool 在 registry 里声明 `risk_level: low、medium、high`，自动应用 deny 规则。
 
 **MCP 层**：
@@ -552,12 +539,11 @@ Codex、Claude Code、Hermes 都没有 profile 抽象，但用别的等价方案
 
 落地节奏：
 
-- 月 1：核心层 1-3 跑通。
-- 月 2：加上 4-6 中间件。
-- 月 3：MCP 集成。
-- 月 4：observability 加 token budget。
+- 先让核心层 1-3 在目标任务集上跑通。
+- 再按审计、缓存或多模型需求补中间件与 adapter。
+- 最后决定是否接 MCP 和独立 observability 流，并记录引入后的失败模式。
 
-总工程量大概 8-12 周（一个 senior 全职）。比直接照搬任何一家全量都轻量，但保留了关键 trade-off 决策权。
+工程量取决于既有 runtime、支持的 provider 和隔离要求；用目标任务集拆分里程碑，不要把固定周数当成承诺。
 
 **源码定位**：综合所有四家的源码，参考路径见本章末尾的 SourceTrail。
 **追问**：「为什么不沿用 LangChain 的 Tool？」LangChain Tool 抽象太厚（每个 tool 是个 Class），对快速迭代不友好。开源框架应该让 tool 是个简单的 dict，必要时让用户自己包装成 class。

@@ -1,35 +1,25 @@
 ---
-title: 08 · Git Workflow
+title: 08 · Agent 改坏代码后如何回滚
 sidebar:
   order: 8
-description: codex-git-utils crate、IDE 级 git 基础设施、git-root only、banner only：四家对 git 的抽象厚度差一个数量级
+description: 在不覆盖用户未提交改动的前提下，让 Agent 定位、应用并安全回滚代码变更
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
 ## Git 是恢复层，也是审计层
 
-<Verdict tldr="Git 是 coding agent 跟版本控制历史耦合最紧的一根线，决定一个 agent 是不是「真的懂代码」很大程度上取决于它对 git 的理解有多深。具体要回答四个问题：当前在哪个仓库、哪个 commit、哪个 branch（agent 推理代码时必须知道这些前提），模型生成的 patch 怎么应用到工作区（直接覆盖文件还是走 git apply 让冲突可见），怎么做出错回滚（agent 跑坏了能不能一键回到干净状态），怎么集成 PR 工作流（gh CLI、code review、提 commit 这些常见操作怎么暴露给模型）。四家在这四件事上的抽象厚度差整整一个数量级。Codex 走「git 是一等公民，应该独立成 crate（Rust 的最小可独立编译单元，对应一个独立的 npm 包或 Python 模块）」路线：把 git 拎出来做了一整个 codex-git-utils crate，公开 30 多个函数（apply_git_patch 应用补丁加 parse_git_apply_output 解析输出加 stage_paths 暂存路径一条龙、GitInfo 强类型对象封装 commit_hash、branch、repository_url 启动时并发收集注入 system context、GitSha 强类型不是裸 String 让序列化和 TS 类型导出统一、baseline 那一组 ensure_git_baseline_repository 启动时把工作区拷贝到 sandbox 临时目录里另立一份「干净副本」、diff_since_latest_init 拿当前工作区跟那份 baseline 做 diff 看 agent 改了哪些文件、reset_git_repository 一键把工作区还原到 baseline 状态，实现了 sandbox 内单独维护的「干净状态副本」让 agent 跑坏可一键回滚、5 秒 timeout 防止大型 monorepo 卡死）。这是 coding agent 在 git 工程上的天花板。Claude Code 走「git 是 IDE 基础设施，要做高性能加高安全」路线：没有独立 crate 但 utils/git.ts 加 utils/git/* 加 tools/PowerShellTool/gitSafety.ts 加起来近千行代码精细分层，最关键的工程细节有三个：findGitRoot 用 LRU 50 缓存（注释里明确说「模型一次会改十几个目录的文件，每个都要查 git root，所以 LRU 必备」）、gitSafety.ts 防御两种特定的 git 沙箱逃逸攻击（bare-repo 攻击：cwd 里同时出现 HEAD 加 objects、refs 时 git 会把 cwd 当成 bare repo 跑 hooks。git-internal write 加 git 复合攻击：一条命令先创建 HEAD、objects、refs、hooks 再跑 git 触发刚创建的恶意 hooks）、/review 和 /pr_comments slash 命令把 gh pr view 到 gh pr diff 到分析这种多步操作封装成「内嵌 prompt 模板」的 prompt-as-command 模式。OpenClaw 走「git 不进 agent 抽象，平台层只做版本戳」克制路线：整个 git 处理就两个文件：git-root.ts 是 30 行的 walk-up 找 .git 实现、git-commit.ts 是直接读 .git/HEAD 拿短 SHA（绕开 git binary 依赖避免 PATH 问题）。模型要查 git 状态、提 commit、推 PR 全部走 shell 工具（跟跑 ls 没区别），平台层只负责告诉模型「我们在哪个仓库加哪个 commit」这种最基础的元信息。Hermes 走「git 完全不抽象」极简路线：整个项目的 git 处理就一个函数：在启动 banner 上显示一行字 `Hermes Agent v0.x.x · upstream abc1234 · local def5678 (+3 carried commits)`，告诉用户当前版本和落后多少 commit。除此之外没了。要写专门做 coding 的 agent 参考 Codex。要写 IDE 插件、dev tool 参考 Claude Code。要写通用控制面（不是 coding agent）参考 OpenClaw。要做极简 chat agent 不为 git 多写代码参考 Hermes。" />
+<Verdict tldr="问题是 agent 改完代码后如何恢复，而不是 Git 能列出多少命令。本文沿着三个决策读源码：哪些状态要注入上下文，补丁如何留下可审计结果，失败时怎样回到不覆盖用户未提交改动的基线。Codex 的 baseline 与结构化 patch 只在 coding agent 需要这些保证时才值得承担；Claude Code 的缓存和 gitSafety 解决 IDE 的高频查询与恶意工作目录；OpenClaw、Hermes 则把职责留在 shell 或版本提示。数字按源码快照、假设场景或本站实验分别标注，不把它们当成通用实测。" />
 
-## Harness 应该理解多少 Git
-
-<details>
-<summary>读前提示（按需展开）</summary>
-
-- **agent 是不是「真的懂代码」很大程度取决于对 git 的理解多深**：仓库、commit、branch 是推理代码的前提。
-- **抽象厚度分歧最大**：Codex 独立 codex-git-utils crate 30 多个函数加 baseline 一键回滚，Claude Code 近千行 IDE 级 git 基础设施（findGitRoot LRU 50、gitSafety.ts），OpenClaw 只做版本戳，Hermes 只有 banner 一行。
-- **产品形态决定 git 抽象厚度**：coding agent 做 crate，通用控制面只要版本戳。
-- **最大的坑是 git 沙箱逃逸**：bare-repo 攻击靠 cwd 里伪造 HEAD、objects、refs 触发恶意 hooks，gitSafety.ts 专门防这两种攻击。
-
-</details>
-
+## 先问：回滚要不要碰用户的 Git
 <Diagram
   src="/diagrams/08-git-workflow-base.svg"
   alt="四系统对 git 的抽象层次：从一整个 crate 到一行 subprocess"
@@ -50,11 +40,11 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## 四套系统怎样接入 Git
+## 源码证据：回滚、上下文和安全如何分工
 
 ### Codex · git 拎出来做成独立 crate
 
-Codex 在 git 这件事上的出发点是：coding agent 跟 git 的交互是高频且复杂的（每个 turn 都可能涉及 commit、branch、diff、apply patch、reset 等操作），如果让模型每次都用 shell 命令去做，会有三个具体问题：shell 输出是非结构化文本模型 parse 容易错（比如 `git status --porcelain` 的输出空格敏感）、每个调用都要起一个 git 子进程开销大（monorepo 里一次 git 命令可能要几百毫秒）、错误处理散落各处（每个调用方都要重新写超时、fallback、解析逻辑）。
+coding agent 每轮都要读状态、应用补丁、比较差异；把这些调用留给 shell，解析和回滚就会散落。Codex 因此把 apply、baseline、branch、info 放进 git-utils crate。下面只看它如何支持恢复，不把 crate 规模当质量分数。
 
 所以 Codex 决定把 git 拎出来做成独立 crate，把所有 git 相关的「结构化抽象」「性能优化」「错误处理」「安全防御」一次性做对，让上层调用者只面对干净的 Rust API。
 
@@ -155,9 +145,9 @@ pub async fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
 
 这段代码有三个值得反复琢磨的工程细节。第一个是 `GitSha` 是强类型而不是裸 String：`codex_protocol::protocol::GitSha` 把 SHA 的合法格式校验、序列化、TS 类型导出全都封装到一个类型里，调用方拿到 GitSha 就知道它是合法的 git SHA，不需要每个调用方再手写正则。这种「不要让 String 在系统里到处跑」的原则在大型 codebase 里很重要，每个领域概念都应该有自己的类型。
 
-第二个是 5 秒 timeout，注释里直接说「prevent freezing on large repositories」：在大型 monorepo（Google、Meta 这种）里 `git rev-parse HEAD` 偶尔会因为各种原因（仓库锁、索引重建、网络 mount 慢）卡 30 秒甚至更久，agent 启动如果同步等就会卡死。
+第二个是 5 秒 timeout，注释写的是「prevent freezing on large repositories」。这只能证明作者设置了一个有界预算，不能证明某类 monorepo 通常会卡 30 秒；锁、索引和网络挂载都可能改变结果。
 
-硬 timeout 让最坏情况是 5 秒后 GitInfo 返回 None，agent 照常启动只是没有 git 上下文，比卡死好得多。第三个是并行收集：commit、branch、URL 这三个独立调用通过 `tokio::join!` 并发起，把启动延迟从 3 倍 RTT 降到 1 倍 RTT，对启动速度极敏感的 CLI 工具来说这是必要的优化。
+超时后当前快照让 GitInfo 返回 None，agent 可以继续启动但没有 Git 上下文。第三个是并行收集：commit、branch、URL 三个调用在源码里通过 `tokio::join!` 发起；是否能把启动时间从三次等待降到一次，要在目标仓库和文件系统上测量。
 
 特别值得讲的是 baseline 那一组（`ensure_git_baseline_repository`、`diff_since_latest_init`、`reset_git_repository`）：这是 Codex 独有的「agent 专属快照仓库」机制。具体怎么做：agent 启动时在 sandbox 内单独 init 一个 git 仓库作为 baseline，把当前工作区状态全 commit 进去。
 
@@ -165,7 +155,7 @@ agent 在主仓库里跑一轮做了一堆改动后，可以用 `diff_since_late
 
 ### Claude Code · git 当 IDE 基础设施：高性能缓存加高安全防御加 slash 命令封装
 
-Claude Code 没有 Codex 那种独立 crate，但 `utils/git.ts` 加 `utils/git/*` 子目录加 `tools/PowerShellTool/gitSafety.ts` 加起来近千行代码，分层很细。
+IDE 场景的难点是频繁查 root 和不可信 cwd。Claude Code 用 LRU 缓存减少重复 stat，并在 PowerShell 路径检查 bare-repo 与内部写入组合；/review 则把多步流程留在 prompt。
 
 它的出发点是：git 对 IDE-style agent 来说是基础设施，要做到三件事：一是性能（IDE 高频调用 git 命令，每次都走子进程会卡）、二是安全（IDE 用户的 cwd 完全不可信，git 可能被武器化做沙箱逃逸）、三是工作流封装（让 code review、PR 评论这种多步流程能一行命令完成）。下面一条条看。
 
@@ -213,11 +203,11 @@ const findGitRootImpl = memoizeWithLRU(
 
 注意几个细节。`memoizeWithLRU(fn, keyFn, 50)` 的 50 是 LRU 容量：50 个不同的 startPath 都会被缓存命中，超过 50 个 LRU 淘汰最旧的。50 这个数字怎么选的？
 
-因为典型项目里一次 turn 涉及的目录通常不超过 50 个（即使是大型 monorepo），而无限缓存的注释里说「edit many files across different directories would otherwise accumulate entries forever」直接暴露了真实使用模式：模型一次 turn 会改十几个甚至几十个目录的文件，每个都要查 git root，所以 LRU 必须有但容量不能小。
+源码注释解释了为什么要限制无界缓存：跨目录编辑会不断积累 key。它没有给出「50 足够覆盖多数 monorepo」的基准，因此这里把 50 视为该版本的实现参数；换成别的项目应通过命中率和内存占用重新选择。
 
 `logForDiagnosticsNoPII` 是 Claude Code 特有的「不带 PII 的诊断日志」工具：记录 find_git_root 调用的耗时和 stat 次数让团队可以分析慢路径，但绝不记录路径本身（因为路径可能包含用户名等 PII）。
 
-`stat.isDirectory() || stat.isFile()` 这一行处理一个 corner case：`.git` 不一定是目录，在 git worktree 和 submodule 场景下它是一个文件，文件内容指向真正的 git dir。缓存必须正确识别这两种情况。
+`stat.isDirectory() || stat.isFile()` 这一行处理一个 corner case：`.git` 不一定是目录，在 git worktree 和 submodule 场景下它是一个文件，文件内容指向实际的 git dir。缓存需要正确识别这两种情况。
 
 安全层是 Claude Code 的 PowerShell 特有 `gitSafety.ts`，专门防御两种 git 沙箱逃逸攻击：
 
@@ -238,7 +228,7 @@ const findGitRootImpl = memoizeWithLRU(
 
 这段注释里描述的两种攻击都是真实存在的 git 安全漏洞，值得详细讲清楚。第一种是 bare-repo 攻击：git 有一种叫 bare repository 的模式（裸仓库，没有 working tree 只有 git 对象数据库），bare repo 的判断标准是「当前目录直接包含 HEAD 文件、objects、目录、refs、目录」而不需要 `.git、` 目录。
 
-所以如果攻击者诱导 agent 把工作目录 cd 到一个特制目录（这个目录里有 HEAD 加 objects、加 refs、但伪造），然后让 agent 跑任何 git 命令，git 会把这个目录当成 bare repo 处理，执行目录里的 hooks 脚本：攻击者通过提前在 hooks、里放恶意脚本就可以做沙箱逃逸。
+如果攻击者诱导 agent 把工作目录切到一个特制目录（里面有 HEAD、objects、refs 等结构），某些 Git 操作可能按 bare repo 解释它并触发 hooks。具体会触发哪个 hook 取决于子命令和配置；文章不把「任意 git 命令」当成已验证事实。
 
 第二种是 git-internal write 加 git 复合攻击：一条复合 shell 命令先创建 HEAD 加 objects、加 refs、加 hooks、这些目录结构，然后接着跑 git 命令，刚被创建的 hooks 立刻就被执行。这两种攻击都利用了 git 自动信任工作目录的设计。
 
@@ -282,7 +272,7 @@ Claude Code 后面还有一个 `/ultrareview` 是 `/review` 的远程加强版�
 
 ### OpenClaw · 只做版本戳，git 不进模型抽象循环
 
-OpenClaw 的 git 抽象比前两家薄得多：薄到只剩两个文件 git-root.ts 和 git-commit.ts。这种克制是定位决定的：OpenClaw 是 agent 控制面（agent platform），不是 coding 工具，模型本身要不要做 git 操作是用户决定的事（用户写 Slack bot 可能根本不碰 git），平台不应该假设每个 agent 都需要 git 抽象。
+通用控制面不应替每个 skill 规定 Git 工作流。OpenClaw 只找 root、读版本戳，其余交给 shell；这会把状态解析和回滚责任推给上层。
 
 `git-root.ts` 整个文件就是「向上走找 .git」的实现：
 
@@ -347,7 +337,7 @@ const readCommitFromGit = (
 
 </SourceBlock>
 
-为什么不走 git binary？因为 git 子进程会引入 PATH 依赖（如果用户系统里没装 git 或者 PATH 没设好就报错），还有启动延迟（每次跑 git 都要几十毫秒）。直接读 `.git/HEAD` 文件：这个文件要么是个 40 字符的 SHA（直接就是 commit hash），要么是 `ref: refs/heads/main` 格式（指向一个 ref，再读 `.git/refs/heads/main` 拿 SHA）。
+为什么不走 git binary？因为 git 子进程会引入 PATH 依赖（如果用户系统里没装 git 或者 PATH 没设好就报错），也会增加一次进程启动和仓库读取。直接读 `.git/HEAD` 文件：这个文件要么是个 40 字符的 SHA（直接就是 commit hash），要么是 `ref: refs/heads/main` 格式（指向一个 ref，再读 `.git/refs/heads/main` 拿 SHA）。两条路径的耗时差异需要在目标操作系统和仓库上测量，源码本身没有给出基准。
 
 这种「绕开 git binary 直接读 .git 内部文件」的做法适用于「只读一个 commit hash」的简单场景，不适用于复杂操作（branch、log、status 这些走文件读太麻烦），但对 OpenClaw 的需求（只要版本戳）刚刚好。
 
@@ -357,9 +347,9 @@ const readCommitFromGit = (
 
 ### Hermes · 整个项目的 git 处理就一个函数：banner 上显示版本和落后信息
 
-Hermes 比 OpenClaw 还要克制：整个项目的 git 处理只有一个函数：
+聊天 Agent 只需在启动时告诉用户构建版本。Hermes 的 banner 读取 upstream 和 local SHA，没有 patch 或回滚抽象；这是范围选择，不是 Git 能力证明。
 
-<SourceBlock path="REF/hermes-agent/hermes_cli/banner.py" lines="213-238" system="hermes" summary="banner 唯一的 git 状态：upstream / local / ahead 三件套">
+<SourceBlock path="REF/hermes-agent/hermes_cli/banner.py" lines="213-238" system="hermes" summary="banner 单一的 git 状态：upstream / local / ahead 三件套">
 
 ```python
 def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
@@ -398,21 +388,21 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
 
 除了这一行字之外 Hermes 整个项目就没有任何其他 git 抽象：模型要查 git 状态、提 commit、推 PR，全部走 `terminal_tool` 工具跑 shell 命令，跟跑 `ls`、`cat` 这些没任何区别（参见第 07 章 shell 执行）。
 
-这是「git 完全不进 agent 抽象」的极端版本。理由跟 OpenClaw 类似：Hermes 是多平台 chat agent 而不是 coding 工具，用户可能在 Telegram 上跟它聊天根本不碰 git，给 git 做厚抽象是不必要的复杂度。banner 上那行字也不是给 agent 用的，是给运维人员看的：「这个 Hermes 实例跑的是哪个版本？跟主干差多少？」用来快速判断是不是有未推送的修改。
+这是把 Git 留在 shell 与版本标记边界的轻量实现。在当前 Hermes 快照的多平台 ChatOps 定位下，核心任务不一定涉及仓库编辑，因此没有继续扩展控制面 Git 抽象；coding-first 产品若需要补丁、回滚或工作树保护，仍要承担更深的 Git 集成。banner 上那行字主要给运维人员看：「这个 Hermes 实例跑的是哪个版本？跟主干差多少？」用来判断是否有未推送的修改。
 
-## Git 集成已经形成的共识
+## 回滚路径先共享哪些事实
 
-虽然四家在 git 抽象的厚度上差一个数量级，但仍有 4 件事是所有家都同意的硬约束：这些共识反映了 git 工程里不可绕开的现实。
+这次抽样的四个快照里，有 4 个重复出现的实现细节。它们是源码观察，不是跨项目的硬性规范；你的目标仓库仍需要单独验证。
 
-**第一件是 `.git` 既可以是目录也可以是文件，不能假设它一定是目录**。在标准 git 仓库里 `.git` 是一个目录（里面装着 objects、refs、HEAD 等），但在 git worktree（用 `git worktree add` 创建的额外工作区）和 git submodule（嵌套子模块）场景下，`.git` 是一个文件，文件内容是 `gitdir: /path/to/real/git/dir` 指向真正的 git dir。四家都在「找 git root」的逻辑里同时处理这两种情况（Codex 的 GitInfo 收集、Claude Code 的 findGitRoot 都判断 `stat.isDirectory() || stat.isFile()`），没有任何一家假设只判断目录就够。这种「平台兼容性细节」如果忽视掉，在 worktree 用户那里就会直接报「不是 git 仓库」的错。
+**第一件是 `.git` 既可以是目录也可以是文件**。在普通仓库里它通常是目录；worktree 和 submodule 里则可能是指向实际 git dir 的文件。本次查看的 Codex、Claude Code、OpenClaw 路径都显式处理了这两种形态。忽略它，worktree 用户可能会得到「不是 git 仓库」的误报。
 
 **第二件是用 walk-up 算法向上找 git root，深度有上限**。Codex、Claude Code、OpenClaw 三家都用同样的算法：从 startDir 开始往父目录走，每一层检查有没有 `.git`，找到就返回。深度上限 8-12 层不等（OpenClaw 是 12 层、Claude Code 没硬上限但靠 root 判断退出）。为什么要有深度上限？因为如果 cwd 不在任何 git 仓库内（比如在 `/tmp` 或 `/home/user/desktop`），walk-up 会一直走到 `/` 根目录才停，几十次 stat 系统调用浪费时间。有上限可以在 12 层后果断认为「这不在 git 仓库里」然后立刻返回 null。
 
-**第三件是 git 子进程必须加 timeout，5 秒是基线**。Codex 定义 `GIT_COMMAND_TIMEOUT = TokioDuration::from_secs(5)`、Hermes 跑 subprocess.run 时传 `timeout=5`，都是 5 秒。为什么是 5 秒？因为正常的 git 操作（rev-parse、status、log）在普通仓库里都是几十毫秒到几百毫秒级，5 秒已经远远超过正常水平。超过 5 秒说明仓库异常（被锁、索引重建、网络 mount 卡住），与其让 agent 卡死等下去不如直接超时返回 None。如果设到 30 秒，用户已经认为 agent 死了开始重启。
+**第三件是 git 子进程需要有界 timeout**。Codex 和 Hermes 的当前快照都写了 5 秒；这适合作为初始预算，不是所有仓库都应照抄的数字。大仓库、锁和网络挂载都可能改变耗时，超时后应返回可解释的降级状态，并用目标环境的测量结果调整预算。
 
-**第四件是不能假设 git binary 在 PATH 里**。CI 环境、Docker 容器、Windows 用户、最小化 Linux 镜像都可能没装 git 或者 PATH 没配。四家都做了不同形式的降级：OpenClaw 直接读 `.git/HEAD` 文件绕开 git binary 依赖、Codex 在 collect_git_info 里如果 `rev-parse --git-dir` 失败就返回 None（agent 照常启动只是没 git 上下文）、Claude Code、Hermes 在 git 命令失败时 fallback 到无 git 状态。没有一家假设「git 一定能跑」。
+**第四件是不能假设 git binary 在 PATH 里**。CI、容器和最小化系统都可能缺少它。本次抽样中的路径各自提供了降级方式：OpenClaw 直接读 `.git/HEAD`，Codex 在收集失败时返回空状态，另外两者在命令失败时保留无 Git 上下文的运行路径。是否足够，要在你的部署环境里验证。
 
-## 厚抽象与薄封装怎么选
+## 选择抽象厚度的条件
 
 <Diagram
   src="/diagrams/08-tradeoff.svg"
@@ -420,45 +410,43 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
   caption="Codex 与 Claude Code 守着右下（厚抽象加框死，coding agent 区），OpenClaw 与 Hermes 守着左上（薄抽象加自由，控制面区）。两条对角线没人，对应的工程矛盾就是「为何要抽象」。"
 />
 
-虽然上面 4 条是不可绕过的共识，但「git 抽象应该做多深」这件事的分歧才是真正决定四家适合什么场景的核心。从「你在做什么类型的 agent」这个角度看，四种取舍各自对应一个最适合的产品定位。
+上面 4 条是本次源码对照里反复出现的风险控制。至于 git 抽象做多深，要看产品是否高频修改代码、是否需要回滚，以及团队愿意维护多少专用 API。下面四种实现各自展示了一组取舍，不构成通用排名。
 
-**写一个专门做 coding 的 agent（核心场景就是让模型读代码、改代码、提交代码）**。Codex 的 git-utils crate 是值得直接复刻的标准答案。这种 agent 几乎每个 turn 都要跟 git 打交道，把 git 抽出来做强类型抽象的好处会被反复放大：GitInfo 注入让模型在每条响应里都知道当前 commit、branch、baseline 快照让用户敢让 agent 大胆尝试、apply_git_patch 让 patch 应用统一走结构化路径。代价是要写和维护一整套 git API，但对 coding agent 这是值得的投资。
+**写一个专门做 coding 的 agent（核心场景就是让模型读代码、改代码、提交代码）**。可以先研究 Codex 的 git-utils crate：GitInfo 把 commit 和 branch 放进上下文，baseline 提供回滚点，apply_git_patch 统一 patch 的落盘路径。强类型封装能否抵消维护成本，取决于 git 操作频率、回滚需求和故障率，应在目标工作负载上测量。
 
-**写 IDE 插件或 dev tool（agent 嵌入到开发者的 IDE 环境里）**。Claude Code 的缓存层加 gitSafety 加 slash 命令组合是参考。这种场景下高频调用是常态（用户的每次操作都触发 git 查询），缓存性能是生死线。同时 cwd 完全不可信（用户可能 cd 到任何奇怪目录），bare-repo 攻击防御必须做。并且开发者期待常见工作流（review、PR 评论、commit 整理）能一行命令完成，slash 命令的 prompt-as-command 模式让团队可以快速迭代这些工作流而不发版。代价是 PowerShell 特有的 gitSafety 维护成本高、缓存层引入 invalidation 复杂度。
+**写 IDE 插件或 dev tool（agent 嵌入到开发者的 IDE 环境里）**。Claude Code 的缓存层、gitSafety 和 slash 命令可以作为参考。如果交互会反复查询同一仓库，缓存可能减少等待；如果用户能打开来源不明的仓库，就要针对相应 threat model 检查 bare-repo 等入口。prompt-as-command 便于迭代 review、PR 评论等流程，但缓存失效和 PowerShell 路径仍会增加维护成本。
 
-**写通用 agent 控制面（agent 用途多样，不一定都是 coding）**。OpenClaw 的最小抽象（git-root 加版本戳）是正确克制。这种场景下用户可能写 Slack bot、写邮件 agent、写客服 agent 完全不碰 git，给所有用户硬塞 git 抽象层是浪费。OpenClaw 只提供「找 git root」这个基础工具，git 操作让模型自己用 shell 跑，加上 workspaceOnly 路径限制约束行为。如果某个用户真要写 coding agent，他自己加完整 git 层，框架不阻止也不帮忙。
+**写通用 agent 控制面（agent 用途多样，不一定都是 coding）**。OpenClaw 的 git-root 加版本戳展示了较薄的抽象。对不接触代码仓库的 Slack、邮件或客服任务，专用 git 层未必能收回维护成本；需要 coding 能力时，再由具体 skill 补齐操作和回滚语义。
 
-**写极简的 chat agent（git 完全不是核心场景）**。Hermes 的 banner-only 模式是底线。这种场景下 agent 跟 git 的唯一关系是「告诉用户我跑的是哪个版本」，连 walk-up 找 root 都不需要做（banner 函数自带这个逻辑写在 _resolve_repo_dir 里）。代价是模型要查 git 状态必须自己反复跑 git status 浪费 token、缺乏统一的 git 错误处理，但对极简 chat 场景这些代价都不重要。
+**写极简的 chat agent（git 完全不是核心场景）**。Hermes 的 banner-only 模式只解决版本标识：banner 函数在 `_resolve_repo_dir` 中定位仓库，其他 git 状态仍由模型通过 shell 查询。它减少了框架代码，也放弃了统一错误处理；只有在产品确实不依赖仓库状态时，这项取舍才合算。
 
-## 我的判断：别把 Git 重新发明一遍
+## 选择：把回滚边界放在哪里
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: '独立 git-utils crate 加 GitSha 强类型加 baseline snapshot 机制加 apply_git_patch 一条龙加 5s timeout 加并行 collect。coding agent 的 git 工程上限', risk: '抽象成本高，要维护一整套 git API。非 coding 场景纯粹是浪费' },
-    { system: 'Claude Code', value: '★★★★★', reason: 'gitFilesystem 缓存层加 LRU findGitRoot 加 gitSafety 防 bare-repo 与 hooks 攻击加 /review 内嵌 prompt 加 /pr_comments 全套 PR 流', risk: 'PowerShell 特有 gitSafety 维护代价高。缓存层多了 cache invalidation 的复杂度' },
-    { system: 'OpenClaw', value: '★★★★', reason: '只做最小集：git-root walk-up 加读 .git/HEAD 拿版本戳。控制面定位下的正确克制', risk: '想用 OpenClaw 做 coding agent 要自己加完整 git 层' },
-    { system: 'Hermes', value: '★★★', reason: 'banner-only。所有 git 操作都靠 terminal 加模型自己写命令。架构最简', risk: '模型每次都要 `git status` 一遍，token 浪费。缺乏统一的 git 错误处理' },
-  ]}
-  caption="评分依据：抽象厚度加工程复用度加与系统定位的匹配度"
-  headers={['系统', '评分', '亮点', '风险']}
-/>
+这里不做星级评分。Git 抽象是否合算，取决于任务边界。
+
+| 你的约束 | 可先读 | 代价与边界 |
+| --- | --- | --- |
+| Agent 会改文件、提交并需要回滚 | Codex 的 GitInfo、apply_git_patch、baseline | 需要维护独立 API；baseline 还会占临时磁盘 |
+| Agent 嵌在 IDE，查询频繁且工作目录不可信 | Claude Code 的 LRU 与 gitSafety.ts | 缓存要处理失效；安全检查只覆盖引用的攻击面 |
+| 框架服务多种 Agent，Git 只是可选工具 | OpenClaw 的 root 与版本戳 | coding 能力要由 skill 自己补 |
+| 只需告诉用户构建版本 | Hermes 的 banner | 状态、补丁和回滚仍由模型调用 shell |
 
 ## 从最小 Git 集成开始
 
-下面是从四家提炼的「自己写 git 集成」配方。先把基础四件套打牢，再加生产级特性，最后避开五个常见死路。
+下面是根据这些源码整理的起步清单。先让恢复和失败路径可观察，再按真实工作负载添加功能；这里的数字都是参考值，不是交付周期承诺。
 
 <BuildRecipe
   title="复刻方案"
   minimal={[
     '从 walk-up 找 git-root 起步（参考 OpenClaw 的 30 行实现）。从 cwd 一层层往上找直到看到 .git 目录，简单直接。这是任何 git 集成的第一步',
     '读 .git/HEAD 拿 commit 短 SHA 不依赖 git binary。git 不在 PATH（CI、container、极简系统）也能拿到 SHA。HEAD 文件格式简单（一行 ref 或 SHA）正则就能解析',
-    '所有 git 子进程加 5s timeout。大仓库下 git log、git status 能跑十几秒，不加 timeout 会卡住整个 agent。timeout 后用降级值（如 commit=unknown）避免 agent 启动失败',
+    '所有 git 子进程设置有界 timeout。可以先从源码中的 5s 预算开始，再用目标仓库测量调整；超时后返回可解释的降级值（如 commit=unknown），不要让启动失败',
     'git 操作走通用 shell 拦截器不要专门为 git 开后门。git 命令的危险性跟其他 shell 命令一样高（git push --force、git reset --hard 都能毁数据），别图方便给 git 单独开通道',
   ]}
   advanced={[
     '把 git 信息做成强类型对象注入 system context（参考 Codex 的 GitInfo）。{ commit, branch, remote_url, dirty } 字段对模型友好（模型不用自己解析 git status 输出），还能直接 i18n、加注释',
-    'commit、branch、remote_url 三件并行收集（用 Promise.all 或 tokio::join!）。git 命令各跑 100ms 串行就 300ms，并行只要 100ms。agent 启动时间是用户体验关键',
-    'findGitRoot 加 LRU 缓存（参考 Claude Code 的 50 entries）。同一会话内反复访问同一目录，缓存能省大量 walk-up 开销。50 entries 足够覆盖大多数 monorepo 场景',
+    'commit、branch、remote_url 尽量并行收集（用 Promise.all 或 tokio::join!）。并行可以减少串行等待，但具体收益要用你的仓库和文件系统测量',
+    'findGitRoot 加 LRU 缓存（参考 Claude Code 的 50 entries）。同一会话内反复访问同一目录时，缓存可以减少重复 walk-up；50 是该源码快照的实现参数，应按目标工作负载的命中率和内存占用重新选择',
     '做 baseline 快照机制（参考 Codex 的 ensure_git_baseline_repository）。sandbox 内单独维护一份干净的仓库副本。agent 改坏了一键 reset 到 baseline。这是「让 agent 大胆改但不怕改坏」的关键',
     '提供 apply_git_patch 高层抽象（参考 Codex 的 git-utils/apply.rs）。输入 patch 字符串、输出受影响文件列表。模型不用自己 git apply 然后处理 conflict，把这种繁琐细节抽掉',
     '加 bare-repo 攻击防御（参考 Claude Code 的 gitSafety.ts）。cwd 里出现 HEAD 加 objects、加 refs、触发告警。这是 git 被「假仓库」攻击的常见入口（路径穿越加 git internal write）',
@@ -467,13 +455,13 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
   avoid={[
     '别假设 git 在 PATH。CI 环境、container、windows 用户都可能没装。至少做一次启动检测（git --version），失败用降级模式（不读 git 信息），不要直接 throw 让 agent 挂掉',
     '别把 git status 输出原样塞给模型。输出是非结构化文本（中文、英文、不同 git 版本格式都不一样），模型解析率低。解析成 { branch, ahead, behind, files: [...] } 再传',
-    '别给 git reset --hard、git push --force 开后门。这些命令毁数据后无法恢复，必须走 execpolicy、permission mode 拦截。agent 看似「方便」迟早会出事故',
+    '别给 git reset --hard、git push --force 开后门。这些命令毁数据后无法恢复，需要走 execpolicy、permission mode 拦截。agent 看似「方便」迟早会出事故',
     '别忽视 worktree、submodule。.git 是文件不是目录的情况要处理（worktree 子目录的 .git 是文件指向主仓库）。submodule 的 .git 也是文件。忽视会导致误判仓库根',
-    '别让模型替你跑危险 git 命令时无 timeout。大仓库下 git log 能跑十几秒，git filter-branch 能跑几小时。强制 timeout 是基本盘',
+    '别让模型替你跑无界的 git 命令。大仓库、锁和历史重写都可能拖慢调用；设置 timeout，并在超时后给出下一步，而不是静默卡住',
   ]}
 />
 
-## 四种抽象厚度
+## 把差异留给决策点
 
 <Diagram
   src="/diagrams/08-layers.svg"
@@ -483,7 +471,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
 
 差一个数量级。Codex 那边 git-utils 一个 crate 几千行。Hermes 这边 25 行 banner 函数。两边都没错，只是 agent 定位不同。
 
-## 沿着 Git 边界读源码
+## Git 状态与回滚的核验入口
 
 <SourceTrail
   title="延伸阅读 · 源码入口"
@@ -498,7 +486,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/utils/git/gitFilesystem.ts', desc: '缓存层：branch、defaultBranch、head、remoteUrl、worktreeCount' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/tools/PowerShellTool/gitSafety.ts', lines: '1-130', desc: 'bare-repo 攻击加 git-internal write 攻击双重防御' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/commands/review.ts', desc: '/review 内嵌 prompt 加 /ultrareview 远程入口' },
-    { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/commands/pr_comments/index.ts', desc: '/pr_comments 完整工作流' },
+    { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/commands/pr_comments/index.ts', desc: '/pr_comments 较全工作流' },
     { system: 'OpenClaw', path: 'REF/openclaw/src/infra/git-root.ts', lines: '1-73', desc: 'walk-up 全部代码（30 行）' },
     { system: 'OpenClaw', path: 'REF/openclaw/src/infra/git-commit.ts', lines: '86-100', desc: '不走 git binary，直接读 .git/HEAD 拿 SHA' },
     { system: 'Hermes', path: 'REF/hermes-agent/hermes_cli/banner.py', lines: '195-256', desc: '_git_short_hash 加 get_git_banner_state 加 format_banner_version_label' },
@@ -524,13 +512,13 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
 
 本质区别是 **「git 是 agent 的核心抽象还是边缘元信息」** 的定位差异，背后是产品定位的差异。
 
-Codex 是 coding agent，最常见的任务路径是「读文件 走改文件 走提 commit 走跑测试 走推 PR」。这条路径里 git 出现 4-5 次，所以把 git 抽象成 first-class 工程是值得的。`GitInfo` 注入 system context 让模型一开始就知道当前 commit 加 branch。`apply_git_patch` 让 patch 落盘和 git add 合成一步。
+Codex 是 coding agent，一条完整任务可能经过读文件、改文件、检查状态、跑测试和准备提交，Git 会在多个节点参与。`GitInfo` 注入 system context 让模型一开始就知道当前 commit 加 branch，`apply_git_patch` 把 patch 落盘和 git add 合成一步；这些接口是否值得长期维护，要看产品里此类任务的实际占比。
 
 `baseline snapshot` 让 agent 把仓库改乱了也能一键回退。
 
 Hermes 是 multi-agent 研究平台，git 只是众多元信息之一（旁边还有 GPU 配置、环境变量、模型版本）。它的 banner 显示「upstream abc1234、local def5678、+3 carried commits」，告诉用户当前 agent 跑的是哪个版本。仅此而已。Hermes 用户的任务路径里 git 出现的次数不多于 GPU 信息，所以也没必要给 git 单独建抽象。
 
-工程哲学：**抽象厚度跟使用频率匹配**。用 100 次的 API 写 1000 行抽象成本回得来。用 1 次的 API 写 50 行就够。Hermes 没必要为了「agent 框架显得专业」硬上 git-utils。
+工程哲学：**抽象厚度跟使用频率和失败代价匹配**。高频、需要结构化恢复的 Git 路径值得独立 API；只展示版本戳的路径可以保持很薄。Hermes 没必要为了「agent 框架显得专业」硬上 git-utils。
 
 实战类比：
 
@@ -562,7 +550,7 @@ Hermes 是 multi-agent 研究平台，git 只是众多元信息之一（旁边�
 
 Codex 用 `JsonSchema` 加 `TS` derive macro 把 Rust 类型导出成 TypeScript 类型。`GitSha` 一处定义，前端拿到的就是 `type GitSha = string & { __brand: 'GitSha' }`（branded type）。前端的 fetch 调用、UI 状态管理都享受类型安全。
 
-工程哲学：**任何在系统里飘的 string 都该问：有没有合法格式？有就 newtype**。SHA、UUID、文件路径、URL、emoji codepoint、ISO timestamp，每个都该有自己的 newtype。代价是 5-10 行 wrapper 代码，收益是后面少 50 个 bug。
+工程判断：如果一个字符串有明确的合法格式和生命周期，就值得考虑 newtype。SHA、UUID、文件路径和 URL 都可以从边界校验开始；收益应通过编译错误、测试和维护成本来验证，不能预先折算成少多少 bug。
 
 类似设计：
 
@@ -581,7 +569,7 @@ Codex 不止 `GitSha`，还有 `RolloutId`、`SessionId`、`ConversationId` 全�
 <details>
 <summary>**Q3 · 概念**：Codex 的 `collect_git_info` 用 `tokio::join!` 并行收集，为什么不串行？</summary>
 
-串行对比并行的本质区别是 **「3 倍 RTT 还是 1 倍 RTT」**。
+串行与并行的差异取决于三条命令的实际耗时；独立调用的理论上限是等待最长的一条，而不是固定的倍数。
 
 `collect_git_info` 要拿三个东西：
 
@@ -589,9 +577,7 @@ Codex 不止 `GitSha`，还有 `RolloutId`、`SessionId`、`ConversationId` 全�
 2. 当前 branch：`git rev-parse --abbrev-ref HEAD`
 3. remote URL：`git config --get remote.origin.url`
 
-每条命令在大仓库里需要 100-500ms（git 启动开销加 fs 访问）。串行等于三条加起来 300-1500ms。并行等于 max(三条) 等于 100-500ms。三倍差距。
-
-agent 启动时间是 UX 的关键指标。500ms 对比 1500ms，用户能直观感受到。Codex 用 `tokio::join!` 把三条并发跑：
+本文没有记录这三条命令在某个仓库里的耗时，所以不写 100-500ms 或 500ms 对比 1500ms。Codex 用 `tokio::join!` 把三条并发跑；复现时应同时记录串行、并行、冷缓存和热缓存结果。
 
 ```rust
 let (commit_result, branch_result, url_result) = tokio::join!(
@@ -603,12 +589,12 @@ let (commit_result, branch_result, url_result) = tokio::join!(
 
 为什么不更进一步把所有 git 操作都并行？因为有些操作有 **数据依赖**：
 
-- 先拿 commit hash，再拿这个 commit 的 message 必须串行。
-- 先拿 branch，再拿 branch 的 upstream 必须串行。
+- 先拿 commit hash，再拿这个 commit 的 message 需要串行。
+- 先拿 branch，再拿 branch 的 upstream 需要串行。
 
 只有「彼此无依赖」的操作才能并行。`collect_git_info` 三件套刚好都不依赖，所以可以一波带走。
 
-工程纪律：**找系统启动路径上的「无依赖批次」一律并行**。Codex 还有几处这种优化：
+工程判断：启动路径上可以寻找没有数据依赖的批次，但是否并行要看资源竞争、错误处理和可观测性。Codex 的其他并行点需要逐一回到对应源码核验：
 
 - `app-server` 启动时并行 load config、sandbox spec、git info。
 - TUI 启动时并行 init terminal、load history、connect IPC。
@@ -634,10 +620,10 @@ malicious-dir/
 ├── objects/              ← 空目录
 ├── refs/                 ← 空目录
 └── hooks/
-    └── post-checkout     ← 真正的恶意代码（chmod +x）
+    └── post-checkout     ← 实际的恶意代码（chmod +x）
 ```
 
-agent 进入 `malicious-dir` 跑任何 git 命令（甚至 `git status`），git 会认为这是 bare repo，自动执行 `hooks/post-checkout`。模型完全没意识到这一步触发了 RCE。
+agent 进入 `malicious-dir` 后执行会读取或切换仓库状态的 Git 子命令，可能触发目录中的 hook；是否触发取决于子命令与配置。这里的 `git status` 是测试向量中的待验证命令，不是通用保证。
 
 **攻击 B · Git-internal write 加 git 复合命令**
 
@@ -670,7 +656,7 @@ if (command_creates_files_then_runs_git(parsed)) {
 
 **源码**：`claude-code/src/tools/PowerShellTool/gitSafety.ts:1-130`（攻击模式定义加 `validateGitArgs` 实现）。
 
-**追问**：「除了 PowerShell，bash 也有这毛病吗？」答：完全一样。Claude Code 在 BashTool 里走的是 23 项 ID 化检查加 tree-sitter，能识别「先创建 HEAD、objects 再跑 git」的复合命令模式。PowerShell 单独写一个 `gitSafety.ts` 是因为 PowerShell 的解析语义比 bash 更怪，需要专门写。
+**追问**：「除了 PowerShell，bash 也有这毛病吗？」复合命令的风险同样存在，但检测器和解析器并不相同。Claude Code 的快照分别在 BashTool 与 `gitSafety.ts` 中处理，不能把 PowerShell 的检查数量或行为直接外推到 bash。
 </details>
 
 <details>
@@ -700,19 +686,19 @@ baseline snapshot 是 Codex 在 sandbox 内单独维护的一个「干净 git �
 - **Git worktree**：多分支并行，但还是一个 .git。
 - **Codex baseline**：完全独立的 .git，与用户的工作流隔离。
 
-代价：baseline 占额外磁盘空间（worktree 大小的 1 倍）。Codex 通过 sandbox 临时目录管理，agent 结束就清理。
+代价：baseline 会复制工作区并占用额外磁盘空间，实际大小取决于复制策略、忽略规则和仓库内容。Codex 通过 sandbox 临时目录管理，agent 结束就清理。
 
 **源码**：[`codex/codex-rs/git-utils/src/baseline.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/git-utils/src/baseline.rs) 全部加 `lib.rs:60` 的 `pub use baseline::*`。
 
-**追问**：「我自己实现一个简化版需要多少代码？」答：约 80 行。核心步骤：(1) sandbox 启动时 `cp -r cwd /tmp/baseline-{uuid}` 然后 `git init && git add . && git commit`。(2) diff 时 `git --git-dir=/tmp/baseline-{uuid}/.git --work-tree=cwd diff`。(3) reset 时 `git --git-dir=/tmp/baseline-{uuid}/.git --work-tree=cwd checkout HEAD .`。三个命令落地。
+**追问**：「我自己实现一个简化版需要多少代码？」核心步骤是复制或快照工作区、初始化基线、比较 diff、执行恢复。代码量取决于跨平台复制、权限、忽略规则和中断恢复，不能用固定行数承诺。
 </details>
 
 <details>
 <summary>**Q6 · 实战**：你的 coding agent 要加 PR review 能力，从零开始怎么实现？</summary>
 
-最小可行 PR review 流程，从简到繁：
+按 **入口 → 结构化 → 发布 → 自动化 → 深度 → 项目规则** 六个 scope 推进；每个 scope 都用固定 diff 和失败路径验收。
 
-**Day 1 · slash command 加内嵌 prompt**
+**阶段 1 · slash command 加内嵌 prompt**
 
 参考 Claude Code `/review` 的 prompt-as-command 模式。用户输入 `/review 123`，agent 跑：
 
@@ -727,7 +713,9 @@ You are an expert code reviewer. Follow these steps:
 
 这一步无需写 PR API 集成代码，全靠 `gh` CLI 提供工具，模型自己组合调用。
 
-**Day 2 · 加结构化输出**
+**验收门槛**：固定 PR fixture 能稳定收集元数据和 diff，权限或命令失败时给出可行动错误。
+
+**阶段 2 · 加结构化输出**
 
 让模型用 JSON 输出 review 结果而不是 markdown：
 
@@ -742,7 +730,9 @@ type Review = {
 
 这样可以编程消费 review 结果，比如自动 post 到 PR comments。
 
-**Day 3 · post 到 GitHub**
+**验收门槛**：schema 覆盖缺字段、未知 severity 和空 findings；解析失败不会被当成通过。
+
+**阶段 3 · post 到 GitHub**
 
 拿到 JSON 后用 `gh pr comment` 把每条 quality_issue 发成 inline comment：
 
@@ -753,17 +743,25 @@ gh api repos/foo/bar/pulls/123/comments -f body=...
 
 或者用 `gh pr review --request-changes` 或 `--approve` 给一个总评。
 
-**Day 4 · 加 CI 集成**
+**验收门槛**：固定 findings 能映射到正确的 PR、文件和行；重复提交不会产生重复评论，权限失败会留痕。
+
+**阶段 4 · 加 CI 集成**
 
 把 `/review` 包装成 GitHub Action：每次 PR open 自动跑一次 review。这一步从交互式 agent 升级成 background agent（参见 18 章 cron、background tasks）。
 
-**Day 5 · 区分 review 类型**
+**验收门槛**：重复 webhook 可幂等处理，CI 取消和重试不会丢 findings，凭据不出现在日志。
+
+**阶段 5 · 区分 review 类型**
 
 加 `/ultrareview`：跑一个更深的 review，多步骤（先看架构 走再看安全 走再看性能 走最后 fitness）。Claude Code 的 ultrareview 走的是远程 pipeline，每一步用不同 prompt。这一步开始体现「review as multi-agent pipeline」。
 
-**Day 6+ · 集成项目特定规则**
+**验收门槛**：各阶段的输入、输出和失败回传可追踪；并行或远程调用的成本与收益用同一 diff 集对比。
 
-PR review 大头是项目特定的规则：「这个 module 不能依赖那个 module」「这个函数必须加单测」。把项目规则放 `~/.claude/AGENTS.md` 里，agent review 时自动加载。Codex 用 `AGENTS.md`，Claude Code 也用 `AGENTS.md`，OpenClaw 用 `claudeOcConfig`，机制类似。
+**阶段 6 · 集成项目特定规则**
+
+PR review 大头是项目特定的规则：「这个 module 不能依赖那个 module」「这个函数需要加单测」。把项目规则放 `~/.claude/AGENTS.md` 里，agent review 时自动加载。Codex 用 `AGENTS.md`，Claude Code 也用 `AGENTS.md`，OpenClaw 用 `claudeOcConfig`，机制类似。
+
+**验收门槛**：规则版本进入 review trace；冲突规则有确定优先级，且误报可由固定样本回归。
 
 **关键工程纪律**：
 
@@ -792,7 +790,7 @@ OpenClaw 的核心抽象是 **tool catalog 加 tool policy pipeline**（参见 0
 
 **3. OpenClaw 用户场景多样**
 
-OpenClaw 装上去可能是 coding agent，也可能是 customer support agent、scraping agent、data analysis agent。后三种根本不需要 git 抽象。如果平台层默认给所有 agent 都套一层 git，对非 coding agent 就是浪费。
+OpenClaw 装上去可能是 coding agent，也可能是 customer support agent、scraping agent、data analysis agent。这些例子说明平台不能预设每个工作负载都需要 git 抽象；默认把完整 git 层装进控制面，会让非 coding 工作负载承担用不到的接口和维护面。
 
 OpenClaw 给出的折中是：**`git-root.ts` 只提供「在哪个仓库」这种平台元信息**，让 sandbox 边界、日志归类有 anchor 用。至于「用 git 做什么」完全交给具体 skill。
 
@@ -877,9 +875,9 @@ Codex 接受多种 patch 格式：unified diff、git diff with binary、V4A 都�
 <details>
 <summary>**Q9 · 实战**：你接手一个 agent 项目，git 处理全部走 `subprocess.run("git ...")`。如何渐进式升级？</summary>
 
-按 **从可见性到结构化到抽象到防御** 四阶段升级。
+按 **可见性 → 结构化 → 基线 → 防御** 四个 scope 推进；每个 scope 先通过固定 fixture 的验收，再决定是否增加下一层。
 
-**第 1 阶段（1 周）· 把 git 调用集中化**
+**第 1 阶段 · 把 git 调用集中化**
 
 现状：项目里到处 `subprocess.run(["git", ...])`。第一步把这些调用集中到一个 `gitutil.py`。
 
@@ -891,7 +889,11 @@ def run_git(*args, cwd=None, timeout=5):
 
 所有 `subprocess.run("git ...")` 替换成 `run_git(...)`。一处加 timeout、一处加日志、一处加错误处理。
 
-**第 2 阶段（1 周）· 加结构化解析**
+**验收门槛**：静态扫描确认业务代码不再直接拼接 git 调用；固定 fixture 覆盖 timeout、stderr 和非零退出，且错误能回到调用方。
+
+**第 2 阶段 · 加结构化解析**
+
+**前置**：集中执行器已经统一 cwd、timeout 和错误处理。
 
 最常用的几个 git 命令包装成函数：
 
@@ -915,11 +917,19 @@ def recent_commits(cwd: Path, n: int = 10) -> list[CommitInfo]:
 
 模型拿到结构化对象而不是 raw stdout。
 
-**第 3 阶段（2 周）· baseline snapshot**
+**验收门槛**：用固定仓库 fixture 对 branch、status、log 的解析结果与 Git CLI 交叉核对，并确认异常输出不会静默变成空对象。
+
+**第 3 阶段 · baseline snapshot**
+
+**前置**：产品需要在一次 agent run 前后区分用户已有改动和 agent 新增改动。
 
 实现简化版 baseline（参见 Q5）。Agent 启动时 dump 一份干净副本，结束时 cleanup。提供 `reset_to_baseline()` 和 `diff_since_baseline()`。
 
-**第 4 阶段（2 周）· 安全防御**
+**验收门槛**：固定 fixture 依次执行 apply、diff、reset；reset 可重复，且不会覆盖 fixture 预先存在的未提交改动。
+
+**第 4 阶段 · 安全防御**
+
+**前置**：agent 能操作不受信任的仓库或工作目录，且威胁模型已经写成可执行的测试向量。
 
 加 gitSafety 双重攻击防御：
 
@@ -935,7 +945,9 @@ def validate_git_args(args: list[str], cwd: Path) -> str | None:
 
 每次 `run_git` 前先调这个 validator。命中就拒绝。
 
-**第 5 阶段（持续）· prompt as command**
+**验收门槛**：bare-repo 和 compound-attack fixture 必须被拒绝；正常仓库的常用命令仍通过，并把 verdict 写入审计日志。
+
+**第 5 阶段 · prompt as command（按需）**
 
 把高频 git 操作做成 slash command 加内嵌 prompt（参考 Claude Code）：
 
@@ -943,7 +955,7 @@ def validate_git_args(args: list[str], cwd: Path) -> str | None:
 - `/commit`：让 agent 自动写 commit message 并提交。
 - `/diff-since-baseline`：让 agent 看 agent run 改了什么。
 
-每个 slash command 都是一段精心写好的 prompt，模型读完知道按什么顺序调 `git` 工具。
+每个 slash command 都是一段精心写好的 prompt，模型读完知道按什么顺序调 `git` 工具。只有当命令序列稳定、用户会重复执行时才增加这一层；验收看固定任务的调用顺序和失败提示是否稳定。
 
 **关键工程纪律**：
 
@@ -954,15 +966,15 @@ def validate_git_args(args: list[str], cwd: Path) -> str | None:
 
 **源码参考**：从最简到最复杂，OpenClaw `git-root.ts:1-73` 走 Hermes `banner.py:213-238` 走 Claude Code `utils/git.ts:1-100` 走 Codex `git-utils/src/info.rs:1-200`。一步步爬，不要跳。
 
-**追问**：「公司的 monorepo 太大，`git log` 一跑 30 秒怎么办？」答：1. 加 timeout（5 秒）加 fallback 路径（show 「git too slow, please run manually」）。2. 用 `git log --max-count=10` 限制返回行数。3. 缓存 git_info 结果（LRU），不要每次都重新跑。Claude Code 的 LRU(50) 就是这个用途。
+**追问**：「公司的 monorepo 太大，`git log` 很慢怎么办？」先用有界 timeout 和可见的 fallback，再用 `--max-count` 限制输出；缓存是否有效，要看目标仓库的命中率和失效规则。Codex 的 5 秒与 Claude Code 的 LRU(50) 是参考实现参数，不是通用答案。
 </details>
 
 <details>
 <summary>**Q10 · 开放**：设计一个「agent 友好的 git 抽象层」，可以集成进任何语言的 agent 项目。</summary>
 
-把四家的精华抽出来：
+按目标约束组合可借鉴模式：
 
-**核心 API（必须）**
+**核心 API（需要）**
 
 ```typescript
 // Layer 1: 元信息
@@ -1007,7 +1019,7 @@ interface BaselineHandle {
 async function ensureBaseline(cwd: string): Promise<BaselineHandle>;
 ```
 
-**安全层（必须）**
+**安全层（需要）**
 
 ```typescript
 interface GitSafetyValidator {
@@ -1044,7 +1056,7 @@ const reviewCommand = createSlashCommand({
 
 模板化的 prompt-as-command。
 
-**完整 API 示例**
+**较全 API 示例**
 
 ```typescript
 import { createGitUtils } from '@your-org/git-utils';
@@ -1071,13 +1083,13 @@ await baseline.reset();  // 一键回退
 - 比 OpenClaw 多 patch 加工作流抽象。
 - 比 Hermes 多结构化加安全。
 
-工程投入：3-4 人月加 1 月文档、测试。比单独移植 Codex git-utils 便宜（因为去掉了 Rust 特有的细节），比 OpenClaw 复杂（因为加了 patch 工作流）。
+工程投入需要按目标语言、平台、仓库规模和恢复测试矩阵重新估算。这个组合比 OpenClaw 的 root 加版本戳多出 patch、baseline 与安全验证范围，不能从四个源码快照直接推导固定人月。
 
 **跨语言**：核心 API 设计成 JSON in、out，每种语言（TS、Python、Rust、Go）各实现一份执行器，共享同一份 GitSafety validator 规则。
 
 **源码组合**：Codex `git-utils/src/lib.rs` 全加 Claude Code `utils/git.ts:1-100` 加 OpenClaw `git-root.ts:1-73` 加 Hermes `banner.py:213-238`。每家拿一段拼起来就是你的 git-utils v0.1。
 
-**追问**：「如何处理 git LFS、submodule、worktree？」答：v0.1 不处理 LFS，提供 escape hatch（「如果命令需要 LFS，直接走 shell」）。Submodule 在 `findGitRoot` 里处理（.git 是文件而非目录的情况）。Worktree 同理。这三种 corner case 加起来再多写 50-80 行。
+**追问**：「如何处理 git LFS、submodule、worktree？」答：v0.1 可以先保留 escape hatch，把 LFS 交给 shell；submodule 和 worktree 要在 `.git` 为文件时单独测试。实现增量取决于平台和测试矩阵，不能预先承诺固定行数。
 </details>
 
 </details>

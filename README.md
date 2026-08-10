@@ -20,7 +20,7 @@ The public surface is intentionally bilingual:
 
 - **Astro 6** + **Starlight 0.39** — 静态站点 + 文档骨架
 - **MDX** — 章节内嵌 Astro 组件
-- **Pagefind** — 全文搜索（61 页索引）
+- **Pagefind** — 全文搜索
 - **Sharp** — 图片优化
 
 ## 开发
@@ -35,10 +35,10 @@ pnpm dev          # http://localhost:4321
 | 命令 | 用途 |
 |------|------|
 | `pnpm check` | astro check（TypeScript + content schema） |
-| `pnpm check:template` | 每章 10 段模板齐 |
+| `pnpm check:template` | 检查元数据、证据入口、标题与附录锚点 |
 | `pnpm check:i18n` | 中英文章节 1:1 对齐 |
 | `pnpm check:all` | 上面三件套 |
-| `pnpm build` | SSG 输出到 `dist/`（61 pages） |
+| `pnpm build` | SSG 输出到 `dist/` |
 | `pnpm preview` | 本地预览 build 产物 |
 
 ## Deploy
@@ -72,29 +72,24 @@ src/content/docs/             # 中文（默认 locale = root）
 └── systems/                  # 4 个系统画像
 src/content/docs/en/          # 英文镜像（i18n parity 由 CI 校验）
 src/content/i18n/             # UI 字符串翻译
-src/components/               # 9 个 MVP Astro 组件
+src/components/               # 文章与站点 Astro 组件
 src/styles/                   # tokens + handdrawn 主题
 diagrams/                     # Excalidraw 源文件（入仓）
 public/diagrams/              # 导出的 SVG/PNG（部署用）
 scripts/                      # 模板与 i18n 校验脚本
 ```
 
-## 章节模板
+## 编辑契约
 
-每章固定 10 段（CI 强制校验），新增章节请参考 `src/content/docs/patterns/02-agent-loop.mdx`。模板规则见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+Pattern 文章不再复制固定十段。每篇围绕一个工程冲突组织，保留可追溯源码，同时说明版本、证据类型、失败代价和结论边界。CI 检查：
 
-| § | 段落 | 用途 |
-|---|------|------|
-| §1 | Verdict（30 秒结论） | 直接表态 |
-| §2 | CompareTable（对照表） | 四家横向对照 |
-| §3 | 深度剖析 | 关键设计来龙去脉 |
-| §4 | 共同点 | 最小公约数 |
-| §5 | 不同点 | 取舍背后的分歧 |
-| §6 | BuildRecipe（复刻方案） | MVP / Advanced / Don't 三档 |
-| §7 | 架构图 | AgentLoopSVG / Diagram |
-| §8 | 设计点评 | 评审视角建议 |
-| §9 | SourceTrail（源码路线） | 关键文件 + 行号 |
-| §10 | 小练习 | 一道动手题 |
+- `author`、`last_verified`、`evidence` 元数据；
+- 至少四个不重复的二级标题；
+- 至少一个源码或外部证据入口；
+- 中文结论不超过 280 字，英文不超过 600 字符；
+- 练习和复盘题位于稳定的折叠附录。
+
+完整规则见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
 
 ## 视觉与组件
 
@@ -104,11 +99,11 @@ scripts/                      # 模板与 i18n 校验脚本
 
 ## 写新章节的最短路径
 
-1. 复制 `src/content/docs/patterns/02-agent-loop.mdx` 改 frontmatter
-2. 按 10 段模板填内容
-3. 同步建一份 `src/content/docs/en/patterns/<同名>.mdx`
-4. 跑 `pnpm check:all` 确认通过
-5. PR 时附 `pnpm build` 输出（61 pages 全绿）
+1. 写下文章只回答的一个工程问题和证据类型。
+2. 从最能暴露取舍的源码行为、失败或约束开场。
+3. 同步复写 `src/content/docs/en/patterns/<同名>.mdx`。
+4. 跑 `pnpm check:all` 和 `pnpm build`。
+5. PR 说明核验日期、source snapshot 和未验证边界。
 
 ---
 

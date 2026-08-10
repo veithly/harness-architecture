@@ -1,34 +1,62 @@
 ---
-title: 19 · 自我改进：agent 什么时候学习
+title: 19 · Agent 学到的规则，谁批准写回
 sidebar:
   order: 19
-description: agent 该不该自己「长记性」？四家系统在「什么时候学、用谁的算力学、学到的东西写到哪里、怎么保证学习过程本身不被攻击」这几个问题上选了完全不同的答案。
+description: 追踪经验从采集到写回的安全边界，决定何时让 Agent 学习、谁来批准以及怎样撤销旧结论。
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
-import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## 自我改进先从可审计反馈开始
+## Agent 学到的规则，谁批准写回？
 
-<Verdict tldr="自我改进真正的工程难题不是能不能学，而是几个相互拉扯的子问题：什么时候学（学习这件事本身要不要消耗用户当前对话的时间和算力？）、用谁的算力学（让主对话里的模型抽时间总结？还是另起一个 LLM 任务专门做？还是让用户自己来？）、学到的东西写到哪儿（写在文件里以后注入到 prompt？写进向量索引等检索时再用？）、怎么保证学的内容安全（如果 prompt 注入混进了记忆，等于植入了一个长期生效的后门）。四家系统在这几个问题上分别给出了不同的答案：Codex 选择在主对话外另起 LLM 任务定期做整合（Phase 1 stage1 单次会话即时摘要，Phase 2 global consolidate 跨会话整合并去重），把自我改进当成一项严肃的基础设施工作，并且用一份长达数百行的 prompt 严格规定整合的产物长什么样、什么算高价值经验、什么坚决不能写进来。Claude Code 选择完全交给用户决定何时学、学什么，重要的沉淀动作必须用户主动按下按钮（disableModelInvocation 配置开关：模型无权自行写 skill，必须用户在 UI 上主动确认），模型无权自行决定。OpenClaw 选择最被动的路径：根本不写经验文件，只是把每次会话落盘的内容索引起来，加上时间衰减，让学自然发生在检索的那一刻。Hermes 选择最克制：让 agent 在对话过程中显式调用记忆工具，但把每条记忆的字符上限设得很死，并在写入之前过一遍威胁特征库（_MEMORY_THREAT_PATTERNS 11 条正则，加 10 种不可见 Unicode 字符的检查），确保任何疑似注入的内容都进不了长期 prompt。要在团队里沉淀可复用流程，借 Codex 加 Claude Code。要零成本积累经验，照搬 OpenClaw。要让记忆抗注入，参考 Hermes。" />
+<Verdict tldr="先看写回边界：谁能把经验写进下一次会话会读到的长期 prompt，写回前如何核验，删除后又怎样重建？本文追踪经验从采集到写回的边界，比较后台整合、用户触发、按需索引和受限写入何时适用。源码观察不代表这些路径已在本站完成评测。"/>
 
-## 四种“学习”机制
+自我改进不是“让模型自己变聪明”这么简单。要先决定谁有权写、写到哪里、如何撤销，以及怎样证明一条经验来自可核验的输入。
+
+## 先把学习链路拆开
+
+| 阶段 | 要回答的问题 | 需要留下的证据 |
+| --- | --- | --- |
+| 采集 | 哪段会话值得继续看？ | thread、rollout、cwd、时间 |
+| 提炼 | 哪句话是可复用经验，哪句只是猜测？ | 原文短语、失败条件、来源引用 |
+| 写回 | 谁批准它进入 prompt 或 skill？ | 用户确认、规则扫描、版本快照 |
+| 遗忘 | 输入被删除或过期后怎么撤销？ | watermark、变更记录、重建入口 |
+
+## 只有产生决策差异时才比较
+
+Codex 把 stage1 与 phase2 分开，适合跨会话提炼，但后台模型需要锁、冷却和 forgetting 规则。Claude Code 的 `skillify` 由用户启动并审核，写回边界清楚，代价是需要用户参与。
+
+OpenClaw 不重写 lessons 文件，而是在检索时组合历史片段；它省掉 consolidation，却也没有结构化工作流。Hermes 允许 turn 内写入，但用字符上限、冻结快照和威胁扫描缩小持久化入口。
+
+这些是 source observation。报告中的“800 行 prompt”“30 天衰减”等数字只描述源码配置，不代表跨产品效果。
+
+## 一个可撤销的写回流程
+
+```text
+collect -> redact -> review -> write snapshot -> verify on use
+                       \-> reject / delete / rebuild
+```
+
+先把原始输入当数据，再让模型提炼。写入前保留用户可读的 diff；下一次使用时检查文件、函数或策略仍存在。删除源材料时，能从 immutable 输入重建。
+
+落地前检查：
+
+- 是否能看到这条经验的原始短语和来源？
+- 模型能否自行触发持久化写入？
+- 写入内容是否过 secret、注入和不可见字符扫描？
+- 删除后是否有可重建的路径？
+
+## 源码底稿：按实现展开
 
 <details>
-<summary>读前提示（按需展开）</summary>
-
-- **难题不是能不能学**：而是什么时候学、用谁的算力学、学到的写到哪、怎么保证学习过程安全，四个子问题互相拉扯。
-- **触发权分歧最大**：Codex 让后台 LLM 任务定期自动整合（stage1 + global consolidate），Claude Code 用 disableModelInvocation 规定模型无权自写 skill、必须用户主动确认。
-- **prompt 决定产物质量**：Codex 用一份数百行的 prompt 严格规定什么算高价值经验、什么坚决不能写进来。
-- **最大的坑**：prompt 注入混进记忆等于植入长期后门，Hermes 写入前过 _MEMORY_THREAT_PATTERNS 11 条正则加 10 种不可见 Unicode 检查。
-
-</details>
+<summary>源码底稿：按实现展开</summary>
 
 <Diagram
   src="/diagrams/19-self-improvement-base.svg"
@@ -38,32 +66,19 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 四家在「何时学、谁写、写到哪、怎么安全」上的差异：
 
-<CompareTable
-  rows={[
-    { label: '何时学', values: ['turn 外（Phase 1 per-turn 加 Phase 2 global，6h 冷却）', '用户显式调用 skillify、`/insights`、autoMode critique', '被动：每次 session 落盘自动进索引', 'turn 内：agent 主动调 memory tool'] },
-    { label: '谁写', values: ['独立 LLM job（global lock 加 worker）', 'session 内的 main model 或 Opus（`/insights` 固定 Opus）', '索引系统（embeddings 加 FTS5），不重写文本', '当前 turn 的 agent'] },
-    { label: '产物', values: ['MEMORY.md（任务族）加 memory_summary.md（profile）加 skills/<name>/', 'SKILL.md 写到 ~/.claude/skills/ 或 .claude/skills/', 'SQLite 索引。MEMORY.md 仍是手编', 'MEMORY.md（2200 char）加 USER.md（1375 char）加 § 分隔'] },
-    { label: '范围', values: ['user、global（thread 级 stage1 走用户级 phase2）', 'project、personal（用户选）', 'agent-level（按 agentId 分目录）', 'profile 级（每 HERMES_HOME 一份）'] },
-    { label: '安全', values: ['raw rollout 视为数据。redact 标记 [REDACTED_SECRET]', '运行 disableModelInvocation 等于必须用户主动按', 'sanitize、redact_sensitive_text', '_MEMORY_THREAT_PATTERNS 11 条加 10 个 invisible unicode'] },
-    { label: '冷启动', values: ['INIT 模式：从零建 MEMORY.md 加 memory_summary.md', 'session memory 加 user messages 直接进 prompt', '空索引，session 累积', '空文件，agent 边干边写'] },
-  ]}
-  caption="自我改进 等于 触发模式 乘 改写主体 乘 产物粒度 乘 安全防线"
-  dimensionLabel="维度"
-/>
-
 ## 四套系统怎样积累经验
 
 ### Codex · 把「学习」做成一项独立工程
 
 Codex 看待自我改进的角度很工程化：**学习这件事不该跟主对话抢算力，也不该让用户去操心。它应该像编译、像备份一样，是一个有明确触发条件、有明确产物、有明确节流策略的后台任务**。基于这个判断，它把整个流程拆成了前后两个阶段。
 
-第一阶段很轻量，就在普通会话进行的过程中悄悄发生：每完成一次对话，Codex 会把这一轮值得记录的内容抽取一份摘要，连同一些 metadata（当前的工作目录、当前的 git 分支、本次会话的标识）一起写进一张本地数据库表。这一阶段几乎不增加成本，它的作用是为后续真正的整合工作准备原料。
+第一阶段在普通会话过程中运行：每完成一次对话，Codex 会把这一轮值得记录的内容抽取一份摘要，连同一些 metadata（当前的工作目录、当前的 git 分支、本次会话的标识）一起写进一张本地数据库表。它的资源开销取决于摘要模型、会话量和存储实现；从源码能确认的是，这一步只为后续整合准备原料。
 
-第二阶段是真正的学习时刻，但它不发生在用户的对话里。它是一个**独立的 LLM 任务**：独立的进程、独立的 prompt、独立的输出文件。这个任务读取三种输入：第一阶段攒下来的所有原始摘要、之前会话留下来的更长的回放摘要，以及当前已经存在的长期记忆文件。然后它做一件事：重写出新版本的长期记忆文件、更新概况摘要、并且在适当的时候自动产出一个新的 skill 文件。
+第二阶段执行的是整合写回，而不是已被评测证实的「学习」。它是一个**独立的 LLM 任务**：独立的进程、独立的 prompt、独立的输出文件。这个任务读取三种输入：第一阶段攒下来的所有原始摘要、之前会话留下来的更长的回放摘要，以及当前已经存在的长期记忆文件。然后它重写长期记忆文件、更新概况摘要，并在满足条件时生成 skill 文件。
 
 这个过程被几个工程上的约束保护着：同一时间只允许一个这种任务在跑（用全局锁串行化）、每次成功之后强制冷却几个小时（避免把账单烧光、也避免没多少新材料就反复重写），并且通过一个「输入水位线」机制确保不会把同样的原始摘要消费两遍。
 
-让这一切真正能起作用的关键，不是数据库表也不是冷却机制，而是**指导第二阶段那段长长的 prompt 本身**。这份 prompt 把「什么算值得记的经验」做了严格定义。
+真正决定第二阶段怎样取舍的是那段 consolidation prompt；数据库表、锁和冷却只负责运行边界。源码说明了 prompt 的目标与格式，但没有证明这些规则能让长期任务完成率提高。
 
 <SourceBlock path="REF/codex/codex-rs/memories/write/templates/memories/consolidation.md" lines="1-20" system="codex" summary="一份明确把'帮未来的 agent 用更少的工具调用、更少的推理 token 解决类似任务'作为目标的长期记忆整合 prompt 开篇。">
 
@@ -86,6 +101,8 @@ The goal is to help future agents:
 
 </SourceBlock>
 
+这里的“减少工具调用和推理 token”是 prompt 写给整合任务的目标，不是本站测得的收益。
+
 这份 prompt 在工程上做了几件值得反复琢磨的事。
 
 第一件是**给"高价值经验"画了一条明显的线**。线之上是：稳定的用户偏好（"这个用户在审 PR 时总希望先跑测试再看 diff"）、决策触发器（"看到这种症状直接走 X 路径就行，不用再探索"）、失败防护盾（"症状是 A、原因是 B、修法是 C、验证方式是 D、什么时候应该停手"）、仓库结构地图（入口在哪、配置在哪、常用命令是什么）、工具的小怪癖、被证实可行的复现步骤。
@@ -96,19 +113,19 @@ The goal is to help future agents:
 
 第三件是**"保留原词原句"的硬规则**。当原始日志或者用户消息里出现一个具体的短语时，整合后必须保留这个短语，不许把它改写成一个抽象的同义词。背后的考量有三层：一是给以后用 `grep` 等文本工具查找留住钩子（"找不到文件 URL"这种字符串以后就能直接搜得到）；二是保留知识的来源属性（是"用户说过的话"还是"我自己推断的"，措辞决定了可信度）；三是用户重读"自己说过的话"会更容易识别和修正，而读一段被改写过的、显得很正式的概括反而提不起警觉。
 
-第四件是**让 skill 自动从经验里浮现出来**。如果同一个工具序列在多次会话里反复出现，或者同一个失败防护盾不止一次救场了，整合阶段就会主动把它抽成一份 skill 文件。skill 不再是用户手编的，而是经验积累的自然副产物。
+第四件是**允许整合阶段从重复经验中提取 skill**。如果同一个工具序列在多次会话里反复出现，或者同一个失败防护盾不止一次救场了，源码允许把这个模式抽成一份 skill 文件；它是否有用仍需人工复核和任务评测。
 
 第五件是**有遗忘机制**。任何记忆系统如果只会加、不会减，最终都会被噪音淹没。Codex 把"哪些原始摘要还活着、哪些已经被删了"作为整合的输入之一：一旦发现某条原始摘要被删掉了，就把长期记忆里只依赖于这条摘要的相关段落同步移除；如果某个段落同时依赖好几条摘要、只删了其中一条，那就把这个段落拆开重写，只去掉那部分。这种"手术式遗忘"比"过期就清空"温和得多，也保留了那些有多重证据支撑的记忆。
 
 ### Claude Code · 把"什么时候学"完全交给用户
 
-Claude Code 在自我改进上的姿态可以一句话概括：**模型自己不能决定「我现在要把这次经验沉淀下来」，必须用户主动按下那个按钮**。这种「显式优先」的态度跟前一家形成鲜明对比，背后的理由很清晰：任何让 agent 自动把内容写入长期 prompt 的设计，都给了攻击者一个可能的注入入口。让用户做最后一步确认，是最便宜也最有效的防御。
+Claude Code 在自我改进上的姿态可以一句话概括：**模型自己不能决定「我现在要把这次经验沉淀下来」，必须用户主动按下那个按钮**。任何自动写入长期 prompt 的设计都会扩大持久化入口；用户确认让这条边界可见，但不能单独证明内容安全，也不能替代扫描、权限和撤销。
 
 它围绕这种姿态搭了三件相互独立的工具。
 
-第一件是**对话沉淀向导**。当用户觉得刚才这次会话产出的工作流值得保留下来时，可以主动启动这个向导。向导本身是一份特殊的 skill：它有一个明确的标志告诉系统「模型不能自己触发我，必须等用户调用」。一旦启动，它就会用四轮简短的多选式交互（详见第 17 章）把这次会话蒸馏成一份完整的 skill 文件。整个过程的关键不是问答的内容，而是**人在决定要不要保留**：模型只是个执行者。
+第一件是**对话沉淀向导**。当用户觉得刚才这次会话产出的工作流值得保留下来时，可以主动启动这个向导。向导本身是一份特殊的 skill：它有一个明确的标志告诉系统「模型不能自己触发我，必须等用户调用」。当前 prompt 用四轮多选式交互（详见第 17 章）生成一份待审核的 skill 草稿。关键边界是**人在决定要不要保留**，不是四轮这个数字本身。
 
-<SourceBlock path="REF/claude-code-2.1.88-expanded/src/skills/bundled/skillify.ts" lines="22-90" system="claude-code" summary="模型不能自行启动的沉淀向导，必须由用户主动触发；通过四轮简短交互把当前会话产出的工作流蒸馏成一份完整的 skill。">
+<SourceBlock path="REF/claude-code-2.1.88-expanded/src/skills/bundled/skillify.ts" lines="22-90" system="claude-code" summary="模型不能自行启动的沉淀向导，必须由用户主动触发；当前 prompt 通过四轮交互生成一份待用户审核的 skill 草稿。">
 
 ```ts
 const SKILLIFY_PROMPT = `# Skillify {{userDescriptionBlock}}
@@ -145,35 +162,35 @@ Round 4: Final questions (when_to_use trigger phrases + gotchas)
 
 </SourceBlock>
 
-第二件是**对话洞察报告**。用户可以让系统对自己的全部历史会话跑一次分析，它会强制使用最强的模型分两轮处理：第一轮把会话按主题、按工具使用、按时间分布做特征提取，第二轮把这些特征叙述成一份可读的 markdown 报告。这份报告**只给用户看**，不会被写回到任何长期 prompt 里。这一点跟 Codex 的做法形成对比：Codex 的整合产物会被未来的会话直接读到 prompt 里，而 Claude Code 的洞察报告只是给人看的资料。
+第二件是**对话洞察报告**。当前源码固定调用 `getDefaultOpusModel()` 并分两轮处理：第一轮按主题、工具使用和时间分布提取特征，第二轮生成 markdown 报告。固定模型是实现选择；本文没有比较不同模型的报告质量。这份报告**只给用户看**，不会被写回长期 prompt。
 
 第三件是**规则评审**。如果用户为 agent 写了一份"自动批准 / 软拒绝 / 重置环境"的规则文件，可以让一个 LLM 把这些规则审一遍，指出哪些规则过于宽松、哪些规则之间彼此矛盾。注意这是在**审用户写下的规则**，不是让 agent 自己去学新规则，主动权依然在用户手里。
 
-这三件工具背后是同一种哲学：**agent 不能自己悄悄学新东西**；学习的时机由用户控制，学习的产物（无论是 skill 还是洞察报告）由用户预览或仅供用户阅读。代价是用户必须勤快，如果用户不主动按按钮，那这个 agent 就永远不会成长；但收益是整个长期 prompt 是绝对干净的，任何一段进入长期 prompt 的内容都经过了人的明确同意。
+这三件工具背后是同一种哲学：**agent 不能自己悄悄学新东西**；学习的时机由用户控制，学习的产物（无论是 skill 还是洞察报告）由用户预览或仅供用户阅读。代价是用户必须主动参与；收益是长期 prompt 的写入边界更清楚。用户确认能降低未经审核内容进入 prompt 的风险，但不能替代内容扫描、来源核验和撤销机制。
 
 ### OpenClaw · 不写经验文件，让"学"发生在检索里
 
-OpenClaw 选择了一条更激进的路：**它根本就不试图"沉淀经验"，因为它不相信谁能可靠地判断哪些内容值得沉淀**。它认为更稳健的做法是把所有会话内容索引起来，配合一个聪明的检索系统，让 agent 在每次需要做事之前先去"查"，从查到的东西里临时学一遍。也就是说，"自我改进"不发生在某个写入时刻，而是发生在每一次检索时刻。
+OpenClaw 走的是检索路径：它把会话内容切片并建立全文与向量索引，在查询时组合结果，而不是在这里生成结构化 lesson 或 skill。源码能说明这条数据路径，不能替作者推断产品“相信”或“不相信”什么。
 
 具体怎么实现？每次会话结束、内容落盘的时候，索引系统会自动把这次会话的文字抽出来，切成小段，分别建立两种索引：一种是传统的全文搜索索引（用来匹配关键词），一种是向量索引（用来匹配语义相似度）。这两种索引并存的好处是：用户问"上次那个让 X 报 401 的 bug 怎么修的"时，全文索引能精准锁定"X"和"401"这种关键词；用户问"那个跟权限校验有关的问题"时，向量索引能找到没用同一个词但意思相近的会话。
 
-光有索引还不够：三年前的某次随手记录跟昨天的某次精确总结显然不该一视同仁。OpenClaw 给老内容加了**时间衰减**：每过 30 天权重减半，越老的内容在检索时排得越靠后。但有一类内容例外，就是用户显式标记为"长青"的那部分（通常是手动维护的 MEMORY.md），它们不参与衰减。这种区分让"昨天的小笔记自然褪色，但常青的设计约束永远在前面"。
+OpenClaw 源码还提供可选的**时间衰减**：启用后，默认半衰期参数是 30 天；当前配置默认 `enabled: false`。日期文件进入衰减路径，`MEMORY.md` 等其他路径被当作 evergreen 跳过衰减。这里的 30 天和路径分类是实现配置，不是召回质量结论；evergreen 也不代表内容仍然正确。
 
-最终的检索结果不是单一信号决定的：语义相似度、关键词匹配、时间衰减、还有一个用来避免结果重复的多样性约束被一起加权排序，得到最适合当下查询的几条记忆。配合一份强制性的 prompt 提示，告诉 agent 在动手做事之前必须先查一次记忆，这套系统就完成了它的"学习"。
+最终结果由语义相似度、关键词匹配、可选时间衰减和多样性约束共同排序。工具描述还要求相关任务先查记忆；是否实际调用、返回内容是否有用，仍要看运行时执行和带标签查询集，不能直接等同于“学会了”。
 
-这种模式的最大代价是**没有结构化的 skill 这一层**：你永远不会从这套系统里得到"用户的偏好列表"或者"标准化的工作流文件"，它只是一堆按相关性排好序的会话片段。如果你的产品对"沉淀工作流"的需求不强，这个代价完全可以接受，换来的是几乎零运维成本的经验积累。
+这种模式的最大代价是**没有结构化的 skill 这一层**：你不会从这套系统自动得到"用户的偏好列表"或者"标准化的工作流文件"，而是得到一堆按相关性排好序的会话片段。它省去了写回和版本迁移工作，但索引、存储、召回质量仍需要维护；如果产品对"沉淀工作流"的需求不强，这个取舍可能更合适。
 
 ### Hermes · 让 agent 在对话里显式写，但写得极克制
 
 Hermes 把「学」的入口放回到了对话之内：让 agent 在某一轮对话过程中显式调用一个工具来写记忆。但它给这个工具设了一套严格的边界，避免变成 agent 想写什么就写什么。
 
-第一道边界是**只允许写两份文件、只允许做四种操作**。一份是流程记忆（限 2200 个字符），一份是用户偏好（限 1375 个字符）。允许的操作只有四种：添加一条、替换一条、移除一条、读一条。条与条之间用一个特殊分隔符切开。不允许写第三份文件，不允许引入复杂的嵌套结构。这种克制的目的是让「记忆」变成一份很窄的合约：agent 永远不会以为它在写「自由形式的笔记」，而是在做一个明确的小动作。
+第一道边界是**只允许写两份文件、只允许做四种操作**。一份是流程记忆（限 2200 个字符），一份是用户偏好（限 1375 个字符）。允许的操作只有四种：添加一条、替换一条、移除一条、读一条。条与条之间用一个特殊分隔符切开。不允许写第三份文件，不允许引入复杂的嵌套结构。这种克制的目的是让「记忆」变成一份很窄的合约：工具不允许写自由形式的笔记，而是要求 agent 执行一个明确的小动作。
 
-第二道边界是**用字符数限制而不是 token 数限制**。理由很务实：token 数会随模型变化（同一段中文在不同 tokenizer 下 token 数可能差好几倍），不可预测；字符数则跨模型一致。再说限制本身的目的是逼着作者做"什么该留、什么该删"的取舍：超出上限就必须替换某条旧的，不能无限堆积。
+第二道边界是**用字符数限制而不是 token 数限制**。字符数能用静态 schema 校验，而 token 数随 tokenizer、语言和模型变化。2200/1375 是 Hermes 当前实现上限，不能固定换算成上下文 token，也不是其他产品的推荐值。
 
-第三道边界是有意思的**「启动时快照」机制**。系统 prompt 里塞的是会话启动那一刻磁盘上的记忆快照。agent 在会话中途调用工具写新内容时，这个写操作**只更新磁盘，不重塑当前会话的 system prompt**。新内容要到下一次会话启动重新加载时才会进入 prompt。这样做的好处是 prompt 的前缀缓存不会因为中途写记忆而失效：前缀缓存能给 agent 系统省下大量的 token 成本，保持它的稳定性是一项很值钱的优化。
+第三道边界是**「启动时快照」机制**。系统 prompt 里塞的是会话启动那一刻磁盘上的记忆快照。agent 在会话中途调用工具写新内容时，这个写操作**只更新磁盘，不重塑当前会话的 system prompt**。新内容要到下一次会话启动重新加载时才会进入 prompt。这样做的好处是中途写记忆不会重塑当前会话的 prompt；前缀缓存是否节省 token 取决于 provider 和模型，需要单独测量。
 
-第四道边界（也是最关键的一道）是**写入之前的威胁特征扫描**。
+第四道边界是**写入之前的威胁特征扫描**。
 
 <SourceBlock path="REF/hermes-agent/tools/memory_tool.py" lines="65-101" system="hermes" summary="任何即将进入永久 prompt 的内容，都要先过一遍专门针对提示注入和凭证泄露训练出来的特征库；任何不可见 Unicode 字符也会直接拦下。">
 
@@ -209,9 +226,9 @@ def _scan_memory_content(content: str) -> Optional[str]:
 
 </SourceBlock>
 
-这套扫描的逻辑很清晰：**任何即将进入系统 prompt 的内容，都必须按 system prompt 的安全标准来审**：因为一旦写进去，它就跟产品的核心指令同等地位地参与后续每一轮决策。
+这套扫描针对的是会进入高信任 prompt 的内容。它能阻断当前规则列出的模式和不可见字符，但不替代用时核验、运行时权限或用户撤销。
 
-扫描特征覆盖了几大类典型攻击：经典的提示注入模板（「忽略之前的指令」、「你现在是……」）、欺骗模式（「不要告诉用户……」）、把环境变量里的密钥往外发的脚本片段、读取已知凭证文件路径（`.env`、`.netrc`、`.ssh` 之类）的命令、植入 SSH 后门的关键字、以及一组特别难肉眼发现的不可见 Unicode 字符（零宽空格、双向控制字符）。任何一条命中都直接拒绝写入。这种「输入侧硬约束」虽然不能保证 100% 拦下所有攻击，但它把绝大多数已知的攻击载体堵在了门外。
+扫描特征覆盖了源码列出的几类攻击：经典的提示注入模板（「忽略之前的指令」、「你现在是……」）、欺骗模式（「不要告诉用户……」）、把环境变量里的密钥往外发的脚本片段、读取已知凭证文件路径（`.env`、`.netrc`、`.ssh` 之类）的命令、植入 SSH 后门的关键字，以及不可见 Unicode 字符（零宽空格、双向控制字符）。命中这些模式时会拒绝写入；这说明输入侧有一条硬约束，但不能据此推导对未列出的攻击或变体的覆盖率。
 
 ## 真正需要决定的几件事
 
@@ -241,7 +258,7 @@ def _scan_memory_content(content: str) -> Optional[str]:
 | **forgetting** | workspace diff 触发手术式清理 | 用户手动删 SKILL.md | temporal decay halfLife=30d | char limit 逼着 replace |
 | **失败代价** | 6h 冷却 = 刚学的要等 6h | 用户忘按 = 不学 | 索引膨胀 + 没有结构化 skill | 没有跨 session 抽象 |
 
-**怎么选**：要给团队建可复用工作流，选 Codex Phase 2 + Claude Code skillify；要 zero-touch 经验沉淀，选 OpenClaw 模式；要在记忆里不被注入，选 Hermes 模式。混合也成立，但每种都要有清晰边界。
+**怎么选**：如果需求是跨会话整合，先检查 Codex Phase 2 的边界；如果写回必须经用户确认，检查 Claude Code 的 skillify；如果检索已经足够，检查 OpenClaw；如果要把写入面收窄，检查 Hermes。它们只是起点，不构成能力排名；混合方案仍需写清边界。
 
 ## Codex Phase 2 Prompt 深拆
 
@@ -333,18 +350,9 @@ applies_to: cwd=<primary working directory or scope>; reuse_rule=<when safe to r
 
 删了的 `rollout_summaries/*.md` 触发对应 `MEMORY.md` block 的手术式删除（只删 deleted input 唯一支撑的内容，混合 block 拆开重写）。
 
-## 我的判断：先控制写入，再追求自动化
+## 写回合同从可撤销快照开始
 
-<ScoreCard
-  rows={[
-    { name: 'Codex', score: 9, badge: '后台学习王者', notes: 'Phase 1 + Phase 2 + 800 行 consolidation prompt + 自动 skill 抽取 + INIT/INCREMENTAL/forgetting 全套；缺点是 6h 冷却太长。' },
-    { name: 'Claude Code', score: 8, badge: '用户驱动最稳', notes: 'skillify + /insights + autoMode critique 三入口；用户必须按按钮，安全可控但要求用户参与。' },
-    { name: 'OpenClaw', score: 6, badge: '被动索引', notes: '零运维成本；temporal decay + hybrid retrieval 把「学」变「查」；缺点是没有结构化 skill。' },
-    { name: 'Hermes', score: 7, badge: '安全克制', notes: '11 条威胁扫描 + invisible unicode + frozen snapshot 保 prefix cache；缺点是没有跨 session 抽象。' },
-  ]}
-/>
-
-## 从一次可撤销写入开始
+## 最小实现：一次可撤销写入
 
 <BuildRecipe
   steps={[
@@ -355,7 +363,7 @@ applies_to: cwd=<primary working directory or scope>; reuse_rule=<when safe to r
     { title: '加威胁扫描', body: 'memory 进 prompt 前必扫：prompt injection / role hijack / exfil（curl/wget + KEY/TOKEN）/ secrets read / ssh / invisible unicode。参考 Hermes 11 条。' },
     { title: '加 frozen snapshot', body: '系统 prompt 用 session 启动时快照；mid-session 写只更新磁盘。下次 session 加载新快照。保 prefix cache。' },
     { title: '加 forgetting', body: '不能只长不删。删了的 input 触发对应 memory 的手术式清理（不是整块删）。Codex 的 workspace diff 模式可以直接借鉴。' },
-    { title: '加用户复盘入口', body: '至少给一个 `/insights` 风格的 user-facing 报告，让用户看到 agent 在「记什么」「学什么」，可以校准方向。' },
+    { title: '按需加用户复盘入口', body: '如果系统会自动写回，提供 `/insights` 风格的 user-facing 报告，让用户看到 agent 在记什么，并保留删除或重建入口。' },
   ]}
 />
 
@@ -422,7 +430,7 @@ applies_to: cwd=<primary working directory or scope>; reuse_rule=<when safe to r
 
 ## 反模式
 
-- **在主 turn 里同步重写 MEMORY**：浪费 token + 污染 prefix cache + 让用户等。Codex 把这种工作推到独立 job 是对的。
+- **在主 turn 里同步重写较大的 MEMORY**：当重写需要较长上下文或模型调用时，它可能增加 token、降低 prefix cache 复用并拉高用户等待时间。当前 Codex 快照把这类工作推到独立 job；是否值得拆分，要比较主 turn p95 延迟、cache read/write token、job 排队时间与记忆陈旧度。小而确定性的本地更新仍可能适合内联。
 - **让模型默认调 skillify**：Claude Code `disableModelInvocation: true` 是设计选择。模型自主蒸馏 skill 容易学错重点。
 - **把 memory 当 transcript dump**：违反 Codex 的 "no large raw outputs verbatim"。LLM 上下文有限，原文 dump 等于没记。
 - **不做注入扫描就让 memory 进 prompt**：Hermes 11 条威胁扫描的存在不是 paranoia。memory 进的是系统 prompt，注入一次就长期生效。
@@ -431,6 +439,8 @@ applies_to: cwd=<primary working directory or scope>; reuse_rule=<when safe to r
 - **不区分 evergreen 和 dated**：OpenClaw 的 `memory/YYYY-MM-DD.md` 衰减 vs `MEMORY.md` 不衰减是必要的区分。
 - **让 agent 写 secret 进 MEMORY**：Hermes 的 exfil_curl / read_secrets / ssh_backdoor 模式正面阻断这一类。
 - **skill 没有 success criteria**：Claude Code skillify 把 "Success criteria: ALWAYS include this!" 写进 prompt 模板。没有 success criteria 的 skill 是 wishful thinking。
+
+</details>
 
 ## 附录：复盘题
 
@@ -443,15 +453,15 @@ applies_to: cwd=<primary working directory or scope>; reuse_rule=<when safe to r
 
 **Q1 · 为什么 Codex 把 consolidation 拆成 Phase 1（per-turn）和 Phase 2（global）两个阶段，而不是一次写完？**
 
-Phase 1 写在主 turn 里，目的是趁 turn 上下文还热（rollout 完整、cwd / git_branch / 当前任务都在）抽出 stage1 输出。这是「廉价 + 高保真」的一步：每个 thread 一条，写进 SQLite 的 `stage1_outputs` 表，不做 LLM 重写。
+Phase 1 写在主 turn 里，利用仍可访问的 rollout、cwd、git_branch 和当前任务抽出 stage1 输出：每个 thread 一条，写进 SQLite 的 `stage1_outputs` 表，不做第二阶段的 LLM 重写。源码没有提供这一步的成本或保真度对照。
 
 Phase 2 是独立的 LLM job，跑 800 行 system prompt 把 raw_memories.md + 多个 rollout_summaries + 已有 MEMORY.md 重写成最终产物（MEMORY.md / memory_summary.md / skills/*）。这一步贵，所以要 global lock + `input_watermark` 防重复 + 6h cooldown 防过频。
 
-拆两阶段的核心理由是：**抽取要趁热（在 main turn 里）、重写要冷静（独立 LLM 任务，不抢主 session token / 不污染 prefix cache）**。如果合成一步，要么 main turn 被拖慢，要么 LLM 看不到完整 raw rollout。
+这份快照的取舍是：在 main turn 里做较轻的抽取，保留当时可访问的 rollout 与任务元数据；把跨多份材料的重写放进独立 LLM job，减少主 session 的 token、延迟与 prefix cache 变动。它不是天然必须的拆分：输入小且更新确定时可以合并；独立 job 也会引入排队、锁竞争和记忆陈旧。应比较主 turn p95 延迟、cache token、stage1 召回率、job 延迟与失败重试后再决定。
 
 源码：[`codex/codex-rs/state/src/model/memories.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/state/src/model/memories.rs)（Stage1Output + Phase2JobClaimOutcome）、[`codex/codex-rs/memories/write/templates/memories/consolidation.md`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/memories/write/templates/memories/consolidation.md)。
 
-追问：为什么是 6h 而不是 1h？答：cooldown 太短会让 LLM 反复处理同一批新增 rollout，浪费 token；太长则用户感受不到「学习了」。Codex 选 6h 是经验值，可以通过 `PHASE2_SUCCESS_COOLDOWN_SECONDS` 调。
+追问：为什么是 6h 而不是 1h？答：所审阅源码把 `PHASE2_SUCCESS_COOLDOWN_SECONDS` 配成 6 小时，但没有公开这个值的实验依据。它用于限制成功后的再次运行；应按新增输入量、模型成本和可接受延迟调参。
 
 **Q2 · Claude Code 的 skillify 为什么要把 `disableModelInvocation` 设为 true？这破坏了 skill 自动触发的能力，是不是反 pattern？**
 
@@ -465,9 +475,9 @@ Phase 2 是独立的 LLM job，跑 800 行 system prompt 把 raw_memories.md + �
 
 **Q3 · OpenClaw 的 `halfLifeDays=30` 怎么算？为什么要给 `MEMORY.md` 做 evergreen 例外？**
 
-时间衰减公式：`weight = 0.5 ^ (ageDays / halfLifeDays)`，30 天权重折半，60 天 1/4，90 天 1/8。这个值是经验选的：太短老经验快速失权（30 天前的 bug fix 用不上），太长则索引膨胀且新经验排不上来。`memory/YYYY-MM-DD.md` 这种「带日期」的文件走衰减：它们记录的是当时的环境、当时的失败，过段时间天然过期。
+时间衰减公式是 `weight = 0.5 ^ (ageDays / halfLifeDays)`；若启用 30 天半衰期，30/60/90 天对应的乘数是 1/2、1/4、1/8。源码没有解释为什么选 30 天，而且当前默认 `enabled: false`。`memory/YYYY-MM-DD.md` 这类日期文件进入衰减路径；是否改善召回要用带时间标签的查询集验证。
 
-`MEMORY.md` 走 evergreen（不衰减）：它装的是「这个 repo 的入口、约定、长期偏好」，这些信息只要 repo 没换技术栈就一直有效。**衰减 vs evergreen 的关键判断：信息是否 time-bound**。如果一条 memory 描述「2024 年 10 月那次部署失败」，应该衰减；如果描述「这个 repo 的测试入口是 `pnpm test:unit`」，应该 evergreen。
+`MEMORY.md` 走 evergreen 路径，不参与这条衰减公式。这是路径分类，不是新鲜度证明；仓库入口和测试命令仍可能变化，取回后要核验当前状态。
 
 源码：[`openclaw/src/memory/temporal-decay.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/memory/temporal-decay.ts)。追问：能不能让 LLM 自动判断 evergreen？
 
@@ -475,7 +485,7 @@ Phase 2 是独立的 LLM job，跑 800 行 system prompt 把 raw_memories.md + �
 
 **Q4 · Hermes 为什么用字符长度（2200/1375）而不是 token 数限制 memory？**
 
-token 数依赖 tokenizer，不同模型（Claude 3.5 / GPT-4 / Gemini）的 tokenizer 不同，同一段中文在 Claude 里可能是 100 tokens，在 GPT-4 里是 80 tokens。如果用 token 限制，agent 必须知道当前用哪个模型，complexity 爆炸。字符长度跨模型可预测：2200 字符的中文段在任何模型里都是「能装下，但接近上限」。
+token 数依赖 tokenizer、语言和模型，同一段文字没有固定换算。字符上限便于在 schema 层静态校验，但 2200 个字符会占多少 token、是否接近上下文上限，都要按目标模型测量。
 
 这把「prioritize 什么」的判断推给了 agent：char limit 是硬约束，逼着 agent 决定哪句话留、哪句话删。2200（MEMORY.md）和 1375（USER.md）的比例不是随便选的：MEMORY.md 装环境 / 流程（更多事实），USER.md 装偏好（更精炼）。**用 char limit 还有一个好处**：审计简单，`wc -c MEMORY.md` 就能验证有没有超。
 
@@ -491,7 +501,7 @@ invisible unicode 字符（zero-width space、zero-width joiner、bidi override 
 
 （2）**bidi override（U+202D / U+202E）**：让显示顺序和实际字节顺序不一致，用户在 UI 上看到的 memory 内容和实际写进 prompt 的内容不一样；（3）**embedding pollution**：让搜索 / 比对失效。Hermes 在 `_scan_memory_content` 里维护 10 个高危字符的明确清单，写入前直接拦截。
 
-**memory 进入系统 prompt 是「一次注入、长期生效」**，所以输入扫描比 prompt 层防御更可靠。源码：[`hermes-agent/tools/memory_tool.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/tools/memory_tool.py) 第 65-101 行。
+**memory 进入后续 prompt 会扩大错误的持续时间**。Hermes 的输入扫描覆盖当前列出的已知模式；它与 prompt 规则、用时核验和运行时权限解决不同问题。源码：[`hermes-agent/tools/memory_tool.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/tools/memory_tool.py) 第 65-101 行。
 
 追问：为什么不把所有 control character 都拦？答：太宽会误伤合法内容（emoji 的 skin tone modifier 也是 unicode 控制字符）。Hermes 选「具体清单 + 明确威胁场景」，可审计。
 
@@ -513,7 +523,7 @@ Codex 的 rule 强制：when the source already contains a concise, searchable p
 
 代价有四个：（1）**没法跟用户讲「我记住了你说的 X」**：只有索引、没有显式记忆条目，用户无法在 UI 里看到一个「记住的事」清单；（2）**没法做 user profile**：retrieval 重建出来的「偏好」是当下查询的副产物，不持久；（3）**冷启动差**：空索引意味着新 agent 没有 prior，需要累积；（4）**索引膨胀**：即使有 temporal decay，存储还是单调增长。
 
-**接受代价的场景**：（a）短 session / 一次性 agent，攒不了多少经验，结构化 skill 是 overhead；（b）多 agent 共享数据，retrieval 比 schema 更通用；（c）团队不想维护 consolidation prompt（Codex 的 800 行 prompt 是长期成本）。
+**可能接受这些代价的场景**：（a）短 session / 一次性 agent，不需要结构化 skill；（b）多 agent 共享同一检索库，且查询集能覆盖主要任务；（c）团队不准备维护 consolidation prompt。Codex 当前长 prompt 的行数只说明维护表面，不能直接换算工程成本。
 
 OpenClaw 选这条路是因为它把「学」推后到「检索时」，靠 hybrid retrieval（semantic + lexical + MMR + decay）现场把相关 chunks 拼出来，让 agent 表现得像「记得这件事」。
 
@@ -541,7 +551,7 @@ OpenClaw 选这条路是因为它把「学」推后到「检索时」，靠 hybr
 
 源码：`claude-code/src/commands/insights.ts`。追问：能不能让用户从 `/insights` 直接「保存这条 insight 为 skill」？答：要走 skillify 流程，让用户重新确认（不能跳过 disableModelInvocation 闸）。
 
-**Q10 · 给一个通用的「让 agent 学得安全」的 6 层防护栈，每层对应一个具体威胁。**
+**Q10 · 用六类控制点检查写回威胁。**
 
 按数据流动顺序：
 
@@ -552,8 +562,8 @@ OpenClaw 选这条路是因为它把「学」推后到「检索时」，靠 hybr
 5. **审阅层 · 用户预览**：写 memory / skill 前展示给用户，用户拒绝就不落盘。威胁：自动化沉淀错信息。
 6. **隔离层 · frozen snapshot**：mid-session 写只更新磁盘，下次 session 才加载新快照。威胁：刚注入的 memory 立即污染当前 prompt。
 
-四家系统是这 6 层的不同组合：Codex 重 1+2+6（prompt 工程 + redact + 后台 job 天然隔离），Claude Code 重 4+5（capability flag + 用户审），OpenClaw 重 2（抽取时 redact 是最强一道），Hermes 重 3+6（regex + frozen snapshot）。**生产建议至少要有 2+3+5**：redact + regex + 用户审。源码索引在本章末尾。
+四家系统把控制点放在不同位置：Codex 侧重输入说明、redact 和后台 job；Claude Code 侧重 capability flag 与用户审核；OpenClaw 在抽取路径做 redact；Hermes 使用 regex 与 frozen snapshot。这里的六层是 threat-model 检查表，不是生产最低层数；应按数据来源、写回权限和可撤销性选择。
 
-追问：如果团队只能选一层，选哪个？答：选第 3 层（regex + invisible unicode 扫描），因为这是「会持久化的注入」的最后一道闸：其他层失守，第 3 层还能挡，第 3 层失守则注入永久生效。
+追问：如果团队只能选一层，选哪个？答：没有一层能同时覆盖注入、密钥泄露、过期事实和越权写入。若内容会进入高信任 prompt，可先做写入审批或权限收口；regex 只筛已知模式，不能作为单独的安全结论。
 
 </details>

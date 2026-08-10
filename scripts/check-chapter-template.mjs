@@ -49,6 +49,10 @@ function hasEvidence(content) {
   );
 }
 
+function verdictLength(content) {
+  return content.match(/<Verdict\s+tldr="([^"]*)"/s)?.[1]?.length ?? 0;
+}
+
 let failures = 0;
 for (const file of PATTERN_DIRS.flatMap(listMdx)) {
   const content = readFileSync(file, 'utf8');
@@ -64,11 +68,22 @@ for (const file of PATTERN_DIRS.flatMap(listMdx)) {
 
   if (!/^title:\s*.+$/m.test(meta)) problems.push('missing title in frontmatter');
   if (!/^description:\s*.+$/m.test(meta)) problems.push('missing description in frontmatter');
+  if (!/^author:\s*.+$/m.test(meta)) problems.push('missing author in frontmatter');
+  if (!/^last_verified:\s*["']?\d{4}-\d{2}-\d{2}["']?\s*$/m.test(meta)) {
+    problems.push('missing or invalid last_verified date in frontmatter');
+  }
+  if (!/^evidence:\s*(source-analysis|experiment|official-docs|mixed)\s*$/m.test(meta)) {
+    problems.push('missing or invalid evidence type in frontmatter');
+  }
   if (headings.length < 4) problems.push(`only ${headings.length} H2 sections; expected at least 4`);
   if (duplicates.length > 0) problems.push(`duplicate H2 headings: ${[...new Set(duplicates)].join(', ')}`);
   if (!hasEvidence(content)) problems.push('missing a source block, source trail, research note, or external citation');
   if (/^##\s+§\d+/m.test(content)) problems.push('numbered template heading remains');
   if (/30 秒速读|30-second read/.test(content)) problems.push('duplicated 30-second summary remains');
+  if (/读前提示|Reading guide/i.test(content)) problems.push('generic reading-guide block remains');
+  const verdictMax = file.includes('/en/') ? 600 : 280;
+  const length = verdictLength(content);
+  if (length > verdictMax) problems.push(`verdict is ${length} characters; maximum is ${verdictMax}`);
   if (/^##\s+(?:面试题|Interview drill|Interview Drill)/m.test(content)) problems.push('review questions must live in an appendix');
   const interviewAnchors = content.match(/id=["']interview-drill["']/g)?.length ?? 0;
   if (interviewAnchors !== 1) problems.push(`expected one stable interview-drill anchor; found ${interviewAnchors}`);

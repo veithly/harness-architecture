@@ -1,39 +1,30 @@
 ---
-title: 15 · Observability, Cost, and Logs
+title: 15 · How to Reconcile an Agent Run
 sidebar:
   order: 15
-description: OTEL + analytics + rollout trace vs modelCost + insights + sessionStorage vs 13 DiagnosticEvent types vs CanonicalUsage + PricingEntry - how the four systems count tokens, dollars, and traffic
+description: Replay an agent run and reconcile token and cost numbers with explicit provenance and uncertainty
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
 ## First answer what happened in this run
 
-<Verdict tldr="Observing an agent means settling four ledgers at once: how many tokens it used, how many dollars that costs, how slow each response was, and how often it failed. Those four ledgers carry different weight depending on how the agent is deployed, which is exactly why the four systems make such different trade-offs. Codex treats observability as production infrastructure and splits the capability across three independent modules. One wires the agent into the industry-standard OpenTelemetry protocol (the CNCF-stewarded standard that unifies metrics, logs, and traces into one wire format) so it can plug into any enterprise backend like Datadog, Honeycomb, or Splunk. One rolls up business-level events (which skill the user invoked, which tools ran, which files changed, how many generated lines were actually accepted). And one packages the whole conversation into an offline-replayable trace bundle, a single zip containing session ID, all events, configuration, and the rollout JSONL, which can be fed back into Codex to reconstruct the original state. Claude Code goes IDE-native: it hardcodes the price of every supported model right into the source (price tier constants baked in, accepting that every price change needs a new release), persists every session to a JSONL file on disk, and lets the user run one terminal command that uses the strongest model to analyze their own conversation history and produce a readable report. OpenClaw takes the event-bus angle. It defines about a dozen semantically clean diagnostic event types (model usage, webhook lifecycle, message queue lifecycle, session stuck signal, tool looping signal) and dispatches them through a listener pattern (the publish-subscribe observer pattern), leaving the actual sink (a monitoring platform, a local file, a private Elasticsearch full-text search engine) entirely up to the deployer. Hermes treats cost precision as the top priority. It defines a vendor-neutral `CanonicalUsage` struct, ranks pricing sources into a six-level confidence ladder (`provider_cost_api` &gt; `provider_generation_api` &gt; `provider_models_api` &gt; `official_docs_snapshot` &gt; `user_override` &gt; `custom_contract`: actual provider cost comes first, then published rates, then user overrides, with negotiated contracts ranked last), tags every cost record with «how confident am I in this number», persists everything to a local SQLite database, and ships a local reporting tool that prints aggregated statistics. Bottom line: borrow Codex's three-module split for enterprise agents, borrow Claude Code for developer self-serve reports, borrow OpenClaw for an event pipeline that fits many deployment shapes, and borrow Hermes for privacy-sensitive local services that need accurate billing." />
+<Verdict tldr="After a run fails, can we replay the trajectory and explain the bill? Save events and token dimensions first, then attach provenance and uncertainty to each price. Codex's exporters, analytics, and trace, Claude Code's local logs, OpenClaw's event bus, and Hermes's CanonicalUsage are compared only around that recovery question. These are source-snapshot observations, not backend performance or billing measurements." />
 
-## Four observability stacks
-
-<details>
-<summary>Before reading (optional)</summary>
-
-- **Observing an agent means settling four ledgers at once**: tokens used, dollars spent, latency per response, failure rate.
-- **Four stacks**: Codex splits OTEL + analytics + offline-replayable trace bundles; Claude Code hardcodes model prices in source and stores sessions as JSONL; OpenClaw dispatches ~a dozen DiagnosticEvent types through a listener bus; Hermes ranks a `CostSource` six-level confidence ladder into local SQLite.
-- **The pricing source determines how much you can trust the dollar number**: Hermes tags every cost record with which source produced it, from `provider_cost_api` down to `custom_contract`.
-- **The biggest trap is hardcoded pricing**: Claude Code accepts that every price change needs a new release; version your pricing table and record its source instead.
-
-</details>
+## First define the evidence for one run
 
 <Diagram
   src="/diagrams/15-observability-cost-base.svg"
   alt="Observability stacks of the four systems: codex OTEL+analytics+trace vs claude code modelCost+insights+sessionStorage vs openclaw 13 DiagnosticEvent types vs hermes usage_pricing+SQLite"
-  caption="Same 'how is the agent doing' question. The four systems span from one crate to three standalone crates, from hardcoded pricing to a 5-source priority ladder."
+  caption="The same 'how is the agent doing' question spans one to three observability crates, hardcoded pricing, and six priced sources plus none."
 />
 
 How the four systems cover observability, cost, and logs across five dimensions:
@@ -41,8 +32,8 @@ How the four systems cover observability, cost, and logs across five dimensions:
 <CompareTable
   rows={[
     { label: 'Token accounting', values: ['`TokenUsage` (input / output / cache_creation / cache_read / reasoning_output) in codex-protocol crate', 'BetaUsage (@anthropic-ai/sdk): input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens / server_tool_use.web_search_requests', '`DiagnosticUsageEvent.usage`: input / output / cacheRead / cacheWrite / promptTokens / total + lastCallUsage', '`CanonicalUsage`: input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + reasoning_tokens + request_count'] },
-    { label: 'Pricing table', values: ['Maintained in model-provider-info crate; analytics reports usd_cost but does not hardcode prices', 'Hardcoded 5 cost tiers (COST_TIER_3_15 / COST_TIER_15_75 / COST_TIER_5_25 / COST_TIER_30_150 / COST_HAIKU_xx) plus MODEL_COSTS map', 'Through model metadata + `costUsd` field; diagnostic-events just emit, do not store prices', '`_OFFICIAL_DOCS_PRICING` dict with 30+ models across anthropic / openai / google / cohere; carries `pricing_version` and source_url'] },
-    { label: 'Cost source', values: ['Model provider info + upstream API returned usd_cost', 'Computed from modelCost.ts (weighted sum across 4 components)', 'Gateway calculates and emits costUsd as part of the event', '`CostSource` enum of 5: provider_cost_api / provider_generation_api / provider_models_api / official_docs_snapshot / user_override / custom_contract'] },
+    { label: 'Pricing table', values: ['Maintained in model-provider-info crate; analytics reports usd_cost but does not hardcode prices', 'Six named hardcoded cost tiers plus MODEL_COSTS map', 'Through model metadata + `costUsd` field; diagnostic-events just emit, do not store prices', '`_OFFICIAL_DOCS_PRICING` dict with 30+ models across anthropic / openai / google / cohere; carries `pricing_version` and source_url'] },
+    { label: 'Cost source', values: ['Model provider info + upstream API returned usd_cost', 'Computed from modelCost.ts (weighted sum across 4 components)', 'Gateway calculates and emits costUsd as part of the event', '`CostSource` has 6 priced sources plus none: provider_cost_api / provider_generation_api / provider_models_api / official_docs_snapshot / user_override / custom_contract'] },
     { label: 'Remote reporting', values: ['OTLP HTTP/gRPC generic + Statsig built-in default exporter (off by default in debug builds)', 'logEvent("tengu_*") to Anthropic analytics endpoint', 'External listeners plug into OTEL / Datadog / etc.', 'No remote reporting; everything local SQLite + local report (`InsightsEngine`)'] },
     { label: 'Historical replay', values: ['rollout-trace crate: trace bundle + reducer + replay; codex debug trace-reduce tool', '`getSessionFilesWithMtime` + `loadAllLogsFromSessionFile` read session files in ~/.claude/projects/', 'diagnostic-events stay in memory; listeners decide persistence', '`InsightsEngine` queries SessionDB SQLite directly with group-by + cost rollups; /insights prints terminal report'] },
   ]}
@@ -50,17 +41,17 @@ How the four systems cover observability, cost, and logs across five dimensions:
   dimensionLabel="Dimension"
 />
 
-## How four systems record behavior and cost
+## Source evidence: events, prices, and replay
 
 ### Codex · Splitting observability into three things that do not fight with each other
 
-Codex's stance on observability is very engineering-minded: it argues that observability is really three different problems with very different requirements, and trying to do all three in one module makes none of them good.
+One run should leave three kinds of evidence: what happened, how many tokens it used, and how the cost was calculated. Codex separates OTEL exporters, business analytics, and replayable rollout traces so each can be integrated and inspected on its own.
 
 So it splits the entire capability into three independent code modules, each focused on one thing, with no coupling between them.
 
-The first thing is **plugging into the industry-standard monitoring protocol**. Any serious production team already has monitoring infrastructure in place, whether Datadog, Honeycomb, Splunk, Aliyun ARMS, or a self-hosted Prometheus + Grafana stack.
+The first thing is **plugging into an existing monitoring protocol**. Production teams may use Datadog, Honeycomb, Splunk, Aliyun ARMS, or a self-hosted Prometheus + Grafana stack; the Codex snapshot chooses OTEL as its adapter protocol, while backend compatibility remains a deployment concern.
 
-All of these backends speak the OpenTelemetry (OTEL) standard. Rather than building its own monitoring system, Codex writes an adapter that emits the agent's internal metrics, traces, and logs over the OTEL protocol (supporting both HTTP and gRPC transports), and lets the user plug the data into whatever they already use.
+Codex avoids building a monitoring backend and emits internal metrics, traces, and logs through OTEL (HTTP and gRPC in the cited config). Whether a target backend accepts the chosen signal types and attributes still needs verification.
 
 On top of that it ships a default exporter for an internal system called Statsig. That one exists because Codex's own team uses Statsig to collect product analytics.
 
@@ -151,7 +142,7 @@ This "every event is its own type" approach is very different from the common pa
 
 The benefits are immediate: the compiler at the emit site checks whether you filled in every field (forgetting one fails to compile), the receiver doing aggregate analysis cannot be tripped up by typoed field names, and adding a new event type is just adding a new type that does not break any existing event.
 
-These twenty-plus event types cover nearly every business-level surface inside the agent worth caring about.
+These twenty-plus event types describe the surfaces covered by this source snapshot; they are not evidence that every business-level surface is represented.
 
 One cluster tracks user-driven actions: skill invocations, guardian reviews, hook runs, context compactions, single-turn content, command executions, and file changes.
 
@@ -163,7 +154,7 @@ All of this is in service of measuring "the fraction of generated code that actu
 
 The third thing is **packaging the whole conversation into an offline-replayable trace**. This one is heavier than the other two.
 
-It solves a debugging problem unique to agent systems: when an agent produces a strange result, reproducing it is extremely hard (LLM nondeterminism, external API state, filesystem state all conspire against you), and figuring out "how exactly did it get to that point" after the fact is nearly impossible.
+It addresses a debugging problem that is especially visible in agent systems: LLM nondeterminism, external API state, and filesystem state make exact reproduction difficult. A trace preserves evidence of the path; it does not make a rerun deterministic.
 
 Codex's approach is to write every raw event a session produces, in order, to a JSONL file, plus a manifest describing what model / environment / version was used, and pack the whole thing into a trace bundle that can be shipped to any debugging tool offline.
 
@@ -173,7 +164,7 @@ The design philosophy is written very plainly: **the conversation hot path only 
 
 ### Claude Code · Hardcoding prices into the code so users can see what they spent right in the terminal
 
-Claude Code's take on observability is IDE-flavored: it assumes its users are mostly developers, and that those developers care less about "plugging into my own Datadog" than about "telling me right in the terminal how much that session cost me, how many tokens it used, and which model was the most expensive".
+An IDE user often needs a local answer to what this session cost. Claude Code keeps model prices in a source table, writes sessions as JSONL, and lets /insights read them; price changes must follow a release or config update.
 
 Around that judgement it does a few very focused things.
 
@@ -181,7 +172,7 @@ The first thing is **hardcoding model prices into the source code**. It does not
 
 It writes the prices of every currently supported model as a set of constants directly in the source.
 
-<SourceBlock path="REF/claude-code-2.1.88-expanded/src/utils/modelCost.ts" lines="26-90" system="claude" summary="5 hardcoded cost tiers (COST_TIER_3_15 / COST_TIER_15_75 / COST_TIER_5_25 / COST_TIER_30_150 / COST_HAIKU_35 / COST_HAIKU_45); each tier covers 5 dimensions (input / output / cache_write / cache_read / web_search)">
+<SourceBlock path="REF/claude-code-2.1.88-expanded/src/utils/modelCost.ts" lines="26-90" system="claude" summary="Six named cost tiers (COST_TIER_3_15 / COST_TIER_15_75 / COST_TIER_5_25 / COST_TIER_30_150 / COST_HAIKU_35 / COST_HAIKU_45); each records input / output / cache_write / cache_read / web_search">
 
 ```ts
 export type ModelCosts = {
@@ -251,7 +242,7 @@ Sonnet-class models sit at one tier ($3 per million input / $15 per million outp
 
 Each tier records five prices: input, output, prompt cache write, prompt cache read, and per-call web search.
 
-Computing cost is just multiplying each kind of usage by its own price and summing, nothing fancy, but you have to keep the five separate or it will be wildly wrong: cache reads typically cost about one tenth of input price; mixing them into one number can be off by an order of magnitude.
+Computing cost means multiplying each billed dimension by its current rate and summing. In the Claude tier cited here, cache reads and normal input have different rates; collapsing them into one total introduces an error whose size depends on the provider contract and actual usage mix.
 
 The second thing is **handling unknown models gracefully, neither throwing nor charging zero**.
 
@@ -269,15 +260,11 @@ Implementation is unusual: it reads every session's JSONL file out of `~/.claude
 
 Once to extract a structured fact sheet of "what happened in this session", and once to take those facts and write a natural-language summary. Then it prints the report to the terminal.
 
-Why Opus instead of cheaper Haiku? Because "analyzing your own conversation history" is very quality-sensitive. Haiku occasionally hallucinates on long contexts (output tool calls that never happened);
-
-Opus is much steadier on long-text understanding and summarization. One `/insights` invocation costs about $0.5 to $1, but a developer's daily agent spend is typically $20 to $50, so the under-5% overhead pays for itself.
-
-It buys the developer-experience win of "I don't need to open a browser dashboard, I can see today's spend right in the terminal".
+The source confirms two consecutive Opus calls: one extracts facts and one writes the summary. It does not provide a Haiku comparison, per-run token count, or dollar cost, so this article does not invent a value-for-money result. Evaluate that choice with real session lengths, current prices, failure samples, and human review.
 
 ### OpenClaw · One "diagnostic event bus" that funnels every observability signal through the same pipe
 
-OpenClaw's trade-off is different again. The scenario it serves is not enterprise SRE or a single-machine IDE user, but a common ChatOps deployment shape: one agent simultaneously listening to Slack, Telegram, Discord, an in-house web UI, and an API gateway, serving many concurrent users with a fleet of workers behind it.
+Multi-deployment systems need stable event names more than a fixed sink. OpenClaw dispatches typed usage, webhook, queue, and session signals through listeners, leaving the destination to the deployer.
 
 In that scenario observability has one peculiar challenge: you cannot predict where the deployer wants the logs to land. It could be Datadog, Sentry, a self-built Elasticsearch, or literally just stderr.
 
@@ -379,7 +366,7 @@ There are three very clever bits in that code.
 
 **The second is "listener isolation"**. Each listener call is wrapped in try-catch. If some listener has a bug and throws, the error gets swallowed and written to stderr, but it does not affect the other listeners. Sounds basic but matters a lot when multiple observability backends coexist: you do not want a bug in the Datadog listener to silently knock out the Sentry listener.
 
-**The third is "the sequence number is injected at emit time"**. Notice `seq` is a global counter incremented inside the emit function, not passed by the event producer. This guarantees that **all events have a globally monotonically increasing sequence number**: no gaps, no duplicates, consistent order even with several concurrent turns emitting at once.
+**The third is "the sequence number is injected at emit time"**. In this single-process state object, `state.seq += 1` gives events that have entered `emit` a local incrementing label. It does not by itself guarantee no gaps, no duplicates, or a global order across processes or asynchronous writers; cross-process atomicity, persistence failures, and scheduling need separate sequence-store tests.
 
 The third thing is **using a special `tool.loop` event type to make "the agent got stuck" first-class observable**. This is the most distinctive of all OpenClaw's diagnostic events:
 
@@ -413,9 +400,9 @@ For example, subscribe to `tool.loop`, route critical-level events to Ding Talk 
 
 ### Hermes · Making "how confident am I in this number" a first-class citizen of the cost system
 
-Hermes invests its observability energy in a completely different place from the other three.
+Local billing becomes difficult when providers expose different price evidence. Hermes records token dimensions, price versions, and provenance in CanonicalUsage, PricingEntry, and CostSource, then stores history in SQLite.
 
-Almost all of its engineering effort goes into one thing: **tagging every cost record with metadata describing how confident the system is in that number**.
+The cited implementation emphasizes one concern: **tagging every cost record with metadata describing how confident the system is in that number**.
 
 The context is: Hermes deploys as a privacy-sensitive local service (no remote reporting), so every spending number sits in a local database; meanwhile it supports dozens of different model providers (OpenAI, Anthropic, Google, Cohere, Mistral, OpenRouter, self-hosted models...), and each has its own billing model and data accuracy.
 
@@ -497,12 +484,12 @@ The type definitions above hide the essence of Hermes's entire cost system. They
 
 **The first ranking is "price source"**, meaning "where does this unit price come from". The priorities, from high to low, read like this:
 
-- **provider_cost_api (most accurate)**: the provider's API directly tells you in the response "this call cost $0.0234". This is the most trustworthy, because the provider computed the real amount, so it cannot disagree with the final bill. Aggregator platforms like OpenRouter, Together, and Replicate are starting to expose this.
-- **provider_generation_api**: the response carries exact token counts with detailed breakdown (input/output/cache_read/cache_write) but no direct dollar amount. You have to multiply by your local unit prices, but because the token counts are provider-authoritative, the resulting figure tracks the actual bill within a percent.
-- **provider_models_api**: the provider's "list models" API tells you "this model's input is $0.0025". Fresher than an offline snapshot: the moment the provider changes prices online, the next pull picks it up.
+- **provider_cost_api (preferred)**: the provider returns the amount for this call. It is closest to the provider's billing record, but discounts, taxes, period-end adjustments, and field semantics can still differ; finance use requires invoice reconciliation.
+- **provider_generation_api**: the response returns token dimensions, while the amount is still calculated with a local price table. Upstream metering helps, but price versions and billing rules can introduce differences.
+- **provider_models_api**: a model-list API can reduce the lag of an offline snapshot. Whether it reflects the latest repricing, regional rates, and contracts depends on that API's update and field contract.
 - **official_docs_snapshot**: a price snapshot copied into the local code, like Claude Code does. Accurate but lagging: between a provider price change and a snapshot update there is a window of inaccuracy.
 - **user_override**: the user writes "this model uses this price" in a config, common for self-hosted models or private contract pricing.
-- **custom_contract**: enterprise contract pricing. In theory user_override and custom_contract are both "the user knows best", but they are ranked last on purpose. These two sources are the most frequently wrong in practice (user typoed, contract not updated, copied the wrong file), so provider real-time data is given higher priority for accuracy.
+- **custom_contract**: enterprise contract pricing. It and user_override can become stale or be entered incorrectly, while provider values may omit discounts, taxes, or period-end adjustments. This ordering is a source policy, not an error-rate result from this article; financial use still requires invoice reconciliation.
 
 **The second ranking is "cost status"**, meaning "how certain is this number". It has four values:
 
@@ -511,100 +498,96 @@ The type definitions above hide the essence of Hermes's entire cost system. They
 - **included**: this call is actually covered by the user's subscription (for instance, when the user is on ChatGPT Plus and the agent goes through ChatGPT's built-in auth, this call costs the user nothing extra). This status matters a lot. Without it the computed "this month's spend" would significantly overstate what the user actually paid.
 - **unknown**: data simply unavailable, amount left blank. The frontend sees this status and shows "price unknown" so the user knows it is missing data, not free.
 
-**The third design is attaching a source URL and a pricing version to every price record**. The local `_OFFICIAL_DOCS_PRICING` dictionary covers 30+ models across anthropic, openai, google, cohere, and so on, and every record carries two audit fields: source URL (which webpage was this price copied from) and pricing version (`2026-05-01` style). Six months later when the user looks back at their cost stats and notices an odd price, they can trace it back to "oh this came from openai.com/pricing on 2026-05, OpenAI hadn't raised prices yet". That auditability is mandatory for enterprise users.
+**The third design is attaching a source URL and a pricing version to every price record**. The local `_OFFICIAL_DOCS_PRICING` dictionary covers 30+ model entries and carries a source URL plus a pricing version. That metadata lets a team reconstruct which price snapshot produced an estimate; whether it is sufficient for an enterprise audit depends on retention and invoice-reconciliation requirements.
 
-**The fourth design is dropping cost results into a local database and exposing one command that turns them into a report**. All usage data goes into local SQLite: not just the amount but also the status, source, pricing version, and notes. Hermes ships a local tool called InsightsEngine that queries this database directly, doing aggregations by model, by time, by session, and printing a readable report to the terminal. The entire data path has no remote reporting, which is Hermes's biggest difference from the other three. Privacy is elevated to a very high priority; the cost data never leaves the user's machine, even at the cost of giving up a unified cross-machine view.
+**The fourth design stores cost results locally and exposes a reporting command.** The cited path writes usage, status, source, pricing version, and notes to SQLite, then InsightsEngine aggregates by model, time, and session. This path has no remote exporter, which supports a local report; it does not prove that every project telemetry path stays on-device, so deployments still need a network audit.
 
-## What observability already agrees on
+## Invariants shared by observation paths
 
-Despite wildly different engineering trade-offs, the four systems converge on five surprisingly consistent fundamentals. Think of these as the "required curriculum" for any agent observability system.
+Putting the four source snapshots back into a billing and replay workflow yields five checks. They are this article's engineering synthesis, not an industry standard.
 
-**The first is recording token usage along at least four independent dimensions**. The minimum split is: pure input tokens, pure output tokens, cache-hit (read) tokens, cache-write tokens. If your model is something like OpenAI o1 or Anthropic extended thinking that exposes a reasoning step, add a "reasoning tokens" dimension; if the model supports server-side web search, add a "web search requests" dimension. These four to six dimensions cannot be collapsed into "total tokens" because their unit prices differ dramatically. Cache reads typically cost about one tenth of input price; cache writes cost 1.25x input price. If you only track totals and multiply by some unified rate, the computed bill can be off by an order of magnitude.
+**The first is recording usage by priced dimension.** In the Claude pricing tier cited here, input, output, cache reads, and cache writes use different rates; reasoning or web search needs another field when the provider bills it separately. The fields and ratios must follow the provider's current billing contract rather than being generalized from one model tier.
 
-**The second is computing cost by multiplying each dimension's usage by its own price and summing, never using a single "average rate"**. This is the direct corollary of the first point: different unit prices mean separate computation. Codex, Claude Code, and Hermes each implement this dimension-wise computation function; OpenClaw leaves the cost field for the gateway to fill but still requires the gateway to compute it dimension-wise.
+**The second is multiplying each dimension by its own rate before summing.** A single average rate introduces error whenever dimensions have different prices. The current Codex, Claude Code, and Hermes snapshots calculate by dimension; OpenClaw carries a cost field but leaves the algorithm to the gateway or caller.
 
-**The third is making session history replayable**. The persistence mechanism differs: Codex uses rollout-trace bundles with a reducer, Claude Code drops each session into a JSONL file under the project directory, Hermes stuffs everything into local SQLite, and OpenClaw hands the decision to listeners. But none of them implement "replay by rerunning". Rerunning runs into LLM nondeterminism, external state, and changed API state, which makes it near-impossible to reproduce exactly. So the four systems treat history as "look at a snapshot" rather than "re-execute".
+**The third is making session history inspectable.** Codex uses rollout-trace bundles with a reducer, Claude Code writes sessions under the project directory, Hermes uses local SQLite, and OpenClaw leaves persistence to listeners. Event replay can reconstruct recorded state, while re-execution still depends on model sampling, external state, and API changes. Treat “rebuild from logs” and “run again with the same result” as different contracts.
 
-**The fourth is not crashing on unknown models**. When a user invokes a model the local pricing table has never heard of, the worst response is throwing (agent crashes, user loses the conversation), and the second worst is charging zero (user thinks the new model is free). All four pick "fall back to some default plus tell the team": Claude Code uses default-model pricing plus an internal alert event, Hermes marks the status as unknown so the frontend shows "price unknown", OpenClaw simply leaves the cost field blank and lets downstream decide.
+**The fourth is defining an explicit result for unknown models.** The cited paths expose different policies: Claude Code can use default-model pricing plus an internal alert, Hermes can mark the result `unknown`, and OpenClaw can leave `costUsd` blank for downstream handling. Those semantics are not interchangeable; whichever policy you choose, do not silently display missing pricing as free or let a cost-display error terminate the agent run.
 
 **The fifth is turning off remote reporting in development mode by default**. Codex uses Rust's `cfg!(debug_assertions)` compile-time switch to flip the exporter to None for debug builds; OpenClaw defaults diagnostics off, requiring users to opt in. The engineering discipline behind both is the same: development tests produce all sorts of weird metric spikes (infinite loops, huge inputs, intentional failures); if that data leaks into production monitoring dashboards, operators get misled into believing production is broken, and the whole team drowns in noise.
 
-## Record events, prices, and uncertainty
+## Compose observability by replay need
 
 <Diagram
   src="/diagrams/15-tradeoff.svg"
   alt="Four observability stacks on observability investment vs pricing precision"
-  caption="Codex 3 crates heaviest investment; Hermes 5 source + CanonicalUsage highest precision; Claude Code modelCost medium precision + /insights; OpenClaw event stream but cost field left empty."
+  caption="Codex uses 3 observability crates; Hermes records 6 priced sources plus none; Claude Code uses modelCost plus /insights; OpenClaw emits events and leaves cost to the caller."
 />
 
 Four typical scenarios:
 
 - **Enterprise SaaS agent**: borrow Codex's OTEL + analytics + rollout-trace triad. Plug into Datadog / Honeycomb / Splunk. Replay offline.
-- **IDE / dev-tool agent**: borrow Claude Code's hardcoded modelCost + `/insights`. Developers love terminal reports more than remote dashboards.
+- **IDE / dev-tool agent**: borrow Claude Code's hardcoded modelCost + `/insights`; a terminal report provides local feedback without deploying a remote dashboard.
 - **Multi-platform ChatOps**: borrow OpenClaw's DiagnosticEvent + listener pattern. Events flow out; the deployer picks the landing zone.
 - **Privacy-sensitive workloads**: borrow Hermes's CostSource priority ladder + all-local SQLite. No remote reporting.
 
-## My take: replay before dashboards
+## Choice: replay before dashboards
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: 'Three standalone crates with clean separation (otel / analytics / rollout-trace). Four exporter variants (OTLP HTTP/gRPC + Statsig + None) cover enterprise, internal, and dev. rollout-trace turns offline replay into a standard capability. AcceptedLineFingerprints measures code retention rate.', risk: 'Big surface area; newcomers struggle to spot the three crate boundaries. Statsig default endpoint is hardcoded, hinting at vendor lock-in.' },
-    { system: 'Claude Code', value: '★★★★', reason: 'Five hardcoded cost tiers keep things simple. tokensToUSDCost folds all 5 dimensions. tengu_unknown_model_cost is the safety net. /insights uses Opus to analyze itself. sessionStorage in ~/.claude/projects/ is a clean partition.', risk: 'Hardcoded prices mean every new model requires a release. No remote OTEL exporter. Running Opus twice in /insights is expensive.' },
-    { system: 'OpenClaw', value: '★★★★', reason: '13 DiagnosticEvent types form a clean taxonomy (usage / webhook ×3 / message ×2 / session ×2 / queue ×2 / run / heartbeat / tool.loop). Listener pattern accommodates any backend. The four tool.loop detectors operationalize agent runaway.', risk: 'No built-in cost computation (costUsd is left for the caller). No remote exporter shipped. Event schema relies on TS types; no JSON schema for external consumers.' },
-    { system: 'Hermes', value: '★★★★★', reason: 'Five CostSource priorities is the most complete cost model in the industry. PricingEntry carries source_url + pricing_version for auditability. Four CostStatus values clearly distinguish actual / estimated / included / unknown. InsightsEngine queries SQLite directly.', risk: 'All-local means no unified view across multi-host deployments. Pricing updates ride code releases. Lack of OTEL exporter is unfriendly to SRE teams.' },
-  ]}
-  caption="Score basis: observability coverage + cost precision + failure handling + deployment fit"
-  headers={['System', 'Score', 'Strengths', 'Risks']}
-/>
+There is no star rating here. Make one run replayable before adding dashboards or cost optimisation.
+
+| Constraint | Start with | Cost or boundary |
+| --- | --- | --- |
+| Enterprise monitoring needs metrics, logs, and traces | Codex OTEL, analytics, and rollout-trace split | More components and exporter/privacy work |
+| Developers need a local session bill | Claude Code model-cost table, JSONL, and /insights | Pricing updates must follow releases or config |
+| Deployers choose the event sink | OpenClaw typed diagnostic events and listeners | Cost calculation remains with the caller |
+| Local billing needs provenance and confidence | Hermes CanonicalUsage, PricingEntry, and SQLite | Multi-host aggregation and price refresh need extra work |
 
 ## Start with a minimal event record
 
-Below is the recipe distilled from the four systems for writing your own observability + cost accounting.
-
-Get the basic multi-dimensional token tracking + accurate cost calculation working first, then add production-grade features (decoupled architecture, multi-source pricing, user-facing reports), finally avoid six common mistakes that pollute metrics or slow down the hot path.
+Fix the per-turn usage, price provenance, and cost-result contracts first; add exporters, price sources, or reports only when a replayable evidence path justifies them.
 
 <BuildRecipe
   title="Build recipe"
   minimal={[
-    'At least 4 token dimensions (borrow from everyone): input (input tokens) + output (output tokens) + cache_read (cache reads, ~1/10 of input price) + cache_write (cache writes, ~1.25x of input price); add reasoning_tokens / web_search as optional 5th dimensions; tracking only input+output makes cache optimization gains invisible',
-    'Cost formula sums each dimension separately (borrow from Claude Code\'s tokensToUSDCost): each dimension queried for its own price, multiplied independently, then summed; can\'t use "average price" simplification, the four prices differ by up to an order of magnitude (cache_read is 12.5x cheaper than cache_write)',
+    'Record the dimensions in the provider billing contract: input / output / cache_read / cache_write are a common starting point, with reasoning or web search added when billed; the Claude tier cited here has different cache rates, but those ratios do not generalize to every model',
+    'Cost formula sums each dimension separately (borrow from Claude Code\'s tokensToUSDCost): query and multiply each billed dimension, then sum; the cited Claude tier has a large cache_read/cache_write price gap, but do not generalise that ratio to every model',
     'Unknown models fall back to default + emit alert event (borrow from Claude Code\'s tengu_unknown_model_cost): when model ID has no price entry, fall back to default estimate and emit telemetry alert (so you know an unknown model appeared); never crash (breaks main flow) and never silently return 0 (misleads users into thinking it\'s free)',
     'Debug builds disable remote reporting (borrow from Codex\' cfg!(debug_assertions)): development runs (tests / debugging) trigger massive call volume; if these hit production metrics they pollute data; use compile-time switch to disable OTEL in debug builds, enable in release',
   ]}
   advanced={[
     'Observability code in its own crates (borrow from Codex): codex-otel / codex-analytics / codex-rollout-trace each as separate crates, hot path only touches small writer API (doesn\'t directly depend on heavy SDKs like OTLP / Statsig); this lets observability upgrade / swap / remove independently (e.g. switching to Datadog doesn\'t require touching business code)',
     'Three exporter tiers: OTLP HTTP + OTLP gRPC + in-house default (borrow from Codex). Enterprise users connect to their OTLP (HTTP or gRPC depending on their infra preference), default users (not configured) hit in-house exporter (sends to your service), dev environments use None (no reporting); three tiers cover all scenarios',
-    'Trace bundle + reducer pattern (borrow from Codex): raw events stream into JSONL synchronously (non-blocking), reducer offline computes reduced state (aggregations / dashboards); makes "viewing trace" not block hot path; this is standard event sourcing pattern',
-    'AcceptedLineFingerprints (borrow from Codex): measures how much model-generated code survives (the most critical product metric for coding agents); line-level fingerprint stores only hash not content (privacy), can track lifecycle of same line from generation through modification / deletion',
+    'Trace bundle + reducer pattern (borrow from Codex): write raw events to JSONL and compute reduced state offline; benchmark disk, buffering, and flush policy before claiming the writer is off the hot path',
+    'AcceptedLineFingerprints (borrow from Codex): measure whether model-generated code survives later edits; storing hashes instead of source still requires a privacy threat assessment',
     '/insights command (borrow from Claude Code + Hermes): let users see their own usage report (model breakdown / cost / token distribution) in their terminal, dashboard not required; this lowers the barrier to "look at metrics", users can check anytime',
     'DiagnosticEvent ×13 + global listener (borrow from OpenClaw): event schema strongly enforced in type system (which fields required / optional), global listener decides where to land (stdout / stderr / file / OTEL); when adding new event type, only one place changes, listeners auto-receive',
     'tool.loop detectors ×4 (borrow from OpenClaw): generic_repeat (same tool repeated) / known_poll_no_progress (known polling pattern with no progress) / global_circuit_breaker (global circuit) / ping_pong (multiple tools called back and forth); makes "agent runaway" first-class signal so SREs can see the trend',
-    'CostSource priority ×5 (borrow from Hermes): provider_cost_api (most accurate) > generation_api (returned at generation time) > models_api (model metadata) > docs_snapshot (scraped from docs) > user_override (user-entered) > custom_contract (enterprise contract price); multi-source pricing sorted by accuracy, traceable',
+    'CostSource records 6 priced sources plus none (borrow from Hermes): provider_cost_api / generation_api / models_api / docs_snapshot / user_override / custom_contract; the label explains where an amount came from, while final billing still needs reconciliation',
     'CostStatus ×4 (borrow from Hermes): actual (paid, from provider API) / estimated / included (covered by package, no extra cost) / unknown; let downstream consumers know how accurate the number is, avoid reporting estimated as actual to finance',
     'PricingEntry carries source_url + pricing_version (borrow from Hermes): each price entry tagged with the URL it was scraped from (snapshot date) + pricing_version (price version number), auditing answers "where and when did this price come from", traceable when models reprice',
-    'Privacy mode (borrow from Hermes): all-local SQLite + terminal report, no remote reporting; this is required for enterprise / compliance scenarios, otherwise they won\'t adopt at all',
+    'Privacy mode (borrow from Hermes): all-local SQLite + terminal report, no remote reporting; use it when the workload or compliance policy forbids remote telemetry',
   ]}
   avoid={[
-    'Don\'t collapse all tokens to one rate: input cost ≠ cache_read cost ≠ web_search cost, conflating them throws costs off by an order of magnitude; most common error is multiplying all tokens by input price, which makes cache optimization gains completely invisible',
+    'Don\'t collapse all tokens to one rate: input cost ≠ cache_read cost ≠ web_search cost; follow the provider contract and validate error with real usage instead of generalising one tier\'s price gap',
     'Don\'t emit telemetry synchronously in the hot path: OTLP sending is network IO (can be slow / fail), synchronous emission blocks agent loop; use sender pattern (write to in-memory channel) / async (background task) / batch (batch sending), swallow send failures (monitoring can\'t break business)',
     'Don\'t let listener exceptions crash the main flow: listeners are user / plugin code that may have bugs; wrap each listener in try-catch, write exception to stderr without re-throwing (monitoring can\'t affect business)',
     'Don\'t assume the upstream API always returns cost: provider API may not return it (older versions / error cases), need fallback to local estimation (token count × your stored unit price) + mark CostStatus.estimated; can\'t crash, can\'t return 0',
-    'Don\'t hardcode prices without versioning: when models reprice (e.g. Claude 3.5 → 3.7 doubling), no way to know what date the old data\'s price was based on; prices must have version + timestamp + source',
+    'Don\'t hardcode prices without versioning: after a model reprices, old data no longer says which rate produced it; prices need a version, timestamp, and source',
     'Don\'t slap OTEL spans on every hot path: span has overhead (creation / context propagation / serialization), profile to see what\'s slow then add targeted spans, otherwise trace noise drowns out actual problems',
   ]}
 />
 
-## Four observability stacks side by side
+## Put observability differences back in deployment context
 
 <Diagram
   src="/diagrams/15-observability-flows.svg"
   alt="Four observability stacks lined up side by side"
-  caption="Codex 3 standalone crates; Claude Code modelCost + /insights; OpenClaw 13 DiagnosticEvent + listener; Hermes CanonicalUsage + BillingRoute + 5-CostSource priority."
+  caption="Codex 3 standalone crates; Claude Code modelCost + /insights; OpenClaw 13 DiagnosticEvent + listener; Hermes CanonicalUsage + BillingRoute + 6 priced CostSource values plus none."
 />
 
 Side by side, the observability gap is obvious. Codex aims for enterprise SRE. Claude Code aims for developer self-service. OpenClaw streams events and lets ops pick. Hermes prioritizes pricing precision while keeping everything local.
 
-## Follow event exits through source
+## The evidence chain from events to cost
 
 <SourceTrail
   title="Further Reading / Source Pointers"
@@ -615,7 +598,7 @@ Side by side, the observability gap is obvious. Codex aims for enterprise SRE. C
     { system: 'Codex', path: 'REF/codex/codex-rs/analytics/src/accepted_lines.rs', desc: 'AcceptedLineFingerprint implementation' },
     { system: 'Codex', path: 'REF/codex/codex-rs/rollout-trace/src/lib.rs', lines: '1-60', desc: 'trace bundle schema + public types' },
     { system: 'Codex', path: 'REF/codex/codex-rs/rollout-trace/src/reducer.rs', desc: 'reducer: raw events → reduced state JSON' },
-    { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/utils/modelCost.ts', desc: 'modelCost + tokensToUSDCost + 5 cost tiers' },
+    { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/utils/modelCost.ts', desc: 'modelCost + tokensToUSDCost + 6 named cost tiers' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/commands/insights.ts', desc: '/insights command, Opus-based analysis + summary' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/utils/stats.ts', desc: 'Session stats + analytics helpers' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/services/analytics/index.ts', desc: 'logEvent / tengu_* analytics dispatch' },
@@ -644,7 +627,7 @@ Side by side, the observability gap is obvious. Codex aims for enterprise SRE. C
 <details>
 <summary>**Q1 · Concept**: What's the minimum number of token dimensions to track? Why can't you just count total tokens?</summary>
 
-Minimum 4: **input / output / cache_read / cache_write**. Counting total alone is off by an order of magnitude.
+The minimum follows the provider contract. This Claude example needs **input / output / cache_read / cache_write**; counting only a total introduces an error whose size depends on current prices and the actual usage mix.
 
 **Price differences** (Anthropic claude-sonnet-4 example):
 
@@ -661,7 +644,7 @@ Actual cost:
 
 `5 * 3 / 1000 + 25 * 0.3 / 1000 = 0.015 + 0.0075 = $0.0225`
 
-4x off. Over a month, that's an order of magnitude difference.
+For this assumed usage and price table, the two methods differ by 4x. The monthly gap still depends on the real usage mix; one example cannot establish an order-of-magnitude result.
 
 **The 5th dimension:**
 
@@ -718,7 +701,7 @@ Each crate has different users / deployment:
 - analytics for PM / growth, warm data
 - rollout-trace for devs, cold data
 
-If merged, "I only want OTLP but forced to bundle analytics deps" happens. `codex-otel` compile output ~800KB, `codex-rollout-trace` adds 2MB. Each scenario different, standalone crates give flexibility.
+If merged, "I only want OTLP but am forced to bundle analytics dependencies" can happen. The cited source does not provide a comparable build-size measurement here; keep the crates separate when independent release and dependency boundaries matter.
 
 **Follow-up**: "Cross-crate sharing?" Shared schema (TraceMessageId, etc.) extracted to `codex-protocol` crate. All three observability crates share protocol, independent of each other.
 
@@ -726,15 +709,15 @@ If merged, "I only want OTLP but forced to bundle analytics deps" happens. `code
 </details>
 
 <details>
-<summary>**Q3 · Architecture**: Why is Hermes's 5-CostSource priority ordered this way?</summary>
+<summary>**Q3 · Architecture**: Why does Hermes retain a CostSource label?</summary>
 
 `provider_cost_api > provider_generation_api > provider_models_api > official_docs_snapshot > user_override > custom_contract > none`
 
-**Core principle**: closer to provider's system, more real-time, higher confidence.
+**Core principle**: closer to a provider's billing system can improve freshness, but confidence still depends on field scope and invoice reconciliation.
 
 **Tier-by-tier:**
 
-1. **`provider_cost_api`**: API returns `{"cost_usd": 0.0234}` directly. Computed by provider, accuracy = 100%. OpenRouter / Together / Replicate moving this way.
+1. **`provider_cost_api`**: the API returns `{"cost_usd": 0.0234}` directly. It is closest to the provider's billing record, but not "100% accurate" without invoice reconciliation; discounts, taxes, and period-end adjustments may use a different scope.
 2. **`provider_generation_api`**: generation endpoint returns `{"prompt_tokens": ..., "completion_tokens": ..., "cost": ...}`. Also provider-computed, but need to multiply price again.
 3. **`provider_models_api`**: models list API returns `{"id": "gpt-4o", "pricing": {"input": 0.0025, "output": 0.010}}`. Fresher than docs snapshot, but need self-multiplication.
 4. **`official_docs_snapshot`**: hardcoded from official pricing docs. Snapshot time clear but doesn't follow real-time changes.
@@ -743,7 +726,7 @@ If merged, "I only want OTLP but forced to bundle analytics deps" happens. `code
 
 **Why isn't user_override first?**
 
-Tension: "user knows best" holds for individual devs but not enterprises. Enterprise users may misconfigure (forgot to update / copied wrong file), provider real-time data is most accurate.
+Tension: a user override may reflect a private contract, but it can also be stale or mistyped. Provider data can be fresher while still differing from the invoice scope; retain the source and reconciliation status.
 
 So default sorts by provider proximity, user override is last fallback.
 
@@ -783,7 +766,7 @@ onDiagnosticEvent((event) => {
 })
 ```
 
-Deployer writes 30 lines of code to forward to OTel. But some deployers want to forward to PostgreSQL directly, or to Slack alerts. OpenClaw doesn't assume OTel is the only destination.
+A deployer can map a listener to OTel, PostgreSQL, or an alert sink. Adapter size depends on field mapping, retries, and authentication; OpenClaw's point is that the destination is not hardcoded.
 
 **3. Recursion guard / dispatchDepth**
 
@@ -811,7 +794,7 @@ For enterprise SaaS scenarios, yes. Customers have OTel / Sentry / Datadog infra
 </details>
 
 <details>
-<summary>**Q5 · Concept**: Why is Claude Code's `/insights` running Opus twice worth the cost?</summary>
+<summary>**Q5 · Concept**: `/insights` calls Opus twice; what does the source actually establish?</summary>
 
 `/insights` shows terminal report for local sessions. Implementation:
 
@@ -830,9 +813,9 @@ Devs using agent care about "how much did I chat with agent today" / "which prom
 
 session.json has message text / tool call / cost. Direct SQL group by can't extract "what task primarily did" semantic info. Let Opus read session and give semantic summary.
 
-**3. $0.5-1 per report is reasonable**
+**3. Compute cost from actual calls**
 
-Dev may use $20-50 of agent per day, running insights $0.5-1 is < 5% overhead. Convenience of local reports > this cost.
+The source gives no per-report token count, dollar cost, or daily-spend baseline. Before making Opus the default, record both calls' input, output, cache usage, and current model price.
 
 **4. Privacy**
 
@@ -845,7 +828,7 @@ Reports generated all-local. Session data doesn't go to remote dashboard. Enterp
 
 Merging to one call also works, but split makes both steps more controllable.
 
-**Follow-up**: "Can Haiku replace Opus?" Yes, but semantic quality degrades noticeably. Haiku sometimes fabricates ("summarize what this session did" outputs tool calls that don't exist). Opus is much more stable for long-text understanding. "Expensive but worth it" design.
+**Follow-up**: "Can a cheaper model replace Opus?" Source inspection cannot answer the quality gap. Blind-review the same sessions and record factual errors, omissions, latency, and cost; then choose a model or route by context length.
 
 **Source**: `claude-code/src/commands/insights.ts` + `claude-code/src/utils/queryWithModel.ts`.
 </details>
@@ -853,9 +836,9 @@ Merging to one call also works, but split makes both steps more controllable.
 <details>
 <summary>**Q6 · Real-world**: Adding observability to your agent, zero to production?</summary>
 
-Four phases: **structured tokens → price + cost → DiagnosticEvent → /insights command**.
+Five scopes: **structured tokens → price + cost → DiagnosticEvent → /insights → OTLP**. Reconcile and replay each scope before adding the next.
 
-**Day 1-2 · Structured tokens**
+**Stage 1 · structured tokens**
 
 ```python
 @dataclass
@@ -872,7 +855,11 @@ class Usage:
 
 Every LLM call return fills Usage. Never just store `total_tokens`.
 
-**Day 3-4 · Price + cost**
+**Acceptance gate**: a fixed provider fixture recomputes four token dimensions from raw usage, with explicit states for missing fields and unknown models.
+
+**Stage 2 · price + cost**
+
+**Prerequisite**: Usage fields match the provider billing contract.
 
 ```python
 PRICING = {
@@ -894,7 +881,11 @@ def cost(usage: Usage, model: str) -> float:
 
 Borrow Claude Code `tokensToUSDCost`.
 
-**Day 5-7 · DiagnosticEvent emit**
+**Acceptance gate**: a fixed price snapshot recomputes the amount and records source, version, and fallback; unknown is never treated as zero.
+
+**Stage 3 · DiagnosticEvent emit**
+
+**Prerequisite**: the cost-result schema is stable and emit does not perform synchronous network I/O.
 
 ```python
 def emit_event(event_type: str, **kwargs):
@@ -915,7 +906,9 @@ emit_event("model.usage", model=model, usage=usage, cost_usd=cost(usage, model))
 
 Borrow OpenClaw listener pattern.
 
-**Week 2 · /insights command**
+**Acceptance gate**: event sequence numbers are monotonic, listener failures do not block the main path, and one trace replays back to the turn records.
+
+**Stage 4 · /insights command**
 
 ```python
 @cli.command()
@@ -931,7 +924,11 @@ def insights():
 
 Borrow Hermes InsightsEngine + Claude Code `/insights`.
 
-**Week 3-4 · Add OTLP exporter (optional)**
+**Acceptance gate**: model, token, and cost values in the report trace back to raw session records, and unknown prices render as unknown rather than free.
+
+**Stage 5 · OTLP exporter (optional)**
+
+**Prerequisite**: the deployment has a concrete exporter sink, privacy boundary, and failure policy.
 
 ```python
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -945,14 +942,16 @@ trace.set_tracer_provider(provider)
 
 Borrow Codex `codex-otel` exporter approach.
 
+**Acceptance gate**: disabling the exporter still records core events; send failure, retry, and batch-flush behavior have contract tests.
+
 **Key takeaways:**
 
 1. **Don't start from OTel**: OTel is complex, many deps. First emit_event home-style, export to OTel later when needed
 2. **Pricing table version**: `PRICING_VERSION = "2026-05-15"` for audit
 3. **/insights early**: dev self-service report is high-value low-cost
-4. **OTLP not day-one**: add when SRE team needs
+4. **Add OTLP from an SRE requirement**: stabilize local events and replay first
 
-**Follow-up**: "How to update pricing table?" Review monthly, sync when new models launch. Or use Hermes approach with provider models API auto-fetch. Full automation saves trouble but increases ops.
+**Follow-up**: "How to update pricing table?" Trigger a review when a provider releases a model or changes prices, retaining the previous snapshot; or use Hermes's provider-models API fetch. Full automation saves trouble but increases ops.
 
 **Source mosaic**: Borrow Hermes `usage_pricing.py` + Claude Code `modelCost.ts` + OpenClaw `diagnostic-events.ts` + Codex `analytics/events.rs`.
 </details>
@@ -1077,7 +1076,7 @@ Most subtle loop: each tool call content differs but pattern is "two agents boun
 - Each `tool.use` emit, run 4 detectors
 - Any hit → emit `tool.loop` event, listener decides if to interrupt agent
 
-**Follow-up**: "What else could detectors add?" Combining LLM judge (Haiku checking "are these two turns repeating") would be more accurate but expensive. Could also add `cost_explosion` (single turn cost 10x sudden increase) etc.
+**Follow-up**: "What else could detectors add?" Test an LLM judge for repeated turns or add a `cost_explosion` detector. A threshold such as 10x is only an example; calibrate it against the real cost distribution and false-positive rate.
 
 **Source**: `openclaw/src/infra/diagnostic-events.ts:tool.loop` + [`openclaw/src/agents/loop-detectors.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/loop-detectors.ts).
 </details>
@@ -1108,7 +1107,7 @@ def background_sender():
 threading.Thread(target=background_sender, daemon=True).start()
 ```
 
-Hot path only enqueues (< 1μs), background thread sends.
+The hot path only enqueues and a background thread sends. This is not a microsecond guarantee: contention, serialization, and runtime scheduling still need measurement under target load.
 
 **2. batch + flush**
 
@@ -1170,16 +1169,16 @@ OTel SDK already does batch + async. Use directly.
 
 ```python
 def emit_event(event):
-    requests.post(url, json=event)  # blocks 200ms
+    requests.post(url, json=event)  # assume this network call blocks for 200ms
 ```
 
-200ms sync send adds 200ms agent latency. Direct UX harm.
+If the synchronous network call blocks for 200ms, the calling path inherits at least that wait. The 200ms value is a hypothetical input, not a benchmark from this article.
 
 **Source**: Codex `codex-otel/src/exporter.rs` BatchSpanProcessor + Hermes `agent/usage_tracker.py` async update.
 </details>
 
 <details>
-<summary>**Q10 · Open-ended**: Synthesize the strengths into a universal observability framework.</summary>
+<summary>**Q10 · Open-ended**: Design observability from replay and billing needs, and state the evidence gaps.</summary>
 
 5-layer architecture:
 
@@ -1223,7 +1222,7 @@ def estimate_cost(usage, model, route) -> CostResult:
     return CostResult(amount_usd=None, status=CostStatus.UNKNOWN)
 ```
 
-Borrow Hermes 5-source priority.
+Borrow Hermes's 6 priced sources plus none.
 
 **Layer 3 · DiagnosticEvent emit (mandatory)**
 
@@ -1268,16 +1267,14 @@ Borrow Claude Code `/insights` + Hermes InsightsEngine.
 - Codex: 3 crate split + AcceptedLineFingerprints + rollout-trace replay + cfg debug switch
 - Claude Code: modelCost 5 tier + tengu_unknown_model_cost + /insights with Opus
 - OpenClaw: 13 DiagnosticEvent + listener pattern + tool.loop detectors
-- Hermes: CanonicalUsage 6 fields + 5 CostSource priority + CostStatus 4 states + all-local SQLite
+- Hermes: CanonicalUsage 6 fields + 6 priced CostSource values plus none + CostStatus 4 states + all-local SQLite
 
-**Engineering effort:**
+**Evaluate by scope**:
 
-- Layer 1-2: 1 week (mandatory)
-- Layer 3: 1 week (mandatory)
-- Layer 4: 2 weeks (optional)
-- Layer 5: 1 week (recommended)
-
-5 weeks to v0.1.
+- **Layers 1-2 · usage and pricing contracts**: explain the four token dimensions, price version, and CostStatus for one turn first. **Gate**: a fixed provider fixture recomputes the amount from raw usage and preserves source, version, and unknown states.
+- **Layer 3 · events and local replay**: add when loop diagnostics, replay, or a local report is required. **Prerequisite**: event schema and sequence numbers are stable; **gate**: the same trace replays, listener failures do not break the main path, and /insights reconciles with raw records.
+- **Layer 4 · exporter**: add only when the deployment has a concrete OTLP/Statsig sink and a stated privacy boundary. **Prerequisite**: emit and send are decoupled; **gate**: send failure, retry, and exporter-disabled behavior have contract tests.
+- **Layer 5 · reports and price-source expansion**: add from user queries and provider contracts. **Prerequisite**: price provenance is traceable; **gate**: a bill can be traced to usage, a price snapshot, and an invoice-reconciliation record.
 
 **Key decisions:**
 

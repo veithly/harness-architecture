@@ -1,64 +1,107 @@
 ---
-title: 17 · Skills（从经验到可复用工作流）
+title: 17 · Skill 什么时候该自动触发
 sidebar:
   order: 17
-description: 把反复出现的工作流程沉淀成一个 markdown 文件，让 agent 下次见到相似的请求就自动套用。这一章解释四家系统怎么设计、加载、触发和分发这层「可复用工作流」。
+description: 从触发条件、依赖预检和安装扫描入手，写出可审计、可撤销、不会误触发的 SKILL.md。
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
-import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## Skill 是按需加载的行为包
+## Skill 什么时候该自动触发？
 
-<Verdict tldr="一个 skill 就是「把反复出现的工作流程写在一份 markdown 里，再用 frontmatter（写在文件最前面被 --- 包起来的 YAML 元数据头）告诉 agent 什么时候该用、需要哪些工具」。四家的取向截然不同：Codex 把它做成一个可分层下发的产品平台（personal/project/organization 三层 scope 叠加），把加载、注入、依赖管理都拆成独立模块；Claude Code 把它做成「会话沉淀」的用户体验问题，用四轮问答的 skillify 向导从历史对话里自动抽出可复用流程；OpenClaw 把它当软件供应链来管，从下载、解压到静态扫描（扫 frontmatter 合规性、shell 命令风险、外部 URL）一条龙；Hermes 把它做成信任决策问题，按 4 种来源（builtin/trusted/community/agent-created）× 3 种风险（safe/caution/dangerous）拼出一张 12 格的安装决策表（INSTALL_POLICY 矩阵）。一句话总结：要做产品看 Codex，要让用户愿意写看 Claude Code，要做市场分发看 OpenClaw，要面向合规与 IT 看 Hermes。" />
+<Verdict tldr="自动触发首先是匹配问题：触发太宽会把无关说明和工具声明带进当前回合，触发太窄又会漏掉真正需要的工作流。本文追踪触发条件、依赖预检、安装扫描与人工确认。描述进入 prompt、工具被声明、运行时权限被授予、文件被安装并跨会话保存，是四个不同动作；这里记录源码观察，不把安装演示当成安全证明。"/>
 
-## 四种 Skill 系统
+最难排查的不是 Skill 没有触发，而是用户只提到一个相似词，它就抢先进入上下文，挤占注意力，甚至引出一次不必要的审批。先判断触发是否准确，再讨论文件格式和分发。
+
+本文不做四套产品的功能清单。先看误触发和漏触发的代价，再按需要打开各系统的源码底稿。
+
+## 触发前先分清五层
+
+| 要问什么 | 可验证证据 | 不要混淆 |
+| --- | --- | --- |
+| 这次请求真的匹配吗？ | `when_to_use`、正负样本、隐式触发策略 | 记录误触发和漏触发，不凭直觉报准确率 |
+| 哪些内容会进入 prompt？ | 列表阶段的 `name`、`description`，调用阶段的正文 | 元数据帮助筛选，不等于已执行 |
+| Skill 声明要用哪些工具？ | `allowed-tools`、`dependencies` | 声明是输入或约束，不是权限授予 |
+| 运行时实际允许什么？ | 宿主 policy、审批、sandbox、OS 运行身份 | 只有运行时强制层决定能否执行 |
+| 文件会不会留下来？ | 安装路径、scope、注册表、版本和撤销记录 | 写入磁盘或跨 session 可见是独立的持久化动作 |
+
+这五问比“哪个系统字段最多”更能决定 Skill 是否可维护，也更容易发现误触发带来的实际成本。
+
+## 只在分叉处比较源码
+
+### 需要依赖预检时：Codex
+
+Codex 的 metadata 把 scope、policy、interface 和工具依赖写进结构体。每轮开始前会收集缺失环境变量，再一次性向用户询问。它解决的是中途失败，不等于授予 skill 更高权限。
+
+### 需要把经验变成文件时：Claude Code
+
+`skillify` 不能由模型自行启动。用户触发后，向导分轮确认名称、步骤、成功条件、工具和保存位置，再输出 `SKILL.md`。人工确认发生在持久化之前，这个边界值得保留。
+
+### 需要安装第三方包时：OpenClaw 与 Hermes
+
+OpenClaw 的 scanner 给出规则编号、严重级别、文件、行号和证据片段；安装层据此阻断严重项或提示深审。Hermes 再把来源与扫描结论交叉，决定放行、阻断还是请人确认。
+
+两者都说明一件事：扫描结果是输入，最终信任决策仍需绑定来源和权限；扫描器报错也要在页面上留下可追踪状态。
+
+## 一个可审计的 SKILL.md
+
+先写窄触发器和成功条件，再扩展步骤：
+
+```yaml
+---
+name: release-check
+description: Use when a release candidate needs the repository checks and a recorded diff.
+allowed-tools:
+  - Bash(git diff:*)
+  - Bash(pnpm check:*)
+when_to_use: "Only after the user names a release candidate."
+---
+
+# Release check
+
+## Success criteria
+- The check command exits 0.
+- The diff and command output are recorded.
+```
+
+把 `allowed-tools` 写到子命令级别；把外部 URL、脚本和凭证声明放进审计清单。没有实际安装实验时，不要声称扫描器效果。
+
+落地前检查：
+
+- 触发描述能否让读者举出一个会触发、一个不会触发的例子？
+- 依赖缺失时是否在执行前提示？
+- 生成或安装前是否能预览、撤销和定位来源？
+- source trail 是否指向固定 commit？
+
+## 源码底稿：按实现展开
 
 <details>
-<summary>读前提示（按需展开）</summary>
-
-- **skill 的本质**：一份 markdown 写下反复出现的工作流程，用 frontmatter 告诉 agent 什么时候用、需要哪些工具。
-- **分发取向分歧最大**：OpenClaw 按软件供应链管（下载、解压、静态扫描一条龙），Hermes 按信任决策管（4 来源 × 3 风险的 INSTALL_POLICY 12 格矩阵）。
-- **scope 分层决定产品形态**：Codex 用 personal/project/organization 三层 scope 叠加下发，把 skill 做成平台而不是文件加载器。
-- **第一优先**：先解决用户愿不愿意写，Claude Code 用 skillify 四轮问答从历史会话里自动抽出可复用流程。
-
-</details>
+<summary>源码底稿：按实现展开</summary>
 
 <Diagram
   src="/diagrams/17-skills-base.svg"
   alt="四系统 skill 模型：codex 8 crate 加 scope 加 policy、claude code 17 bundled 加 skillify 4 round、openclaw scanner 加 install 加 plugin sandbox、hermes trust 4 level 加 verdict 3 level 加 lazy load"
-  caption="同一个「让用户写 skill」，四家从 metadata schema 到完整 supply chain。"
+  caption="同一条 skill 生命周期里，四种实现分别强调 schema、authoring、安装扫描和信任决策。"
 />
 
 四家在 skill 发现、注入、执行、安装上的差异：
-
-<CompareTable
-  rows={[
-    { label: 'skill 文件格式', values: ['`SKILLS.md` 加 `agents/{name}/scripts/` 目录加多类 frontmatter（name、description、interface、dependencies、policy）', 'SKILL.md 加 frontmatter 5 字段（name、description、allowed-tools、when_to_use、arguments、context: inline、fork）', 'SKILL.md 加 manifest（workspace skill、bundled skill 双层）', '`SKILL.md` 加 frontmatter（name ≤64、description ≤1024、platforms、prerequisites、metadata.hermes）'] },
-    { label: '隐式触发', values: ['`SkillPolicy.allow_implicit_invocation` 默认 true 加 `detect_implicit_skill_invocation_for_command`', '`when_to_use` frontmatter 字段（"Use when..." 描述触发条件）', '`workspace skill prompt` 注入加 injection 由 agent 自己决定', '`description` 字段做 progressive disclosure tier 1（≤1024 char 摘要）'] },
-    { label: '依赖管理', values: ['`SkillDependencies.tools` 加 env var 自动 RequestUserInput 补齐', '`allowed-tools: ["Bash(gh:*)"]`，精确到 sub-command', 'workspace skill 自带 install 步骤加 brew 依赖检测', '`prerequisites: { env_vars: [API_KEY], commands: [curl, jq] }`'] },
-    { label: '安装来源', values: ['本地加 remote skill（`remote.rs` 接 marketplace）加 plugin 系统', '本地 `.claude/skills/` 加 `~/.claude/skills/` 加 bundled', '`skills-install-download` 下载加 tar verbose 解压加 scanner 扫描', '4 trust level（builtin、trusted、community、agent-created）乘 3 verdict 等于 12 格 INSTALL_POLICY'] },
-    { label: '执行环境', values: ['执行体走 ExecutorFileSystem（沙箱）加 scope 限定', 'SkillTool inline 或 fork（Task agent、Teammate）', '`pi-embedded-runner、skills-runtime` 隔离', 'env_type 后端（local、docker、modal、ssh、daytona）'] },
-  ]}
-  caption="skill 系统 等于 文件格式 乘 触发模型 乘 依赖管理 乘 安装来源 乘 执行环境"
-  dimensionLabel="维度"
-/>
 
 ## 四套系统怎样发现与加载 Skills
 
 ### Codex · 把 skill 当中台来建
 
-Codex 是四家里把 skill 拆得最细的一家。它没有把「加载一个 skill」当成一段简单的「读文件加拼 prompt」，而是当作一条小型的内部产品流水线来对待。
+Codex 把「加载一个 skill」拆成八类职责，而不是只做「读文件再拼 prompt」。这些模块分别处理数据、生命周期、渲染、注入、远程同步和依赖预检。
 
 这条流水线被刻意拆成了八块各管一摊的模块：有人负责从磁盘或远程仓库读 SKILL.md，有人负责维护这些 skill 在内存里的注册表和生命周期，有人负责定义「一个 skill 长什么样」的数据结构，有人负责把 SKILL.md 文本渲染成可以拼进 prompt 的片段，有人负责判断这一轮对话该不该把某个 skill 注入进来，有人负责处理远程下载和同步，有人负责检查「这个 skill 声明的环境变量是不是都准备齐了」，还有人负责解析配置层面的可用范围规则。
 
-这样拆开的目的，是为了让每个关心点都可以单独演化：将来要换远程协议、要加新的注入策略、要支持新的依赖类型，都不会牵动其他模块。也意味着团队可以并行推进：做 marketplace 协议的人不会卡到做依赖检查的人，做 UI 注入的人不会牵动磁盘加载的实现。
+这种拆分把远程协议、注入策略和依赖类型放在不同模块里，目标是减少改动相互影响。是否真的提升并行开发和维护效率，需要结合依赖图、构建时间和团队工作记录判断。
 
 一份 skill 的「身份证」包含哪些信息呢？我们先看一眼数据结构本身，再回到自然语言解释：
 
@@ -107,9 +150,9 @@ pub struct SkillToolDependency {
 
 </SourceBlock>
 
-读懂这份结构最关键的不是字段名，而是它把"一个 skill 能携带的所有上下文"都明面化了：除了名字和描述，它还知道自己属于谁（用户私有、项目共享、组织下发、还是随产品发布的内置）；它有没有外观信息（图标、品牌色、默认 prompt，给 IDE 渲染成卡片用）；它声明了哪些工具或 MCP 依赖（这样 agent 可以提前知道"用这个 skill 需要 git，需要 GitHub token"）；
+读这份结构时，需要先把几层语义分开。名字和描述属于元数据，列表阶段可以装进 prompt，帮助模型筛选候选；`dependencies` 和 `allowed-tools` 是 skill 对工具的声明或约束，不等于宿主已经授予权限；实际能否调用还要看运行时 policy、审批、sandbox 和操作系统身份。`scope`、路径和插件来源描述可见范围、安装位置和持久化生命周期，也不是执行权限。
 
-它的策略允许在哪些产品形态里被使用（同一个 skill 在 IDE 内、在 cloud 里、在 CLI 里可以差异化开放）。把这些信息全部沉淀在元数据里，意味着 skill 不再只是"一段 prompt"，而更像 App Store 里的一个上架条目。
+把这些信息沉淀在元数据里，意味着 skill 不再只是"一段 prompt"，而更像一个需要单独治理的工作流条目。元数据能帮助选择和审计，但不能替运行时的强制层做决定。
 
 接下来要解决一个常见的工程痛点：很多 skill 实际跑起来需要外部凭证。比如调用 GitHub API 要 `GITHUB_TOKEN`，调用某个内部服务要 `INTERNAL_API_KEY`。如果让模型自己尝试再失败再要环境变量，体验会很糟糕。Codex 的做法是：在每一轮对话开始之前，先扫一遍这一轮可能会用到的所有 skill 的依赖声明，看看必需的环境变量是否都齐了。如果还差几个，就主动向用户弹问，把缺的那几条一次性补齐，再开始正常的对话流程。
 
@@ -158,23 +201,23 @@ pub(crate) async fn resolve_skill_dependencies_for_turn(
 
 围绕这套数据结构，Codex 又做了几个值得借鉴的工程选择。第一，它给 skill 安排了**四级可见范围（scope）**：用户私有、项目共享、组织下发、随产品发布的内置。同一份 SKILL.md 文件，存在不同位置就意味着不同的传播半径：放在用户 home 目录下只有本人能用，放在项目里所有协作者都能用，由组织发布的会通过插件渠道分发，内置的则跟着主程序一起发版本。
 
-第二，它默认所有 skill 都可以被模型隐式触发，除非作者明确声明「这个只能手动调起」，避免出现「写了 skill 但模型从不调用」的窘境。第三，用户禁用一个 skill 时不删除它，只是把它标记为「已停用」，留住元数据方便下次重新启用。
+第二，它默认所有 skill 都可以被模型隐式触发，除非作者明确声明「这个只能手动调起」。这是触发策略，不是权限策略。第三，用户禁用一个 skill 时不删除它，只是把它标记为「已停用」，留住元数据方便下次重新启用；文件是否继续留在磁盘、何时跨 session 可见，仍由安装和注册流程决定。
 
-第四，为了避免每次用户输入命令都先调一遍语言模型做意图识别，它会先用文本特征做一轮本地匹配（即源码中的 `detect_implicit_skill_invocation_for_command` 函数，根据命令名直接反查能命中哪些 skill），能本地命中的就不再绕一圈大模型。这四个选择叠起来，构成了一种「产品化」的 skill 心智：可见范围像目录权限，启停像应用开关，触发像快捷键，分发像应用商店。
+第四，为了避免每次用户输入命令都先调一遍语言模型做意图识别，它会先用文本特征做一轮本地匹配（即源码中的 `detect_implicit_skill_invocation_for_command` 函数，根据命令名直接反查能命中哪些 skill），能本地命中的就不再绕一圈大模型。这四个选择叠起来，构成了一种「产品化」的 skill 心智：可见范围像目录可见性，启停像应用开关，触发像快捷键，分发像应用商店。它们仍不等于运行时授权。
 
 ### Claude Code · 把"用户愿意写"放在第一位
 
-Claude Code 走了另一条路。它没有把 skill 当成结构问题，而是当成用户体验问题。它最大的洞察是：**绝大多数用户不会从零写 SKILL.md，但他们会愿意"把刚才做过的事情留下来"**。所以它内置了十几个示范用的 skill，作为"原来 skill 可以长这样"的教学样本，覆盖了几大类常见用途：有的负责让模型在循环中按部就班、有的负责让模型在卡住时主动停下来求助、有的负责记忆事实、有的负责打开特定接口或界面。这些内置 skill 既是工具，也是范例。
+Claude Code 把重点放在 authoring 体验上。它的设计假设是：用户可能不愿从零写 SKILL.md，却愿意整理刚完成的流程。为此，它内置十几个 skill 作为工具和样例；这个假设是否成立，仍需要完成率和回访数据。
 
-其中最关键的是一个叫 `skillify` 的元级 skill（meta-skill，即"用来生成 skill 的 skill"）。它存在的唯一目的，就是把用户刚刚和模型完成的一次对话，转化成一份可复用的 SKILL.md。
+其中一个关键例子是 `skillify`，即用来生成 skill 的 meta-skill。它的用途是把用户刚刚和模型完成的一次对话，转成可复用的 SKILL.md。
 
-它不会一次性把所有问题抛给用户，而是把整个抽取过程拆成四轮简短的多选式交互：先让用户用一句话给"刚才到底在做什么"定个性，再帮用户把流程拆成有顺序的几步并请用户确认，再列出会话里实际用过的工具让用户勾选哪些应该被允许，最后问一句"下次再触发这个 skill 时，你希望它直接在主对话里跑还是单独开一个子进程跑"。这样每一轮只需要用户点几下，就能把一份完整的、有 frontmatter、有触发条件、有权限边界的 skill 保存到本地。
+它不会一次性把所有问题抛给用户，而是把整个抽取过程拆成四轮简短的多选式交互：先让用户用一句话给"刚才到底在做什么"定个性，再帮用户把流程拆成有顺序的几步并请用户确认，再列出会话里实际用过的工具让用户勾选哪些应该写入声明，最后问一句"下次再触发这个 skill 时，你希望它直接在主对话里跑还是单独开一个子进程跑"。向导生成的是文件和元数据；工具声明、宿主运行时权限、sandbox 和是否跨 session 保存仍要分别由安装与执行层确认。
 
-为什么是四轮而不是一次性？这背后有一个实际的产品观察：让用户一口气填完七八个字段，他大概率会放弃；让他每一步只面对一个问题、并且每个问题都给了候选项，他就能很顺手地走完。这一招把「沉淀工作流」从一项任务变成了几乎不需要心智成本的副产品。
+四轮交互把每次需要确认的内容限制在一个小问题里。这个设计意图是降低填写负担，但源码没有公开完成率或对照实验；是否优于单页表单，需要用产品自己的流程数据验证。
 
-下面就是这套四轮向导背后的 prompt 模板。它本身就是一个 skill 文件，里面写满了"先分析这次会话发生了什么、然后按四个步骤问用户、最后输出一份 SKILL.md"的指令。要理解的不是字符串细节，而是它把"沉淀工作流"这件事固化成了模型的一项标准能力：
+下面是四轮向导背后的 prompt 模板。它先分析会话，再按四个步骤询问用户，最后生成一份 SKILL.md 草稿；阅读重点是交互顺序和输出边界。
 
-<SourceBlock path="REF/claude-code-2.1.88-expanded/src/skills/bundled/skillify.ts" lines="22-90" system="claude-code" summary="一份引导模型把当前会话沉淀成 SKILL.md 的 prompt：先理解发生了什么，再按四个回合询问用户，最后产出一份完整可用的 skill 文件。">
+<SourceBlock path="REF/claude-code-2.1.88-expanded/src/skills/bundled/skillify.ts" lines="22-90" system="claude-code" summary="一份引导模型把当前会话沉淀成 SKILL.md 的 prompt：先理解发生了什么，再按四个回合询问用户，最后产出 skill 文件。">
 
 ```ts
 const SKILLIFY_PROMPT = `# Skillify {{userDescriptionBlock}}
@@ -250,11 +293,11 @@ Clearly stated goal.
 
 这套设计里有几个细节值得反复琢磨。
 
-一个是**强制规定触发描述必须以"Use when..."开头**，并且必须给出具体的触发短语和样例用户消息。原因是模型对"什么场景该唤起这个 skill"的判断完全依赖于这段描述，描述写得越具体、越带例句，误触发和漏触发都越少；如果只写"用于 git 相关任务"，模型就会在所有提到 git 的对话里都犹豫要不要调用。
+一个是模板要求触发描述以 `Use when...` 开头，并给出触发短语和样例用户消息。在这条隐式触发路径里，描述是模型选择 skill 的主要输入之一。具体描述和负面边界是否能减少误触发、漏触发，应当用本站自己的标注请求集验证；源码没有给出通用准确率。
 
-另一个是**每一步骤都要写「判定成功的标准」**。skill 通常包含多个子步骤，如果某一步执行完了模型不知道「算不算成功」，就很容易在中途反复尝试或者错误地推进。明确写出「什么算这一步做完了」，等于给模型在每一步之后都装了一个止损位。
+另一个是**每一步骤都要写「判定成功的标准」**。skill 通常包含多个子步骤；若模型不知道一步是否完成，可能反复尝试或继续推进。把验收条件写在步骤旁边，相当于为每一步提供检查点。
 
-还有一个是**允许使用的工具要细到子命令**。一份用于发版的 skill 不应该被允许执行任意 shell 命令，而只能跑 `git cherry-pick`、`gh pr` 这类窄范围的命令。这个粒度差异在出现 prompt 注入或者模型误判时，决定了影响半径是局部的还是灾难性的。
+还有一个是**把工具声明细化到子命令**。一份用于发版的 skill 可以只声明 `git cherry-pick`、`gh pr` 等必要命令，再由宿主运行时强制执行。窄声明有助于缩小误用面，但如果 runtime policy 不读取或不执行它，frontmatter 本身不会形成安全边界。
 
 最后还有一个实用的开关：**inline 还是 fork**。inline 意思是这个 skill 直接在主对话里跑，用户看得见每一步，可以在中间介入。fork 意思是把它丢到一个子进程或子 agent 里跑到底，主对话只看一份汇总结果。前者适合需要人盯着的流程（比如冲突需要人来解的 cherry-pick），后者适合干净的、跑完直接交付的流程（比如写一段 changelog），可以让主对话保持简洁。
 
@@ -262,7 +305,7 @@ Clearly stated goal.
 
 OpenClaw 看 skill 的角度跟前两家又不一样。它把 skill 视作"会被下载、被解压、被执行的第三方代码"，于是按软件供应链的标准来处理它：从下载、解压、静态扫描到安装上线，每一步都有审计痕迹和回退路径。
 
-这条流水线的第一关是**静态扫描器**。当用户决定安装一个 skill 时，扫描器会先把这个 skill 包里的代码文件全部读一遍，按文件类型套用不同的危险特征库（比如脚本文件里出现"动态执行任意代码"的调用、配置文件里出现硬编码的凭证、文档里出现"忽略之前的所有指令"这种典型的提示注入模板），只要命中就记一条发现。每条发现都有规则编号、所在文件和行号、原始证据片段，并按严重程度分为三档：信息、警告、严重。这样安装命令在最终决定"能不能装"之前，就有了一份结构化的风险清单。
+这条流水线的第一关是**静态扫描器**。安装 skill 时，扫描器读取支持的文件类型并套用对应规则，例如动态执行、硬编码凭证和提示注入模板。每条命中记录规则编号、文件、行号、证据片段和严重程度，供安装流程生成风险清单。未被扫描的文件类型和规则之外的行为仍是盲区。
 
 <SourceBlock path="REF/openclaw/src/security/skill-scanner.ts" lines="10-53" system="openclaw" summary="一次 skill 扫描得到的发现结构：规则编号、严重程度、所在文件与行号、证据片段；以及扫描器的文件类型范围和缓存策略。">
 
@@ -343,7 +386,7 @@ async function collectSkillInstallScanWarnings(entry: SkillEntry): Promise<strin
 
 </SourceBlock>
 
-这条流水线里还有几个值得注意的工程选择。扫描结果会缓存最多五千条，并按文件大小、修改时间这些维度判断什么时候失效（只要文件没变就不重扫，省下大量的重复正则匹配）。内置 skill 走的是另一条审计宽松通道，不会和用户安装的工作区 skill 互相阻塞，避免出现"因为某个内置 skill 命中了某条警告，整个系统都不能装新东西"的级联故障。解压第三方包时还会保留详细日志，把每个文件释放到哪里都记下来，便于事后追溯到底装了什么进来。
+这条流水线还缓存扫描结果，并按文件大小和修改时间判断是否失效，以减少未修改文件的重复扫描。内置 skill 与用户安装的工作区 skill 走不同审计路径，避免两者相互阻塞。解压第三方包时保留文件落点日志，便于事后核对安装内容。
 
 ### Hermes · 把信任当作决策入口
 
@@ -371,11 +414,11 @@ VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
 
 </SourceBlock>
 
-这张表里最有意思的格子有两处。「受信来源 + 危险特征」这一格的结论是阻断：也就是说就算是官方仓库，只要扫出明确的危险代码也照样不装，强制 vendor 自我约束。「模型自己写的 skill + 危险特征」这一格则是请用户拍板（ask）：既不直接相信模型（万一是被诱导的）、也不一律阻断（毕竟用户可能确实需要这种危险能力），而是把决定权交回人类。这两个安排合在一起，让这张矩阵既能挡住明显的安全事故，又不至于在边界场景上越权替用户做主。
+这张表里有两处安装策略值得看。「受信来源 + 危险特征」这一格是阻断：即使来自官方仓库，扫出明确危险代码也不安装。「模型自己写的 skill + 危险特征」这一格则交由用户拍板（ask）。它们分别处理来源信任和人工确认，不代表安全覆盖率或运行时授权。
 
-除了这套信任机制，Hermes 还有一个符合「渐进式披露」哲学的设计：所有 skill 都装在用户 home 下的一个统一目录里，无论是内置的、社区下载的、还是模型自己生成的；并且对元数据严格做了字符上限：名字不超过 64 个字符、描述不超过 1024 个字符。这两个数字看起来很硬性，但是经验值：64 字符的名字一行命令行可以放下；
+除了这套信任机制，Hermes 还把渐进式披露落到安装和加载路径：所有 skill 都放在用户 home 下的统一目录，并对元数据设置字符上限，名字 64 个字符、描述 1024 个字符。它们是该实现的 schema 限制，不是跨 agent 的通用标准。
 
-1024 字符的描述差不多两百个 token，足够让模型判断「这个 skill 干什么用、什么时候用」，但又不至于让一份长长的 skill 列表把 prompt 撑爆。真正的执行体（长达数千字的 SKILL.md 内容）只有在模型决定调用这个 skill 的那一刻才会被加载进来。
+1024 字符对应多少 token 会随 tokenizer、语言和模型变化，不能当固定换算或容量保证。执行体（可能比元数据长得多的 SKILL.md 内容）只在模型决定调用某个 skill 时加载。
 
 <SourceBlock path="REF/hermes-agent/tools/skills_tool.py" lines="28-100" system="hermes" summary="一份对外兼容、对内自由扩展的 SKILL.md 元数据规范：名字和描述都设了字符上限，方便列表阶段大量装载；可选字段管平台、依赖和扩展元数据。">
 
@@ -419,7 +462,7 @@ _PLATFORM_MAP = {
 
 </SourceBlock>
 
-这种 schema 设计还有一层"生态友好"的考量：它跟业界正在形成的 skill 互通标准对齐（agentskills.io），意味着同一份 SKILL.md 可以在多家 agent 之间互相加载，而不需要为每一家单独写一份。同时它保留了一个开放的扩展位（`metadata.hermes` 子树），供 Hermes 自己存放额外的元数据（比如标签、关联 skill），既不污染公共 schema，也不会被升级覆盖掉。
+这种 schema 设计与 `agentskills.io` 的公开字段对齐，目标是让多个 runtime 有机会读取同一份 SKILL.md；实际兼容范围仍要按各 runtime 的 parser 验证。它同时保留 `metadata.hermes` 扩展位，存放标签和关联 skill 等实现特有信息。
 
 ## 结构深度与作者体验
 
@@ -431,9 +474,9 @@ _PLATFORM_MAP = {
 
 四家系统站在两条相互拉扯的轴上：一条是"把这件事结构化到什么程度"，另一条是"对作者和用户来说有多容易上手"。理论上结构化越深，长期演化能力越强、可治理性越好；但短期内对作者要求也越高。反过来易上手意味着用户愿意写，但缺乏结构意味着难以做权限治理、生态共享和供应链审计。
 
-Codex 站在"结构最深"的那一端：它把 skill 拆得很细，但代价是写一份完整 skill 要懂得作用范围、策略、依赖、注入时机这些概念，对作者要求最高。Claude Code 走的是反方向：它把内置 skill 当样本、把"沉淀"做成 wizard，让用户不用懂任何概念也能产出一份能用的 skill，但相应地，权限收敛和信任治理就没有 Codex 完整。
+Codex 把 skill 拆成 scope、policy、dependencies 和注入时机等结构，作者需要理解这些边界。Claude Code 把内置 skill 当样本，并把"沉淀"做成 wizard，降低了初次 authoring 的概念负担；权限收敛和信任治理则要另行评估。
 
-OpenClaw 不在用户体验上发力，而是把整条"下载 → 解压 → 扫描 → 安装"的供应链做严，特别适合面向 IT 部门的场景。Hermes 介于两者之间，重点是用一张精巧的小矩阵把"来源"和"风险"两件事一次性表达清楚，让普通用户也能理解为什么有些 skill 装得上、有些装不上。
+OpenClaw 把重点放在"下载 → 解压 → 扫描 → 安装"的供应链上，这套路径可用于需要集中审计的场景。Hermes 用一张矩阵把"来源"和"风险"放在同一个安装决策里，读者可以据此查看每个格子的处理方式。
 
 如果把这四条路径并列着看，更能体会到它们的取向差异：
 
@@ -447,64 +490,40 @@ OpenClaw 不在用户体验上发力，而是把整条"下载 → 解压 → 扫
 
 ### 误区 1：skill 写得越长越好
 
-很多人写 skill 的第一反应是把所有细节都铺出来：两千行 prompt、三十个步骤、每个步骤再列十几条注意事项。直觉上这样最"完整"，但工程上几乎一定会失败。原因有两个：模型读得越多越容易在中段走神丢失上下文；以及 skill 越长就越难维护、越难复用。真正可用的 skill 通常做了两件事：一是用尽量少的字数说清楚"什么时候触发"和"判定成功的标准"，二是把执行细节按需暴露而不是一次性堆砌。
+很多人写 skill 的第一反应是把所有细节都铺出来：两千行 prompt、三十个步骤、每个步骤再列十几条注意事项。这样会增加模型读取和维护成本，也可能让执行路径变得难以检查。较易维护的写法通常先说清楚"什么时候触发"和"判定成功的标准"，再按需暴露执行细节；具体长度仍应通过任务测试决定。
 
 前面提到的「渐进式披露（progressive disclosure）」（列表阶段只看几百字的描述、真要执行时才把完整内容装进 prompt）正是为了避免这种"越多越好"的错觉。
 
 ### 误区 2：自动触发 = 把所有 skill 全部装进 system prompt
 
-为了让模型"能自动用上"所有的 skill，一种简单粗暴的做法是启动时把每个 SKILL.md 都拼进 system prompt。问题在于，假设你有一百个 skill、每份 SKILL.md 平均五千字符，光是开机就要占掉十几万 tokens 的 prompt 预算，根本没法正常对话。更合理的做法是分两阶段：开机时只让模型看到一份"目录"（每个 skill 一行名字加一段不超过千字符的简介）；
-
-只有当模型决定调用某个 skill 时，才把那一份 SKILL.md 的完整内容加载进来。这样无论有多少 skill，常态成本几乎不增长。Codex 还在这之上加了一层过滤，只把当前用户、当前产品形态下被允许隐式触发的那部分 skill 放进目录，避免目录本身也成为噪音。
+为了让模型"能自动用上"所有的 skill，一种简单粗暴的做法是启动时把每个 SKILL.md 都拼进 system prompt。更稳的做法是分两阶段：开机时只让模型看到一份由名字和短描述组成的目录；只有当模型决定调用某个 skill 时，才把正文加载进来。目录大小、缓存和延迟要在目标 provider 上实测，不能从假设的文件数量推算固定节省。Codex 还在这之上加了一层过滤，只把当前用户、当前产品形态下被允许隐式触发的那部分 skill 放进目录，避免目录本身也成为噪音。
 
 ### 误区 3：把工具权限开成"允许 Bash"
 
-如果一个 skill 的 frontmatter 里写「允许使用 Bash」，那它等同于拥有 root 权限：shell 可以做的所有事情它都能做。一旦这种 skill 被注入式攻击劫持，后果不可挽回。正确的做法是把工具权限收敛到具体子命令上：比如负责 cherry-pick 的 skill 只能跑 `git cherry-pick`、`git status`、`gh pr` 这几个明确列出的子命令，其他一切都拒绝。
+`allowed-tools` 写在 frontmatter 里，并不等于 skill 获得了 Bash，更不等于 root。它只是声明或约束，是否能执行由宿主的 tool policy、审批、sandbox 和 OS 运行身份共同决定。正确的做法是把声明收敛到具体子命令，例如 `git cherry-pick`、`git status` 或少数 `gh pr` 操作，并在运行时再次强制；否则窄声明也只是文档。
 
-Codex 更进一步，让 skill 用结构化字段声明依赖：不是字符串模式匹配，而是类型化的「我需要这类工具、走这个传输协议、要调用这个端点」：这样底层完全可以静态校验依赖是否齐备，而不用等到运行时才发现问题。
+Codex 还用结构化字段声明依赖：它让系统提前知道需要哪类工具、传输协议或端点，但依赖预检仍不授予权限，也不替代执行时的拒绝路径。
 
 ### 误区 4：所有来源的 skill 一视同仁
 
-有人会觉得「反正都是 SKILL.md，装上就跑」。但从内置 skill、官方 skill、社区 skill 到模型自己写的 skill，风险等级完全不同。第三方 skill 在没有审查的情况下直接执行，等于把进门钥匙交给每一个陌生人。Hermes 的十二格信任表和 OpenClaw 的静态扫描器，本质都是为了**让「来源 + 风险」成为安装决策的一部分**：陌生来源加一点点可疑特征就足以触发阻断；模型自己写的危险 skill 必须经用户确认；
+有人会觉得「反正都是 SKILL.md，装上就跑」。但从内置 skill、官方 skill、社区 skill 到模型自己写的 skill，来源和风险并不相同。第三方 skill 在没有审查的情况下执行，会扩大供应链风险。Hermes 的十二格信任表和 OpenClaw 的静态扫描器都把**「来源 + 风险」纳入安装决策**：在 Hermes 的矩阵中，社区来源遇到 caution 会阻断，模型创建且 dangerous 则交由用户确认；具体策略以实现代码为准。
 
-扫到明确的危险模式就连官方来源也不放行。两层防御叠加，才能在「允许扩展」和「避免事故」之间维持张力。
+在该矩阵中，明确的 dangerous 模式连 trusted 来源也会阻断。两层防御分别处理内容特征和来源信任，不能替代运行时权限与人工复核。
 
-## 我的判断：触发规则比文件长度重要
-
-<ScoreCard
-  systems={[
-    {
-      name: 'Codex',
-      scores: { '结构化': 5, '隐式触发': 5, '依赖管理': 5, '安装链路': 3, '沉淀机制': 2 },
-    },
-    {
-      name: 'Claude Code',
-      scores: { '结构化': 3, '隐式触发': 4, '依赖管理': 4, '安装链路': 3, '沉淀机制': 5 },
-    },
-    {
-      name: 'OpenClaw',
-      scores: { '结构化': 4, '隐式触发': 3, '依赖管理': 4, '安装链路': 5, '沉淀机制': 2 },
-    },
-    {
-      name: 'Hermes',
-      scores: { '结构化': 4, '隐式触发': 2, '依赖管理': 3, '安装链路': 5, '沉淀机制': 3 },
-    },
-  ]}
-  caption="5 维评分（1=最弱，5=最强）。"
-/>
+## 触发边界决定 Skill 是否可用
 
 ## 从一个可审计 Skill 开始
 
 <BuildRecipe
   steps={[
     { title: '1. 选定一份对外兼容的 SKILL.md 规范', detail: '不要自己发明 frontmatter 字段。沿用目前业界已经趋同的那套描述方式（名字、描述、版本、许可、平台限制、依赖前置条件、允许使用的工具、可选的自有扩展元数据），好处是同一份 skill 可以在多家 agent 之间互通，未来生态打通时不需要重写。把"私有"的扩展字段放在专属的元数据子树里，跟公共字段隔离。' },
-    { title: '2. 加渐进式披露', detail: '不要把所有 SKILL.md 一次性装进 prompt。在内存里保持一份"目录"，只装名字和短描述；当模型决定调用某个 skill 时，再把完整内容加载进来。给名字和描述设字符上限（经验值是 64 和 1024）会强制作者把"是什么、什么时候用"压缩到一两句话里，模型也更容易做出准确的调用判断。' },
-    { title: '3. 把触发条件写得像产品说明', detail: '让 skill 作者用统一句式描述"什么时候用我"，明确列出可能的触发短语和用户消息样例，最好同时写明"不要在以下情况下使用"。这部分是模型隐式触发决策的全部依据；写得越具体，误触发和漏触发就越少。一段抽象的描述远远不够。' },
-    { title: '4. 把工具权限收敛到子命令粒度', detail: '不要让一个 skill 拿到整个 shell 的访问权。明确写出"只能调用 git cherry-pick"、"只能调用 gh pr 的某几个子命令"，其他一律拒绝。更进一步可以把权限结构化（声明这个 skill 需要哪类工具、走什么协议、用什么命令），让权限校验在静态阶段就能完成，而不是等到运行时才出错。' },
+    { title: '2. 加渐进式披露', detail: '不要把所有 SKILL.md 一次性装进 prompt。在内存里保持一份"目录"，只装名字和短描述；当模型决定调用某个 skill 时，再加载正文。64 和 1024 是 Hermes 的 schema 上限；1024 字符对应的 token 数随 tokenizer 变化，是否有助于调用判断要用请求集验证。' },
+    { title: '3. 把触发条件写得像产品说明', detail: '让 skill 作者用统一句式描述"什么时候用我"，列出触发短语、用户消息样例和不适用边界。这些内容会影响隐式触发判断；描述更具体是否降低误触发和漏触发，应通过标注请求集测量。' },
+    { title: '4. 把工具声明收敛到子命令粒度', detail: '把 `allowed-tools` 写成具体子命令，减少误用面；然后在宿主的 runtime policy、审批和 sandbox 层再次强制。依赖字段能帮助预检，但不能单独授予执行权。' },
     { title: '5. 区分"主对话内执行"和"子进程执行"', detail: '让 skill 作者明确声明：这个 skill 适合在主对话里直接跑（用户能看到每一步、可以中途介入），还是适合在一个独立的子进程里跑到底（结果作为汇总返回，不污染主对话）。前者适合需要人盯着的流程（如发版冲突解决），后者适合干净的、跑完即交付的流程（如自动生成发版日志）。' },
-    { title: '6. 把 skill 当作第三方代码来扫描', detail: '一份 SKILL.md 本质上是会被加载进 prompt 或被解释执行的外部内容，跟安装一个 npm 包没有本质区别。建一套静态扫描器，按文件类型套用各自的危险特征（脚本里的动态执行、配置里的硬编码凭证、文档里的提示注入模板），按"严重 / 警告 / 信息"三档分类，严重的直接阻断，警告的提示用户做深入审计。结果按"文件大小 + 修改时间"做一份小型缓存，避免重复扫描。' },
+    { title: '6. 把 skill 当作外部输入来扫描', detail: 'SKILL.md 的正文会影响 prompt，随附脚本还可能被运行；两条风险路径要分别扫描。按文件类型检查动态执行、硬编码凭证和提示注入，并按"严重 / 警告 / 信息"记录安装证据。扫描结果不能替代 runtime policy 或 sandbox。' },
     { title: '7. 把"来源"也纳入决策', detail: '光扫描代码不够，还要追问"这东西从哪儿来"。给所有 skill 打上来源标签（内置、官方、社区、模型自创），然后把"来源 × 风险"叉成一张决策表，每格直接写明该放行、该阻断、还是请用户决定。这一层是防御纵深的另一半，能挡住扫描器漏过的整类风险。' },
-    { title: '8. 给用户一条"沉淀工作流"的捷径', detail: '让用户在完成一次会话之后能用一两条命令把刚才的过程留下来。不要要求他们坐下来从零写一份 SKILL.md，而是给一个三到五步的引导式向导：先确认这次到底在做什么，再确认下次什么场景下应该被自动唤起，再确认用过哪些工具应该被允许，最后让他选是主对话内执行还是子进程执行。完成率会比"自己写"高好几倍，也是把"经验"变成"资产"最有效的路径。' },
+    { title: '8. 给用户一条"沉淀工作流"的捷径', detail: '让用户在完成一次会话之后能用一条向导留下刚才的过程：确认任务、补充触发边界、选择要写入声明的工具，再选主对话或子进程。是否比手写更容易完成，要用自己的完成记录和回访验证，不要引用未公开的对比数字。' },
   ]}
 />
 
@@ -513,14 +532,14 @@ Codex 更进一步，让 skill 用结构化字段声明依赖：不是字符串�
 是否需要为你的 agent 引入 skill 子系统，可以用下面这七个问题自检：
 
 1. **这个流程是不是反复发生？** 如果某种工作流（比如把修复挑到发版分支、写发版说明、跑代码评审）每周都要做好几次，那它值得沉淀；如果只是某次临时任务，写一份 prompt 模板就够，没必要单独建一份 skill。
-2. **你的用户能写 markdown 吗？** 工程师团队大多能直接写 SKILL.md；面向非工程师用户的产品则一定要提供"从一次会话沉淀成 skill"的向导，否则没人会主动写。
-3. **是否需要一个 skill 市场或分发渠道？** 如果只是内部使用、本地 + 跟随产品发布的内置就够了；如果用户能从外部安装 skill，就必须配套来源标签和静态扫描，否则等于不加甄别地接受第三方代码。
+2. **你的用户能写 markdown 吗？** 工程师团队大多能直接写 SKILL.md；面向非工程师用户的产品通常需要提供"从一次会话沉淀成 skill"的向导，再用完成记录验证它是否真的降低 authoring 负担。
+3. **是否需要一个 skill 市场或分发渠道？** 如果只是内部使用，本地文件和随产品发布的内置 skill 可能就够；如果用户能从外部安装 skill，应配套来源标签和静态扫描，并明确安装失败与复核路径。
 4. **是否希望模型自己判断何时调用 skill？** 隐式触发体验更顺滑，但要求每份 skill 的触发描述写得很具体；如果做不到，老老实实让用户用 `/name` 这种显式命令调起反而更稳。
-5. **skill 是否会依赖外部凭证或工具？** 如果会，最好在元数据里把依赖明面化，让 agent 在执行之前一次性检查环境变量和命令是否齐备；如果只是文档里提一嘴让用户自己装，体验和成功率都会大打折扣。
+5. **skill 是否会依赖外部凭证或工具？** 如果会，可以在元数据里明示依赖，让 agent 在执行前检查环境变量和命令；是否改善成功率要按 provider、凭证流程和任务记录验证。
 6. **执行时是否需要用户中途介入？** 需要介入的流程更适合在主对话里直接跑；自包含的、能跑到底的流程更适合丢到子进程里，避免大量工具调用占满主对话上下文。
-7. **skill 怎么产生？** 如果作者愿意手写，提供一份模板和样例就够；如果希望让用户在一次会话之后顺手把过程留下来，就得做一套引导式向导，这部分工程量不小，但回报最高。
+7. **skill 怎么产生？** 如果作者愿意手写，提供模板和样例就够；如果希望用户在会话后留下过程，就需要引导式向导，并用完成率与回访数据评估投入。
 
-经验法则：如果只有一两个问题答"是"，那一份 prompt 模板加上几个示例就足够，没必要建子系统；如果有五个以上答"是"，那就值得把整个 skill 子系统当成一项独立工程来设计，结构上参考 Codex，体验上参考 Claude Code，安装和扫描参考 OpenClaw 与 Hermes。
+不要按回答「是」的数量直接决定是否引入完整子系统。流程稳定但不需要外部安装时，可以先用模板、显式命令和少量示例；只有当触发、依赖、分发或审计成为重复问题时，再分别增加对应组件。
 
 ## 沿着 Skill Loader 读源码
 
@@ -540,6 +559,8 @@ Codex 更进一步，让 skill 用结构化字段声明依赖：不是字符串�
     { label: 'Hermes · SKILL.md schema', path: 'REF/hermes-agent/tools/skills_tool.py', system: 'hermes', lines: '28-100' },
   ]}
 />
+
+</details>
 
 ## 接着读什么
 
@@ -562,8 +583,8 @@ Codex 更进一步，让 skill 用结构化字段声明依赖：不是字符串�
 
 **tool**: 单次原子操作。bash / file_read / git_status。无状态，单次调用，返回结果。
 **prompt template**: 字符串模板 + 变量。用户主动填变量调起。无 trigger 机制，无 metadata。
-**skill**: 工作流 + 触发条件 + 依赖。SKILL.md + frontmatter。模型可以隐式调起，能带 allowed-tools / dependencies。
-**agent**: 独立运行循环 + 多 tool 协同 + 持久状态。有自己 system prompt + tool box + memory。
+**skill**: 工作流 + 触发条件 + 依赖。SKILL.md + frontmatter。模型可以隐式调起，文件可以带 `allowed-tools` / `dependencies` 声明。
+**agent**: 独立运行循环 + 多 tool 协同 + 持久状态。有自己 system prompt + tool set + memory。
 
 **为什么需要 skill 这一层？**
 
@@ -575,12 +596,12 @@ prompt template 太弱（没 trigger），agent 太重（每次 spawn 都是新�
 
 **实际形态**：
 
-- `cherry-pick-to-release`: 频繁但步骤多，必须 skill
+- `cherry-pick-to-release`: 频繁且步骤多，适合沉淀为 skill
 - `write-changelog`: 半频繁，skill 或 prompt template 都行
 - `git status`: 单步，是 tool
 - `data-scientist`: 独立人格 + 长状态，是 agent
 
-**追问**: "skill 能调用 tool 吗？" 能。skill 是 prompt + tool list + when_to_use。执行时还是走主 agent 的 tool box。
+**追问**: "skill 能调用 tool 吗？" 可以发起工具请求。skill 是 prompt + 工具声明 + `when_to_use`；请求最终仍要经过宿主 runtime policy、审批和 sandbox，不能只看文件里的 tool list。
 
 **追问**: "skill 跟 sub-agent 区别？" sub-agent 开新进程 + 独立 context window，skill 共享主 agent context（除非 `context: fork`）。
 
@@ -615,7 +636,7 @@ Claude Code 把 skill 主逻辑放在 `src/skills/` + `src/tools/SkillTool/`，T
 **为什么这种差异？**
 
 - Rust + Cargo workspace 鼓励多 crate
-- TS / Node 单包成本低
+- TS / Node 单包布局可以减少仓库级模块边界；实际重构投入取决于接口、测试和工具链约束
 - Codex 长期规划 skill 是平台能力（marketplace + plugin）
 - Claude Code skill 是 IDE 内嵌功能
 
@@ -623,11 +644,11 @@ Claude Code 把 skill 主逻辑放在 `src/skills/` + `src/tools/SkillTool/`，T
 
 - 团队分工：8 个 crate 可以 8 个人并行
 - 代码导航：找 skill 注入逻辑直接进 `injection/`
-- 重构安全：crate 边界是天然的接口契约
+- 重构安全：crate 边界可以作为接口契约，但仍需测试和评审
 
 **追问**: "缺点是什么？" 工程开销大，跨 crate 调用要明确 export。改一个公共类型要改 8 处 import。
 
-**追问**: "Claude Code 不分 crate，将来扩展会困难吗？" TS 重构成本比 Rust 低，必要时再拆。先求 MVP。
+**追问**: "Claude Code 不分 crate，将来扩展会困难吗？" 随着 owner 或依赖边界变多，拆分可能有价值。应结合现有接口和测试覆盖比较迁移投入；源码不能证明 TypeScript 重构一定比 Rust 便宜。
 
 **源码**: [`codex/codex-rs/core-skills/Cargo.toml`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core-skills/Cargo.toml) + [`codex/codex-rs/core-skills/src/lib.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core-skills/src/lib.rs).
 </details>
@@ -682,7 +703,7 @@ def install_decision(level, verdict):
     return INSTALL_POLICY[level][VERDICT_INDEX[verdict]]
 ```
 
-零运行时开销，编译期已经全检查。
+这段函数只是查表并返回安装决策；运行时是否能执行仍由安装流程、tool policy、审批和 sandbox 决定，不能据此声称零开销或“编译期全检查”。
 
 **追问**: "怎么决定一个 skill 是哪个 trust？" 看安装来源：
 - bundled 目录 → builtin
@@ -690,7 +711,7 @@ def install_decision(level, verdict):
 - 用户主动从 URL 装 → community
 - 模型自己 write_file 创建 → agent-created
 
-**追问**: "矩阵不够细怎么办？" 加更多 trust level（enterprise / paid），但保持 NxM 矩阵小巧。Hermes 目前 12 格已经覆盖 95% 场景。
+**追问**: "矩阵不够细怎么办？" 先用真实安装记录补充来源和扫描结论，再决定是否增加 trust level（enterprise / paid）。Hermes 的 12 格是当前实现的决策表，不等于覆盖率证明。
 
 **源码**: `hermes-agent/tools/skills_guard.py:INSTALL_POLICY + VERDICT_INDEX`.
 </details>
@@ -698,7 +719,7 @@ def install_decision(level, verdict):
 <details>
 <summary>**Q4 · 概念**：progressive disclosure 在 skill 系统里怎么应用？</summary>
 
-Progressive disclosure = 「先给摘要，需要再加载详细」。Hermes 的 `MAX_NAME_LENGTH=64` + `MAX_DESCRIPTION_LENGTH=1024` 是经典应用。
+Progressive disclosure = 「先给摘要，需要再加载详细」。Hermes 的 `MAX_NAME_LENGTH=64` + `MAX_DESCRIPTION_LENGTH=1024` 是该实现的 schema 限制，不是所有 agent 的通用标准。
 
 **两阶段加载**:
 
@@ -707,30 +728,23 @@ Progressive disclosure = 「先给摘要，需要再加载详细」。Hermes 的
 - description（≤1024 char）
 - platforms / prerequisites
 
-模型看到 10 个 skill 的列表，每个 1100 char 摘要 = 11000 char 总 prompt 占用。
+列表阶段的 metadata 会进入 prompt；总占用取决于 skill 数量、实际描述长度和宿主的列表格式。
 
 **阶段 2（调用）**: 加载 SKILL.md 全文
 - prompt body
 - 例子代码
 - detailed steps
 
-只有当模型决定调起这个 skill 时，才把整个 SKILL.md 内容加载到 prompt。
+只有当模型决定调起这个 skill 时，才把正文加载到 prompt。工具声明可以在此之前被解析来做候选筛选或依赖预检，但它们不授予运行时权限；实际执行仍由宿主 policy、审批和 sandbox 决定。
 
-**收益**：
-
-假设 100 个 skill，每个 SKILL.md 平均 5000 char：
-
-- 不用 progressive disclosure: 全部装入 prompt = 500K char = ~125K tokens. 直接超出 context window.
-- 用 progressive disclosure: 列表 110K char ≈ 28K tokens. 调用一个 skill +5K char ≈ 1.25K tokens.
-
-100x 节省。
+不要用假设的 skill 数量和平均字数推出固定的 token 节省。应在目标 provider 上记录列表阶段和调用阶段的实际 prompt、缓存与延迟。
 
 **为什么 64 / 1024 这两个数？**
 
 - 64 char name: 一行命令行可见 + 屏幕宽度友好
-- 1024 char description: 大约 200 token，模型读起来 1 个 sentence 一段，刚好认清「这 skill 做什么」
+- 1024 char description: token 数取决于 tokenizer，不能把字符数换算成固定的上下文容量
 
-**Anthropic skill 文档推荐**: name ≤64, description ≤1024，跨产品事实标准。
+Hermes 源码使用这两个上限；其他运行时是否接受相同字段，需要单独核对其 schema。
 
 **对比 Codex**:
 
@@ -795,8 +809,8 @@ context: <Round 4 选择>
 
 **为什么 4 轮 + AskUserQuestion 不是一次问完？**
 
-- 一次问 4 个问题 → 用户负担太重 → 放弃率高
-- 分 4 轮，每轮一个选择题 → 完成率高
+- 一次问多个问题会让表单变重
+- 分轮只处理一个决定，便于用户逐步确认；完成率要用自己的流程记录验证
 - AskUserQuestion 提供选项，减少打字
 - session 上下文自动填默认值（allowed-tools 自动列出已用 tool）
 
@@ -806,9 +820,9 @@ context: <Round 4 选择>
 - inline / fork 是 ux 选择，模型猜不准
 - 用户参与 = 用户对生成的 skill 有 ownership，未来真会用
 
-**eval 数据**：
+**证据边界**：
 
-源码注释里写 skillify 跟手动写 SKILL.md 的对比 eval：用户完成率 85% vs 35%（自己从 0 写）。
+源码注释提到 skillify 的内部评测，但没有公开样本、流程或汇总方式。这里把向导视为一种降低填写负担的设计，不把来源方的完成率主张外推成通用结果。
 
 **对比其他系统**:
 
@@ -816,7 +830,7 @@ context: <Round 4 选择>
 - OpenClaw 走 skills-install 装外部 skill，不沉淀本地 session
 - Hermes 偶尔在 agent-created 路径下让 agent 自己写，但没 UI 引导
 
-**Claude Code 的 skillify 是独一档**，源于 Claude Code 团队是 prompt 设计专家。
+Claude Code 的 skillify 是这组源码里一个有辨识度的选择；是否适合你的产品，要看用户是否愿意在会话结束时确认触发边界和持久化位置。
 
 **追问**: "怎么让 skillify 自己抽 trigger phrase？" 让 Claude 读 session 抽出 top 3 trigger phrase candidate，再让用户选 / 修。半自动。
 
@@ -828,11 +842,11 @@ context: <Round 4 选择>
 <details>
 <summary>**Q6 · 实战**：怎么给你的 agent 加 skill 系统？路线图？</summary>
 
-5 阶段路线图：
+7 阶段路线图：
 
-**Week 1 · 选 SKILL.md 标准**
+**阶段 1 · 选 SKILL.md 标准**
 
-参考 agentskills.io: `name / description / version / license / metadata`. 别自己发明 frontmatter schema。
+参考 agentskills.io 的 `name / description / version / license / metadata`，并先核对目标 runtime 实际支持哪些字段。
 
 ```yaml
 ---
@@ -845,11 +859,11 @@ metadata:
 ---
 ```
 
-**Week 2 · 加 progressive disclosure**
+**阶段 2 · 加 progressive disclosure**
 
 ```python
 def list_skills_for_prompt() -> str:
-    """Returns metadata-only list (~1100 char per skill)."""
+    """Returns a metadata-only skill list."""
     return "\n".join(f"{s.name}: {s.description}" for s in skills)
 
 def load_skill_body(name: str) -> str:
@@ -859,7 +873,7 @@ def load_skill_body(name: str) -> str:
 
 参考 Hermes 64+1024 char 上限。
 
-**Week 3 · 加 trigger 描述**
+**阶段 3 · 加 trigger 描述**
 
 ```yaml
 when_to_use: |
@@ -869,9 +883,9 @@ when_to_use: |
   - Example: "fix critical bug in release-2.5"
 ```
 
-参考 Claude Code `when_to_use` 黄金句式。
+参考 Claude Code `when_to_use` 的句式，再用负样本检查边界。
 
-**Week 4 · 加 allowed-tools 收敛**
+**阶段 4 · 加 allowed-tools 收敛**
 
 ```yaml
 allowed-tools:
@@ -883,7 +897,7 @@ allowed-tools:
 
 不要 `Bash` 全开。
 
-**Week 5-6 · 加 trust + scanner（如果要 marketplace）**
+**阶段 5 · 加 trust + scanner（如果要 marketplace）**
 
 ```python
 TRUST_LEVELS = ["builtin", "trusted", "community", "agent-created"]
@@ -907,7 +921,7 @@ def scan_skill(skill_path: Path) -> str:
 
 参考 Hermes 12 格矩阵 + OpenClaw scanner。
 
-**Week 7-8 · 加 skillify 沉淀机制（可选）**
+**阶段 6 · 加 skillify 沉淀机制（可选）**
 
 ```python
 @cli.command()
@@ -923,7 +937,7 @@ def skillify():
 
 参考 Claude Code 4 轮 wizard。
 
-**Week 9+ · 加 implicit invocation（可选 · 高级）**
+**阶段 7 · 加 implicit invocation（可选 · 高级）**
 
 ```python
 def detect_implicit_skill(user_msg: str) -> Optional[Skill]:
@@ -933,15 +947,15 @@ def detect_implicit_skill(user_msg: str) -> Optional[Skill]:
     return None
 ```
 
-参考 Codex `detect_implicit_skill_invocation_for_command`. 高级但体验出色。
+参考 Codex `detect_implicit_skill_invocation_for_command`。先用显式调用建立基线，再比较隐式调用的误触发成本。
 
 **关键决策**：
 
-1. **agentskills.io 是事实标准，不要自己发明**
-2. **progressive disclosure 必备，不然 prompt 爆**
+1. **先核对 agentskills.io 与目标 runtime 的兼容范围**
+2. **skill 数量增长时再启用 progressive disclosure，避免列表膨胀**
 3. **trust + scanner 只在要 marketplace 时上**
-4. **skillify 体验最好，但工程量大**
-5. **implicit invocation 是加分项，先实现 explicit 调用**
+4. **skillify 可能降低 authoring 负担，但工程量大，需测完成率**
+5. **implicit invocation 先作为实验项，先实现 explicit 调用基线**
 
 **追问**: "MVP 跳哪些？" 跳 trust + scanner + implicit。先做 SKILL.md + progressive disclosure + allowed-tools.
 
@@ -982,17 +996,17 @@ skill 包通常包含:
 - Hermes: 11 个 regex pattern + 10 个 invisible unicode
 - OpenClaw: 多文件类型 + 3 级严重 + 5000 entry cache
 
-OpenClaw 更适合 marketplace（多文件 skill 包），Hermes 更适合 inline content（单文本扫描）。
+OpenClaw 的扫描路径覆盖多文件 skill 包；Hermes 的示例集中在单文本记忆。是否适合 marketplace 或 inline content，要看安装格式和 threat model。
 
 **5000 cache 有什么用？**
 
-scan 一个 5000 char 内容大约 50ms（多 regex），缓存防止重复扫。`LRU(5000)` 内存大约 50MB，可接受。
+源码给出的是缓存条目上限，不包含本站的扫描耗时或内存测量；不要把 5000 条推导成 50ms 或 50MB。实际成本应在目标机器上记录。
 
 **追问**: "Python skill 怎么扫？" 加 `.py` 扩展名 + Python 特定 pattern（`exec`, `eval`, `__import__`, `subprocess.run`).
 
 **追问**: "Binary 文件呢？" 默认 skip，或单独扫 file header 看是不是可执行。不深入。
 
-**追问**: "scanner 怎么不被绕过？" 不能完全防。攻击者可以 obfuscate code（base64 / 拆字符串）。所以 scanner 是「降低误装率」，不是「100% 拦」。配合 trust level 才是完整防护。
+**追问**: "scanner 怎么不被绕过？" 不能完全防。攻击者可以 obfuscate code（base64 / 拆字符串）。scanner 只能覆盖规则库能表达的风险，仍要结合来源、人工确认和运行时隔离。
 
 **源码**: [`openclaw/src/security/skill-scanner.ts:10-53`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/security/skill-scanner.ts#L10-L53).
 </details>
@@ -1004,7 +1018,7 @@ Claude Code 的 SKILL.md 有 `context: inline | fork` 字段：
 
 **inline**: 跟主 agent 共享 prompt
 - skill 加载到主 agent 的 prompt 里
-- skill 调用 tool 是主 agent 的 tool box
+- skill 请求的工具仍受主 agent 的 runtime policy、审批和 sandbox 约束
 - skill 结果直接进主对话
 - 用户能看到 skill 执行过程
 
@@ -1018,13 +1032,13 @@ Claude Code 的 SKILL.md 有 `context: inline | fork` 字段：
 
 - 需要用户介入的工作流（cherry-pick 中途可能 conflict 要 resolve）
 - 跟主 agent 上下文紧密耦合的（continue what we were doing）
-- 单次执行短（< 5 turns）
+- 单次执行短，且用户可能随时改方向
 
 **fork 适合**:
 
 - 自包含工作流（write changelog 跑到完，主 agent 不需要参与）
 - context 污染严重的（要大量 tool call 不想堆到主对话里）
-- 长执行（> 10 turns）
+- 长执行，且主对话不需要逐步介入
 - 并行的（同时跑多个 review，每个 fork 一份）
 
 **举例**:
@@ -1039,7 +1053,7 @@ Claude Code 的 SKILL.md 有 `context: inline | fork` 字段：
 **对比 Codex / OpenClaw**:
 
 Codex 没有 inline / fork 这样的显式字段：它通过 `SkillScope`（可见范围）和 `SubAgentSource`（这个 skill 是否要派生独立 subagent 跑）这两个字段隐式决定。
-OpenClaw 走 `skills-runtime`（一个独立的 skill 执行运行时进程）隔离执行体，效果类似 fork 但启动更轻量。
+OpenClaw 走 `skills-runtime`（一个独立的 skill 执行运行时进程）隔离执行体，语义上类似 fork；实际隔离范围和启动代价仍要看宿主实现。
 
 **Claude Code 的 inline / fork 是用户友好的显式 API**：
 
@@ -1047,7 +1061,7 @@ skill 作者一句 `context: fork` 就把执行环境定了。
 
 **追问**: "fork 怎么传参？" fork 时把主 agent 的相关 context 包成 prompt 段。Claude Code 的 `Task` tool 接 `prompt` 参数。
 
-**追问**: "fork 出来的 skill 怎么调 tool？" subagent 有自己的 tool box（受 skill.allowed-tools 约束）。不能用主 agent 的工具。
+**追问**: "fork 出来的 skill 怎么调 tool？" subagent 通常有自己的工具集合，且仍受 `allowed-tools`、宿主 policy、审批和 sandbox 约束；不能仅凭 SKILL.md 推断它一定能用或不能用主 agent 的工具。
 
 **源码**: `claude-code/src/tools/SkillTool/SkillTool.ts` + Claude Code Task tool.
 </details>
@@ -1055,7 +1069,7 @@ skill 作者一句 `context: fork` 就把执行环境定了。
 <details>
 <summary>**Q9 · 工程**：skill 调用 LLM 抽 trigger phrase 准吗？怎么提高准确率？</summary>
 
-skill 的 `when_to_use` 写得越好，模型 implicit invocation 越准。
+`when_to_use` 的具体程度可能影响 implicit invocation，但需要用带标签的请求集验证 precision、recall 和人工复核成本。
 
 **手写 when_to_use 痛点**:
 
@@ -1083,18 +1097,15 @@ def extract_triggers(skill_path: Path, sample_sessions: list[Session]) -> str:
 
 1. **正负样本**: 给 LLM 看「应触发」+ 「不该触发但相似」的样本对比
 2. **eval 反馈环**: 跑测试 dataset，看 precision/recall，迭代 trigger phrase
-3. **多模型 voting**: claude / gpt / gemini 都抽一次，取交集
+3. **多模型 voting（待验证）**: 可让多个模型提出候选，再比较交集是否真的减少误触发
 4. **用户 feedback**: 误触发时让用户标，加入负样本
-5. **trigger phrase 分层**: 必触发 trigger ("backport this fix") + 可能触发 trigger ("apply to release"), 给不同 confidence
+5. **trigger phrase 分层**: 可把高置信触发 ("backport this fix") 和候选触发 ("apply to release") 分开，再用评测决定阈值
 
 **Claude Code 的 eval 模式**:
 
-源码注释里到处 `H1 0/2 → 3/3` 标签。每个 prompt section 都跑过 eval：
-- H1-H5 = 5 个 capability case
-- 0/2 = baseline 通过率
-- 3/3 = 优化后通过率
+源码注释里出现 `H1 ...` 这类标签，但没有公开完整样本、运行环境或汇总方法。它们是 prompt 字面量关联的 case-level 记录，不构成本站或跨产品 benchmark。
 
-eval driven prompt design 才是 production 水准。
+要复用这种思路，应保留每个 case 的输入、期望行为、运行版本和原始输出，再比较改动前后，而不是只抄一个分数。
 
 **反例 · 不要这么做**:
 
@@ -1124,7 +1135,7 @@ when_to_use: |
 
 带正负样本，trigger 多种表达方式。
 
-**追问**: "怎么测 trigger 准确率？" 写 50 个 sample user message（25 应触发 25 不应触发），跑 implicit detection，看 precision/recall。production 推荐 P/R > 0.9。
+**追问**: "怎么测 trigger 准确率？" 先做一组带标签的请求，分别记录应触发和不应触发的样本，再统计误触发与漏触发。样本量、阈值和是否上线，要按产品的误触发成本与人工复核结果决定；本文不设统一数值门槛。
 
 **追问**: "误触发怎么自动学？" 用户跳过 skill 的 session 做负样本入库。下次 eval 时把这些跑一遍看新版 trigger 还会不会误触发。
 
@@ -1136,7 +1147,7 @@ when_to_use: |
 
 5 层架构:
 
-**Layer 1 · SKILL.md 标准（必备 · agentskills.io 兼容）**
+**Layer 1 · SKILL.md 标准（需要跨 runtime 互操作时）**
 
 ```yaml
 ---
@@ -1165,7 +1176,7 @@ metadata:
 
 参考 Hermes agentskills.io 兼容 + Claude Code when_to_use.
 
-**Layer 2 · Progressive Disclosure（必备）**
+**Layer 2 · Progressive Disclosure（目录变大时）**
 
 ```python
 class SkillRegistry:
@@ -1219,7 +1230,7 @@ def scan_skill(skill_path: Path) -> str:
 
 参考 OpenClaw skill-scanner 8 扩展名 + critical/warn/info.
 
-**Layer 5 · Skillify Sedimentation（推荐 · DX 杀手锏）**
+**Layer 5 · Skillify Sedimentation（作者不愿手写时可选）**
 
 ```python
 @cli.command()
@@ -1257,26 +1268,19 @@ def detect_skill_to_invoke(user_msg: str, active_skills: list[Skill]) -> Optiona
 
 **核心设计原则**:
 
-1. **agentskills.io 是事实标准**: 不要自己发明 frontmatter
-2. **progressive disclosure 必须**: 不然 prompt 爆
-3. **inline 是默认**: fork 是优化
-4. **scanner 不是 100% 防护**: 配合 trust level
-5. **skillify 是 DX 杀手锏**: 但工程量大
+1. **优先兼容公开的 SKILL.md 约定**: 先核对目标运行时，再决定是否扩展 frontmatter
+2. **skill 数量变大时采用 progressive disclosure**: 列表只放元数据，正文按需加载
+3. **先明确选择 inline 或 fork**: 两者的上下文、观察面和运行时边界不同
+4. **scanner 只能覆盖已知规则**: 结合来源、人工确认和 runtime sandbox
+5. **skillify 可降低沉淀门槛**: 但仍要让用户确认触发条件和持久化位置
 
-**复刻成本**:
+实施范围和工期取决于现有 loader、运行时 policy、安装渠道与验证覆盖；本文不提供时间估算。
 
-- Layer 1-2: 必备，2-3 周
-- Layer 3-4: 推荐 if marketplace, 3-4 周
-- Layer 5: 推荐, 2-3 周
-- Layer 6: 可选, 2-3 周
-
-总共 v0.1 (Layer 1-2) 一个月, v1.0 (Layer 5) 三个月.
-
-**追问**: "skill 跨 agent 怎么共享？" agentskills.io 兼容，任意支持的 agent 都能读。
+**追问**: "skill 跨 agent 怎么共享？" 只有在目标运行时接受相同 schema、正文格式和工具语义时才可能复用，兼容性需要逐项验证。
 
 **追问**: "skill 怎么版本化？" SemVer + immutable distribution. 升级要重装。
 
-**源码 mosaic**: 四家精华叠加。
+**源码 mosaic**: 四种实现的组件按需求组合；这不是经过本站 benchmark 的统一架构。
 </details>
 
 </details>

@@ -1,34 +1,25 @@
 ---
-title: 14 · 多通道入口
+title: 14 · 多入口如何共享一条状态
 sidebar:
   order: 14
-description: TUI、CLI、IDE 默认加 MCP Server、ACP 加 17 channel 插件、17 平台 adapter：四家怎么让用户从不同入口进来
+description: 让终端、IDE、协议和聊天入口共享一条可追踪、可升级的 Agent 状态
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
 ## 入口不同，核心状态不能分叉
 
-<Verdict tldr="同一份 agent 内核背后要同时面对一大类风格完全不同的调用方：人在终端里输入命令、CI 流水线里跑非交互脚本、IDE 通过插件远程调起、外部 IDE 通过标准协议接入、用户在 Slack / Telegram / 微信里发消息、外部系统通过 webhook 主动推送。四家在「这些入口怎么组织」上走出了四种风格：Codex 拆成多个独立 binary（codex 进终端 TUI、codex exec 跑脚本、codex mcp-server 开 MCP 服务、codex app-server 启常驻 daemon），再用一个隐藏命令 codex stdio-to-uds 把 IDE 的 stdio 转发到 Unix domain socket 上挂的 daemon，daemon 升级时 IDE 不用重启；Claude Code 走单 binary 多子命令，全部功能装进一个 npm 包，用 Node 生态的 commander 库组织（默认 REPL、--print 脚本模式、mcp serve / server / auth / plugin / doctor 各管一段），并提供一个 --bare 模式给 CI/SDK 用，跳过所有自动化行为让上下文完全可控；OpenClaw 用 19 个 sub-CLI 懒加载 + 全部走 RPC 连同一个常驻 gateway daemon，再用 ACP（Agent Control Protocol，OpenClaw 定的 IDE 接入协议）对外开放，并把 Telegram / Discord / Slack 等聊天频道做成可独立发布的 npm 包；Hermes 把 17 个平台 adapter（Telegram / Discord / Slack / Feishu / 微信 / Email / SMS / Webhook 等）压进同一个 GatewayRunner 进程，用一个 Python 抽象基类（ABC）定义 6 个必须实现的方法（连接、断开、发消息、发输入指示、发图、查会话信息），并把 HTTP API 调用和入站 webhook 也建模为 platform。结论：开发者工具型 agent 参考 Codex / Claude Code，ChatOps 型 agent 参考 Hermes 的 BasePlatformAdapter，开放生态型 agent 框架参考 OpenClaw 的 channels-plugins。" />
+<Verdict tldr="终端、IDE、协议和聊天入口共用一条运行状态，谁负责翻译？本文沿着入口到核心状态的调用链，观察 Codex 的子命令与 UDS、Claude Code 的单包命令树、OpenClaw 的 gateway/插件，以及 Hermes 的 adapter。比较只保留会影响部署和升级的分岔；页面没有吞吐或延迟实测。" />
 
-## 四种入口拓扑
-
-<details>
-<summary>读前提示（按需展开）</summary>
-
-- **核心问题**：同一份 agent 内核要同时面对终端、CI 脚本、IDE 插件、标准协议、聊天平台、webhook 这些风格完全不同的调用方。
-- **分歧最大点**：Codex 多 binary 加 stdio-to-uds 桥接 daemon、Claude Code 单 binary 用 commander 组织子命令、OpenClaw 19 个 sub-CLI 全走 RPC 连 gateway 加 ACP、Hermes 把 17 个 platform adapter 压进一个 GatewayRunner。
-- **工程判断**：产品形态决定入口拓扑：开发者工具参考 Codex/Claude Code，ChatOps 参考 Hermes 的 BasePlatformAdapter，开放生态参考 OpenClaw 的 channels-plugins。
-- **动手要点**：CI/SDK 入口先留一个 --bare 式开关，跳过所有自动化行为让上下文完全可控；IDE 集成用 stdio-to-uds 桥让 daemon 升级不打断 IDE。
-
-</details>
+## 先固定一条共享状态
 
 <Diagram
   src="/diagrams/14-multi-channel-entry-base.svg"
@@ -50,11 +41,11 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## 四套系统怎样接入多个通道
+## 源码证据：入口如何回到核心
 
 ### Codex · 把每种调用模式都做成一个独立子命令，再用 UDS 桥接 IDE 和 daemon
 
-Codex 的取舍逻辑很清晰：它要服务的调用方差异巨大：终端里裸跑的开发者要看 ratatui 渲染的全屏 TUI、CI 脚本里要的是输入一段 prompt 输出一段 JSON 就退出的非交互模式、IDE 集成要的是双向流式的通信通道、桌面 app 要的是带状态的 daemon、远程 client 要的是带认证的 HTTP、WS 服务。这些场景的生命周期模式、状态管理需求、协议要求都不一样，硬塞进一个进程里会出现各种相互打架的问题。
+入口的生命周期不同：TUI 要保持交互，CI 要尽快退出，IDE 需要双向流，daemon 则要长期持有状态。Codex 把它们拆成子命令，并用 stdio-to-UDS 连接 IDE 与 daemon。
 
 它的解法是把这些场景都拆成 `codex` multitool 的子命令：一个二进制文件，但每个子命令都对应一种完全不同的入口模式。这种「multitool」模式跟 git 的设计哲学一致（一个 git 命令背后是 git-checkout、git-commit 等独立子命令），但每个子命令的代码组织又拆得很彻底，几乎等于多个独立 binary 共享一个分发器。
 
@@ -119,7 +110,7 @@ enum Subcommand {
 
 里面最值得专门讲的是一个叫 **`codex stdio-to-uds`** 的隐藏子命令：它的存在解决的是 IDE 集成里一个棘手的工程问题。
 
-想象一下 IDE 集成的典型痛点：IDE 启动一个 agent 子进程，子进程跟 IDE 之间通常走 stdio 进行 JSON-RPC 通信（这是 LSP、DAP、MCP 等所有 IDE 协议的通用做法）。但 agent 本身想做成一个常驻 daemon：它需要在 IDE 重启之间保留会话状态、想跟其他 IDE 实例共享会话、希望升级 agent 时不影响 IDE 进程。
+想象一下 IDE 集成的一个常见冲突：很多工具入口由 IDE 启动子进程并通过 stdio 通信，但 agent 可能希望用常驻 daemon 保留会话状态、服务多个客户端或独立升级。
 
 这两个需求是矛盾的：IDE 期望的是「一个子进程对应一个 agent 会话」，daemon 模型期望的是「一个 daemon 服务多个客户端」。
 
@@ -131,7 +122,7 @@ daemon 可以随时重启升级（IDE 这边只会感受到一次重连），桥
 
 ### Claude Code · 把所有功能塞进一个 npm 包里，靠 commander 子命令树组织
 
-Claude Code 的取舍跟 Codex 截然相反。它假设它的用户是开发者，用一行 `npm install -g @anthropic-ai/claude-code` 就能装好。它最想避免的事情是用户在终端里需要记住「哦原来还要再装一个 binary 才能用 MCP 模式」。所以它选了「单 binary 多子命令」的路线：所有功能都塞在同一个 npm 包的入口里，用 commander.js 库做子命令分发。
+单包 CLI 的价值是安装和升级简单。Claude Code 用 commander 组织 REPL、脚本、MCP 和 server，并提供 --bare 让 CI 跳过交互行为。
 
 <SourceBlock path="REF/claude-code-2.1.88-expanded/src/main.tsx" lines="971-1006" system="claude" summary="顶层 program 的核心 flag：--print / --bare / --ide / --mcp-config / --print（脚本模式）；几乎所有功能都通过 flag 切换">
 
@@ -182,13 +173,13 @@ program.command('server').description('Start a Claude Code session server')
 
 跟 Codex 比起来，Claude Code 的取舍是"用户只装一个 npm 包"（分发简单），代价是 `main.tsx` 这个文件长达一万多行（维护成本高）。这两种取舍没有绝对优劣，更多取决于团队对"用户体验 vs 工程模块化"的优先级判断。
 
-### OpenClaw · 19 个懒加载子 CLI + 把频道做成可独立发布的 npm 包
+### OpenClaw · 28 个懒加载子 CLI + 把频道做成可独立发布的 npm 包
 
-OpenClaw 的取舍跟前两家又是一个完全不同的逻辑。它要服务的是一个比 IDE 工具更复杂的场景：它本质上是一个 ChatOps 框架，要能同时接入很多种聊天平台（Telegram、Discord、Slack 等），还要能给多种本地工具提供 RPC 接口，还要支持 sandbox 容器隔离，还要给外部 IDE 提供标准化接入协议。一个 CLI 就要同时面对「管理 Telegram 配置、启动 sandbox 容器、查看日志、操作 DNS 解析」等好几十种功能。
+多频道平台需要把入口与 gateway 解耦。OpenClaw 的 sub-CLI 懒加载，频道以 plugin 发布，RPC 和 ACP 负责把外部调用带回同一运行时。
 
-它的解法是把 CLI 拆成 **19 个独立的 sub-CLI**：每个 sub-CLI 对应一个功能领域，组织上既不是 Codex 那种「每个子命令一种入口模式」也不是 Claude Code 那种「主入口加一堆小子命令」，而是「主程序只做分发，所有重型逻辑都在 sub-CLI 里」。
+在本文固定的 commit 中，`entries` 数组注册了 **28 个 sub-CLI**。每个条目对应一个功能领域，主程序负责识别命令，再按需导入对应模块。
 
-<SourceBlock path="REF/openclaw/src/cli/program/register.subclis.ts" lines="44-160" system="openclaw" summary="19 个顶层 sub-CLI：acp / gateway / daemon / logs / system / models / approvals / nodes / devices / node / sandbox / tui / cron / dns / docs / hooks / webhooks / qr / clawbot / pairing / plugins / channels / directory / security / secrets / skills / update">
+<SourceBlock path="REF/openclaw/src/cli/program/register.subclis.ts" lines="44-310" system="openclaw" summary="28 个顶层 sub-CLI，从 acp、gateway 到 update、completion；每个条目延迟导入自己的注册模块">
 
 ```ts
 const entries: SubCliEntry[] = [
@@ -214,7 +205,7 @@ const entries: SubCliEntry[] = [
 
 **第一层是 gateway daemon**：一个常驻的后台进程，持有所有 WebSocket 连接、全局状态、活跃 session。这是整个系统的「心脏」，用 `openclaw gateway start` 启动它。
 
-**第二层是 19 个 sub-CLI**：所有 `openclaw <subcli> <cmd>` 形式的命令都是 RPC 客户端，自己内部不做任何真正的业务逻辑，只是把命令翻译成 RPC 请求发给本地 gateway。这种设计带来一个关键的工程收益：**懒加载**。用户跑 `openclaw logs tail` 这种短命令时，Node.js 只需要把 logs-cli.js 这个文件 require 进来，完全不会 load gateway、daemon、sandbox 等其他模块的代码：结果就是 sub-CLI 的启动延迟可以做到几十毫秒级，跟一个常驻进程的体验差不多。
+**第二层是 28 个 sub-CLI**：`entries` 先注册轻量 action，命中命令后再 `import()` 对应模块。源码能证明未选模块不会在注册阶段加载；它能省多少启动时间，要用同一构建、机器和缓存状态跑 benchmark。
 
 **第三层是独立的 TUI 应用**（`openclaw tui`）：它跟 sub-CLI 是完全独立的 npm 包（在仓库里叫 `ui-tui`），通过 WebSocket 连到 gateway。这种独立性意味着 TUI 可以独立迭代、独立发版，甚至可以在不同机器上跑（TUI 在用户笔记本上，gateway 在公司服务器上）。
 
@@ -250,11 +241,11 @@ const DEFAULT_CATALOG_PATHS = [
 
 ### Hermes · 一个 gateway 进程同时跑 17 个平台 adapter，把 HTTP API 也建模成"平台"
 
-Hermes 的取舍跟 OpenClaw 形成鲜明对比：它的目标是做一个「一个 pip install 装好之后能立刻接十几个聊天平台」的 ChatOps agent，所以它把所有的平台 adapter 都内置在主仓库里，全都在同一个 gateway 进程里跑。这种做法看上去很重，但对它的目标用户（个人开发者搭一个家庭、个人助手机器人）来说是最方便的：不需要折腾插件系统、不需要装额外的 npm 包，开箱就能接入。
+ChatOps 更在意平台适配的一致接口。Hermes 让 adapter 实现连接、发送、输入指示和会话查询等方法，HTTP 与 webhook 也走同一层。
 
-Hermes 的核心抽象是一个叫 `BasePlatformAdapter` 的基类：它定义了 6 个所有平台都必须实现的方法，并且通过这 6 个方法的最小公共子集统一了 17 种千差万别的聊天平台。
+Hermes 的核心抽象是一个叫 `BasePlatformAdapter` 的基类：它定义了 6 个所有平台都需要实现的方法，并且通过这 6 个方法的最小公共子集统一了 17 种千差万别的聊天平台。
 
-<SourceBlock path="REF/hermes-agent/gateway/platforms/base.py" lines="854-1055" system="hermes" summary="BasePlatformAdapter：抽象出 connect / disconnect / send / send_typing / send_image / get_chat_info 等 6 个 abstract method，子类必须实现">
+<SourceBlock path="REF/hermes-agent/gateway/platforms/base.py" lines="854-1055" system="hermes" summary="BasePlatformAdapter：抽象出 connect / disconnect / send / send_typing / send_image / get_chat_info 等 6 个 abstract method，子类需要实现">
 
 ```python
 class BasePlatformAdapter(ABC):
@@ -292,7 +283,7 @@ class BasePlatformAdapter(ABC):
 
 </SourceBlock>
 
-这 6 个抽象方法分别覆盖了「接进来、断开、发出去、显示输入指示、发图、查会话元信息」这几件每个聊天平台都必须支持的基本能力。子类必须实现这 6 个方法的具体逻辑：比如 TelegramAdapter 的 `connect` 是登录到 Telegram Bot API 加开 long polling，DiscordAdapter 的 `connect` 是连 Discord 的 gateway WebSocket，EmailAdapter 的 `connect` 是连 IMAP server。
+这 6 个抽象方法分别覆盖了「接进来、断开、发出去、显示输入指示、发图、查会话元信息」这几件每个聊天平台都需要支持的基本能力。子类需要实现这 6 个方法的具体逻辑：比如 TelegramAdapter 的 `connect` 是登录到 Telegram Bot API 加开 long polling，DiscordAdapter 的 `connect` 是连 Discord 的 gateway WebSocket，EmailAdapter 的 `connect` 是连 IMAP server。
 
 基类还预先做了几件所有 adapter 都需要的事情：管理「活跃 session 的中断信号」（让用户能在 agent 中途打断生成）、管理「挂起的消息」（适配某些平台需要排队的场景）、管理「后台任务集合」（防止异步任务被 GC）。
 
@@ -338,94 +329,92 @@ def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatf
 
 **第二个细节是 extra dependencies**。如果用户需要某个平台，Python 的 packaging 系统提供了 `hermes-agent[slack]` 这种「extra」语法可以安装平台专属的依赖（slack-bolt 等）。这让「主包小加按需安装平台 SDK」成为可能。
 
-**第三个细节是把 HTTP API 和 Webhook 也建模成 platform**：这是 Hermes 巧妙的一个设计。`API_SERVER` adapter 让 Hermes 暴露一个 HTTP API endpoint，外部系统可以通过 HTTP 调用让 agent 处理一条消息；`WEBHOOK` adapter 反过来让外部系统通过 webhook 主动推消息进来。这两种「非聊天平台」的入口完全可以走另一条独立的代码路径，但 Hermes 把它们也建模成 platform，复用了同一套 `BasePlatformAdapter` 抽象、同一套消息处理器、同一套 session 管理逻辑：结果是 API 调用和 webhook 都能享受到聊天平台那套的完整功能（活跃 session 中断、流式响应、长任务支持）。
+**第三个细节是把 HTTP API 和 Webhook 也建模成 platform**：这是 Hermes 巧妙的一个设计。`API_SERVER` adapter 让 Hermes 暴露一个 HTTP API endpoint，外部系统可以通过 HTTP 调用让 agent 处理一条消息；`WEBHOOK` adapter 反过来让外部系统通过 webhook 主动推消息进来。这两种「非聊天平台」的入口完全可以走另一条独立的代码路径，但 Hermes 把它们也建模成 platform，复用了同一套 `BasePlatformAdapter` 抽象、同一套消息处理器、同一套 session 管理逻辑：结果是 API 调用和 webhook 都能享受到聊天平台那套的较全功能（活跃 session 中断、流式响应、长任务支持）。
 
 除了 17 个 platform adapter，Hermes 还提供了几个面向开发者和工具链的入口：一个简单的 `cli.py` 直接跟 agent 对话（主要给开发和测试用）、一个 `tui_gateway/` 包提供本地 TUI（连本地 gateway daemon）、一个 `mcp_serve.py` 把整个 Hermes 包装成一个 MCP server 让其他 agent 可以把它当工具用。
 
-## 多通道入口已经形成的共识
+## 通道实现共享的底线
 
-虽然四家在入口架构上的取舍差异巨大，但它们在四件最基本的事情上达成了一致：这四件事可以看作做好「多通道入口」的最小集合。
+虽然四家在入口架构上的取舍差异巨大，但以下四个检查项在引用的源码中反复出现；它们是本文的工程归纳，不是所有入口系统都必须采用的固定集合。
 
-**第一件事是承认 MCP（或类似的标准化 agent 协议）是事实标准**。四家都给了 MCP server 入口：Codex 做成独立 binary（`codex mcp-server`）、Claude Code 做成子命令（`claude mcp serve`）、Hermes 做成独立 Python 模块（`mcp_serve.py`）、OpenClaw 走的是同源思路的 ACP 协议（`openclaw acp serve`）。背后的逻辑是：agent 之间互相调用、IDE 调用 agent、orchestrator 调用 agent 这些场景越来越多，每家都自己造私有协议是没出路的，必须收敛到公开标准。
+**第一件事是优先评估公开的 agent 协议**。本次快照都暴露了 MCP 或 ACP 入口：Codex 是独立 binary，Claude Code 是子命令，Hermes 是 Python 模块，OpenClaw 是 ACP server。这说明互操作是一个现实需求，但不能仅凭四个项目就宣布某个协议已经成为普遍事实标准；选型仍要看调用方和版本兼容。
 
-**第二件事是把 CLI 和 daemon 拆成两层**。OpenClaw 把这件事做得最显式（gateway daemon 常驻 + sub-CLI 全部都是 RPC 客户端），Codex 通过 `app-server` 加 `stdio-to-uds` 桥隐式实现，Claude Code 通过 `server` 子命令提供（HTTP/Unix socket session 服务器）。背后的逻辑也是一致的：交互式 CLI 启动慢（要 load 配置、连各种依赖）；如果每条命令都重新启动一个完整 agent，用户体验会很差。把状态托管给一个常驻 daemon、让短命令只做 RPC，是几乎所有"agent 也是 CLI 工具"的项目最终都会走到的架构。
+**第二件事是按生命周期决定 CLI 和 daemon 是否分层**。OpenClaw 通过常驻 gateway、Codex 通过 `app-server` 加 `stdio-to-uds`、Claude Code 通过 `server` 子命令展示了三种实现。长任务或多客户端共享状态时分层有价值；短命令、单进程工具则可能不需要 daemon，不能把它写成所有项目的终点。
 
-**第三件事是入口必须做能力探测**。装了某个 channel、platform 不代表它能跑：可能 SDK 没装、可能凭证没配、可能依赖的外部服务连不上。四家都做了能力探测：Hermes 的 `check_<platform>_requirements()` 函数族、OpenClaw 的 plugins catalog（描述每个插件需要的依赖）、Codex 的 features flag（编译时决定哪些能力可用）。共识是：缺依赖时优雅降级（warning 加跳过），不能让一个平台的依赖问题拖垮整个 agent。
+**第三件事是入口需要做能力探测**。装了某个 channel、platform 不代表它能跑：SDK、凭证或外部服务都可能缺失。快照中的 Hermes、OpenClaw 和 Codex 都有不同形式的探测或声明；缺依赖时可以 warning 加跳过，但是否允许继续启动要由产品的失败策略决定。
 
-**第四件事是接入的协议都是公开标准，没人造私有协议**。MCP（Codex、Claude、Hermes 都接）、ACP（OpenClaw 主推）、Telegram Bot API、Slack Bolt、Discord Gateway、IMAP、SMTP 这些都是公开协议。没有任何一家自己造了一个「专属的 agent 通信协议」：一来公开协议有现成的 SDK 和工具链；二来私有协议会让外部生态没法接入，反过来限制 agent 自己的可用场景。
+**第四件事是优先复用公开协议，并把私有扩展隔离在适配层**。MCP、ACP、Telegram Bot API、Slack Bolt、Discord Gateway、IMAP 和 SMTP 都有公开规范或 SDK；这样能降低接入成本，但仍需记录版本、能力差异和供应方限制，不能从样本推断「没人造私有协议」。
 
-## 子命令、适配器与独立包怎么选
+## 按部署形态选择入口
 
 <Diagram
   src="/diagrams/14-tradeoff.svg"
   alt="四家多通道入口在通道数量 x 生态开放度上的相对位置"
-  caption="Codex multi-binary 偏左中；Claude Code 单 binary + subcommand 偏左下；OpenClaw 19 sub-CLI + plugins 最开放；Hermes 17 platform 数量第一但内置主仓库。"
+  caption="Codex multi-binary 偏左中；Claude Code 单 binary + subcommand 偏左下；OpenClaw 28 sub-CLI + plugins；Hermes 17 platform 内置主仓库。"
 />
 
 四种典型场景：
 
-- **要做开发工具型 agent**：参考 Codex / Claude Code 的 CLI + IDE + MCP 三件套。两家都有完整方案。
-- **要做 ChatOps 型 agent**：参考 Hermes 的 BasePlatformAdapter + `check_<platform>_requirements()` pattern，17 个 platform 是真实样本。
+- **要做开发工具型 agent**：参考 Codex / Claude Code 的 CLI + IDE + MCP 三件套。两家都有较全方案。
+- **要做 ChatOps 型 agent**：参考 Hermes 的 BasePlatformAdapter + `check_<platform>_requirements()` pattern；17 个 platform 是这个快照的样本，不是覆盖目标。
 - **要做平台型 agent 框架**：参考 OpenClaw 的 channels-plugins + ACP 设计，让生态做新通道。
 - **要做双栖 agent（开发 + ChatOps）**：参考 Hermes 的「HTTP API 也是 platform」+ Codex 的 stdio-to-uds 桥接，复用同一套 message handler。
 
-## 我的判断：通道只负责翻译
+## 选择：通道只翻译，不拥有状态
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: 'multi-binary 让每种入口都独立 / 可单独升级；stdio-to-uds 让 IDE 跟 daemon 解耦的桥设计精妙；app-server axum 同时支持 HTTP1 + WS 适配多 client', risk: '入口太多导致用户难记（codex vs codex exec vs codex mcp-server vs codex app-server）；多 binary 增加打包跟分发复杂度' },
-    { system: 'Claude Code', value: '★★★★', reason: 'commander.js 用得彻底，子命令组织清晰（mcp / auth / plugin / server）；--bare 模式给 CI / SDK 一个干净入口；server 子命令支持 Unix socket，方便本地多进程接入', risk: 'main.tsx 单文件长达上万行；--ide 自动 detect 在多 IDE 同时打开时有歧义；启动开销较重（plugin / LSP / hook 都 load）' },
-    { system: 'OpenClaw', value: '★★★★★', reason: 'lazy-load sub-CLI 启动开销最小；channels-plugins 让生态可以做新频道；ACP 是 standardized 协议给外部 IDE 接入；gateway daemon + RPC client 解耦最干净', risk: '入口多到难一眼掌握；用户必须先启 gateway daemon 才能用大多数命令；channels-plugins 生态目前主要是官方维护' },
-    { system: 'Hermes', value: '★★★★★', reason: '17 platform adapter 是业界最广覆盖；BasePlatformAdapter 抽象干净（6 abstract method）；HTTP API 跟 Webhook 都建模为 platform 复用 message handler；check_<platform>_requirements() 给优雅降级', risk: '所有 adapter 内置在主仓库，仓库 size 跟测试矩阵庞大；每加一个 platform 是真实代码 +SDK 依赖；不主打 IDE 集成' },
-  ]}
-  caption="评分依据：通道数量 + 生态开放度 + 失败处理 + 维护成本"
-  headers={['系统', '评分', '亮点', '风险']}
-/>
+这里不做星级评分。入口越多，越要先固定一条共享的运行状态和事件协议。
+
+| 部署约束 | 可先读 | 代价与边界 |
+| --- | --- | --- |
+| 终端、CI、IDE 需要不同生命周期 | Codex 的子命令、app-server 与 stdio-to-UDS | binary 与协议数量增加 |
+| 想在一个 CLI 中维护交互和脚本入口 | Claude Code 的 commander 子命令与 --bare | 单包升级方便，但启动路径容易变重 |
+| 需要让社区发布新频道并共享 gateway 状态 | OpenClaw 的懒加载 sub-CLI、RPC 和 channel plugin | 运行依赖常驻 gateway |
+| 主要服务 Telegram、Slack 等聊天平台 | Hermes 的 BasePlatformAdapter 与平台检查 | adapter 和平台测试矩阵持续增长 |
 
 ## 从一个入口与一个核心开始
 
-下面是从四家提炼的「自己写多通道入口」配方。先把基础四件套打牢，再加生产级特性，最后避开五个常见死路。
+下面是从引用实现整理出的起步清单。先固定共享状态和调用契约，再按入口生命周期添加桥接、认证和升级策略。
 
 <BuildRecipe
   title="复刻方案"
   minimal={[
-    '主入口至少 3 个模式：TUI（人类交互）、脚本模式（-p、exec 自动化）、MCP server（stdio 协议）：覆盖人、自动化、工具链三类调用方。缺一个就有一群用户接不上',
+    '先按调用方选入口：人类交互用 TUI 或 REPL，自动化用 -p / exec，外部工具链需要时再加 MCP server；不要为了凑齐模式同时维护没人使用的入口',
     '加 --bare 模式（参考 Claude Code）：跳过所有「自动化」行为（如 auto-update、welcome message、analytics opt-in 等）给 CI、SDK 用。这些自动化在交互场景是友好但在 CI 是噪声',
     '认证入口独立子命令（参考 Claude Code 的 auth、Codex 的 login）：login、status、logout 是独立子命令而非主 flag。这样 auth 流程可以独立测试、独立日志、独立 UX',
     'doctor 子命令（参考 Claude Code 的 doctor）：检查依赖、网络、配置、凭证。用户排错时第一步就跑 doctor，避免「卡在某个步骤但不知道哪一步出问题」的痛苦',
   ]}
   advanced={[
     'multi-binary 拆分（参考 Codex）：daemon（长跑服务）/ CLI（用户入口）/ mcp-server（MCP 协议端点）/ stdio-to-uds（桥）分别独立 binary，各自升级；不同部分升级速度不同，分 binary 能精细化',
-    'stdio-to-uds 桥（参考 Codex）：IDE 启子进程走 stdio（IDE 期望的协议），子进程内部走 UDS 连 daemon（高性能 IPC）；IDE 跟 daemon 完全解耦（daemon 重启不影响 IDE，IDE 升级不影响 daemon）',
+    'stdio-to-uds 桥（参考 Codex）：IDE 子进程走 stdio，桥再通过 UDS 连接 daemon。它把进程生命周期分开，但吞吐、重连和升级行为仍要在目标 IDE 与 daemon 上验证',
     'app-server 用 axum（参考 Codex）：同一个 daemon 同时支持 HTTP1 + WS（不同 client 选协议）；axum 是 Rust 生态最流行的 web server，性能 + 生态都成熟',
-    'sub-CLI lazy-load（参考 OpenClaw）：每个 sub-CLI（auth / config / doctor / login 等）一个文件，只在用到时 import；CLI 启动时间是 UX 关键，全部 import 会让启动慢半秒',
+    'sub-CLI lazy-load（参考 OpenClaw）：每个 sub-CLI（auth / config / doctor / login 等）一个文件，只在用到时 import；用冷、热启动 benchmark 验证收益，不预写固定毫秒数',
     'channels-plugins catalog（参考 OpenClaw）：通道作为独立 npm 包通过 catalog 注册；这样新增通道（如新的 IM 平台）只需发 npm 包不用改主包，企业可以发自己的私有 channel 包',
     'ACP 协议（参考 OpenClaw）：让外部 IDE / orchestrator 用标准协议接入；不要发明私有协议（外部生态不会跟进），ACP 是 OpenClaw 推动的标准',
-    'BasePlatformAdapter（参考 Hermes）：6 个 abstract method 抽出来（send_message / receive / parse / validate / authenticate / cleanup），每个平台独立子类；新增平台只需实现这 6 个方法',
+    'BasePlatformAdapter（参考 Hermes）：围绕 connect / disconnect / send / send_typing / send_image / get_chat_info 抽出 6 个 abstract method；新增平台还要补依赖、认证和兼容性测试',
     'check_<platform>_requirements()（参考 Hermes）：缺依赖时优雅降级 + 警告（如「telegram 库未装，telegram 通道禁用」），不 fatal；让用户能逐步开通道而非一次性装齐所有依赖',
     'HTTP API / Webhook 也建模为 platform（参考 Hermes）：复用同一套 message handler；HTTP 跟 Telegram 在 agent 视角都是「收到一条消息回一条消息」，统一抽象简化代码',
     'extra dependencies（参考 Hermes）：主包不带平台 SDK，hermes[slack] / hermes[discord] / hermes[telegram] 等 extra 才装对应 SDK；用户只用 Telegram 不应该被迫装 discord.py',
   ]}
   avoid={[
-    '别全塞一个 main 文件：超过 5000 行就该拆；Claude Code 的 cli.js 单文件是反面教材（debugging 极痛苦，单点故障）',
+    '别把所有入口逻辑塞进 main 文件：按生命周期和职责拆 registrar、adapter 与 daemon；是否拆分看变更耦合和测试边界，不用固定行数判断',
     '别把所有 platform 强制依赖：用户只用 Telegram 不应该被迫装 discord.py / slack-sdk 等所有平台 SDK；用 extra 让用户选',
-    '别在 MCP server 里跑长任务：MCP 设计上是请求-响应，长任务用 progress notification（流式更新）或 split（分多次请求-响应）；长跑会撑爆 stdio buffer',
-    '别让 IDE 集成依赖私有协议：MCP / ACP 都是公开协议，外部 IDE 自然支持；私有协议每个 IDE 都要单独适配，永远跟不上',
+    '别让长任务占住 MCP 请求却没有进度和取消：使用 progress notification、任务句柄或分段请求，并对 stdio 缓冲与断线恢复做压力测试',
+    '别在已有 MCP / ACP 能表达需求时再造私有协议：私有协议会把每个 IDE 的适配、版本兼容和文档都变成自己的维护成本',
     '别让 daemon 跟 CLI 紧耦合：daemon 升级不应该重启所有 CLI client（用户的 long-running session 会断），用 stdio-to-uds 桥解耦',
   ]}
 />
 
-## 四种入口拓扑并列
+## 把入口差异放回部署场景
 
 <Diagram
   src="/diagrams/14-entry-topologies.svg"
   alt="四种入口拓扑并列对照"
-  caption="Codex 多 binary 各自独立；Claude Code 单 binary + commander 子命令；OpenClaw 19 sub-CLI + ACP + channels-plugins；Hermes 17 platform adapter 单进程。"
+  caption="Codex 多 binary 各自独立；Claude Code 单 binary + commander 子命令；OpenClaw 28 sub-CLI + ACP + channels-plugins；Hermes 17 platform adapter 单进程。"
 />
 
 把 4 种放一起，"用户怎么进来"的差异一眼可见：Codex 让每种调用方走专属 binary，Claude Code 让 commander 替你 dispatch，OpenClaw 让生态做新通道，Hermes 把 17 个平台塞同一个进程。
 
-## 沿着 Channel Adapter 读源码
+## 入口适配器怎样回到同一核心
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -438,7 +427,7 @@ def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatf
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/main.tsx', lines: '971-1006', desc: '顶层 flag 与默认 action' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/main.tsx', lines: '3894-3970', desc: 'mcp / server / auth / plugin 子命令注册' },
     { system: 'Claude Code', path: 'REF/claude-code-2.1.88-expanded/src/entrypoints/mcp.ts', desc: 'startMCPServer 实现' },
-    { system: 'OpenClaw', path: 'REF/openclaw/src/cli/program/register.subclis.ts', lines: '44-300', desc: '19 个顶层 sub-CLI 注册（lazy load）' },
+    { system: 'OpenClaw', path: 'REF/openclaw/src/cli/program/register.subclis.ts', lines: '44-310', desc: '28 个顶层 sub-CLI 注册（本文固定 commit）' },
     { system: 'OpenClaw', path: 'REF/openclaw/src/acp/server.ts', desc: 'serveAcpGateway 入口（@agentclientprotocol/sdk）' },
     { system: 'OpenClaw', path: 'REF/openclaw/src/channels/plugins/catalog.ts', desc: 'channels-plugins catalog 注册' },
     { system: 'Hermes', path: 'REF/hermes-agent/gateway/platforms/base.py', lines: '854-1060', desc: 'BasePlatformAdapter 抽象' },
@@ -471,7 +460,7 @@ def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatf
 **Codex multi-binary**：每个入口（tui / exec / mcp-server / app-server / stdio-to-uds / app / cloud）是独立 Rust binary。好处：
 
 1. **独立升级**：tui 改了 UI 不影响 mcp-server。VS Code 插件可以单独升 stdio-to-uds 而不动 tui。
-2. **启动成本最小**：每个 binary 只 link 自己需要的 crate，启动开销 < 50ms。
+2. **依赖面可分开**：每个 binary 只 link 自己需要的 crate；具体启动时间仍取决于构建模式、机器和初始化路径。
 3. **职责清晰**：用户看一眼 `codex-app-server` 就知道是 daemon，看 `codex` 就知道是 TUI。
 4. **可分发到不同发布渠道**：app 可以单独发 macOS App Store / Windows Store。
 
@@ -488,17 +477,17 @@ def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatf
 
 **选哪种？**
 
-- **agent 写 Rust + 重度多入口**：Codex multi-binary 是对的
-- **agent 写 Node / Python + npm/pip 一键安装**：Claude Code single-binary 是对的
+- **agent 写 Rust + 重度多入口**：Codex multi-binary 更适配这种发布与生命周期边界
+- **agent 写 Node / Python + npm/pip 一键安装**：Claude Code single-binary 更适配一键分发；是否采用仍取决于入口数量和升级策略
 - **agent 写 Rust + 入口少**：single binary + clap subcommand 也行（小 Codex）
 
-**追问**：「混合方案？」可以：Codex 80% 是 multi-binary，但 `codex` 主 binary 内嵌 tui 的 90% 代码，需要时直接 invoke 子命令；OpenClaw 走的就是这种「主 binary + lazy-load sub-CLI module」混合。
+**追问**：「混合方案？」可以。Codex 同时有独立 binary 和主 CLI 内的子命令分发；OpenClaw 则是「主 CLI + lazy-load sub-CLI module」。是否继续拆 binary，取决于生命周期和发布边界。
 
 **源码**：[`codex/codex-rs/cli/src/main.rs:105-182`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/cli/src/main.rs#L105-L182) + `claude-code/src/main.tsx:971-1006`。
 </details>
 
 <details>
-<summary>**Q2 · 概念**：MCP 跟 ACP 都是公开协议，4 家为什么都用？</summary>
+<summary>**Q2 · 概念**：什么时候值得接公开协议，什么时候需要私有扩展？</summary>
 
 「公开协议 vs 私有协议」的成本算清楚：
 
@@ -508,27 +497,27 @@ def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatf
 - 文档 / SDK / 版本兼容自己维护
 - 用户被锁定 → 切换难 → 生态封闭
 
-**公开协议（MCP / ACP）收益**：
+**公开协议（MCP / ACP）的潜在收益**：
 
-- 一次实现，所有支持该协议的 IDE / orchestrator 自动可用
-- 协议设计已被多方迭代，corner case 已被覆盖
-- 文档 / SDK / 版本管理由协议组织维护
+- 对兼容客户端减少重复适配
+- 复用现成文档、SDK 和版本协商机制
+- 把私有扩展限制在能力缺口，而不是重写整个传输层
 
-**MCP 跟 ACP 各自定位：**
+**本次快照里的入口：**
 
-- **MCP（Model Context Protocol）**：Anthropic 提出，主要场景是「LLM 客户端调用外部工具」。Codex / Claude Code / Hermes 把自己作为 MCP server 暴露给 Cursor / VS Code / Cline。
-- **ACP（Agent Client Protocol）**：OpenClaw 提出，主要场景是「Agent 之间通信」。让 OpenClaw 当 ACP server，外部 orchestrator 当 ACP client 调度多 agent。
+- **MCP（Model Context Protocol）**：Codex、Claude Code 和 Hermes 的引用路径提供 MCP server 入口，但具体 client、能力和版本需要逐一核对。
+- **ACP（Agent Client Protocol）**：OpenClaw 的引用路径提供 ACP server；它与 MCP 解决的调用关系不同，不能把两者当成一个统一协议。
 
-**4 家全用：**
+**四个入口并不等于“都采用同一协议”：**
 
 - Codex `mcp-server` binary
 - Claude Code `claude mcp serve`
 - OpenClaw `openclaw acp` 子命令
 - Hermes `mcp_serve.py`
 
-**实际效果：** 用户在 Cursor 里能同时挂载 Codex、Claude Code、Hermes 作为 MCP server 用，三家不需要互相适配。这是「公开协议产生网络效应」的典型 case。
+**实际效果要验证：** 只有当客户端实现相同协议版本、transport 和所需能力时，接入才可能减少适配；本文没有在 Cursor 中同时挂载三套 server 的实测。
 
-**追问**：「公开协议要不要等成熟再用？」不用等。MCP / ACP 第一版有 breaking change 是常态，但「跟一个公开协议早期版本」比「自己造一个私有协议」性价比高得多。
+**追问**：「公开协议要不要等成熟再用？」先看调用方、版本稳定性和缺失能力。早期接入能换来生态兼容，也会承担 breaking change 和兼容测试；把私有字段隔离在 adapter，能降低后续迁移成本。
 
 **源码**：[`codex/codex-rs/mcp-server/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/mcp-server/)、[`openclaw/src/acp/server.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/acp/server.ts)、[`hermes-agent/mcp_serve.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/mcp_serve.py)。
 </details>
@@ -541,7 +530,7 @@ IDE 集成有一个根本张力：
 **IDE 端约束**：
 
 - 启子进程走 stdio（VS Code Extension API、JetBrains Plugin SDK 都这么设计）
-- 进程退出时子进程必须清理（防止僵尸进程）
+- 进程退出时子进程需要清理（防止僵尸进程）
 
 **Agent 端约束**：
 
@@ -560,7 +549,7 @@ stdio-to-uds 内部连 UDS (Unix domain socket)
 agent-daemon 监听 UDS（独立长跑进程）
 ```
 
-桥本身是轻量进程（< 5MB 内存），用户关 IDE 时 stdio-to-uds 退出，但 daemon 不退出。下次开 IDE 重新启 stdio-to-uds 连接同一个 daemon → session state / cache 都还在。
+桥本身只负责转发和重连；用户关 IDE 时 stdio-to-uds 退出，但 daemon 是否继续、session state / cache 是否保留，取决于 daemon 生命周期策略。内存占用需要在目标构建上测量，源码没有给出可迁移的 `<5MB` 基准。
 
 **桥的具体职责：**
 
@@ -571,9 +560,9 @@ agent-daemon 监听 UDS（独立长跑进程）
 
 **Windows 怎么办？** UDS 在 Windows 10+ 也支持。或者用 named pipe (`\\.\pipe\agent`) 等价方案。
 
-**追问**：「不用桥，IDE 直接连 UDS 行不行？」VS Code Extension API 不支持直接连 UDS，只支持启动子进程走 stdio。所以桥是必需的。Cursor / Cline 等都受这个约束。
+**追问**：「不用桥，IDE 直接连 UDS 行不行？」取决于目标 IDE extension API 和部署方式。只有当客户端只能启动 stdio 子进程、而服务必须独立常驻时，桥才是必要层；否则可以直接使用 socket、HTTP 或 WebSocket。
 
-**Codex 是唯一显式做这件事的 agent**：`stdio-to-uds` 是独立 crate。其他三家要做 IDE 集成时也会面对同样问题，但还没单独抽出来。
+**Codex 是单一显式做这件事的 agent**：`stdio-to-uds` 是独立 crate。其他三家要做 IDE 集成时也会面对同样问题，但还没单独抽出来。
 
 **源码**：[`codex/codex-rs/stdio-to-uds/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/stdio-to-uds/)。
 </details>
@@ -601,9 +590,9 @@ agent 的 message handler 不关心消息从哪来。Telegram 用户发消息跟
 2. **认证模式跟聊天 platform 完全不同**：Telegram 用 token，HTTP 用 API key / JWT。抽象到一起会增加耦合。
 3. **协议假设漂移**：HTTP 是请求-响应，Telegram 是事件驱动。两个塞同一抽象需要 adapter 自己 bridge。
 
-**为什么 Hermes 这么做对？**
+**Hermes 的做法适合什么场景？**
 
-Hermes 定位是「ChatOps 优先」。HTTP API 跟 Webhook 只是次要入口，不需要为它们专门设计架构。复用 platform adapter 让代码量小、维护简单。如果 HTTP API 是主入口，应当反过来设计（HTTP-first，聊天 platform 是 adapter）。
+Hermes 定位是「ChatOps 优先」。在 HTTP API 与 Webhook 只是次要入口时，复用 platform adapter 可以减少额外维护面；如果 HTTP API 成为主入口，则应评估反过来的设计（HTTP-first，聊天 platform 作为 adapter）。
 
 **追问**：「自己实现这种 unified adapter 要注意？」抽象层做最小（5-6 method），让具体 adapter 决定细节。Hermes 抽象 `send_typing` 但允许 no-op，这是 escape hatch。
 
@@ -613,7 +602,7 @@ Hermes 定位是「ChatOps 优先」。HTTP API 跟 Webhook 只是次要入口�
 <details>
 <summary>**Q5 · 工程**：lazy-load sub-CLI 在 OpenClaw 怎么实现？</summary>
 
-OpenClaw 有 19 个 sub-CLI（acp / gateway / tui / channels / plugins / sandbox / ...）。如果全 import，启动时间会被拖到 1 秒以上。lazy-load 方案：
+本文固定的 OpenClaw commit 注册了 28 个 sub-CLI（acp / gateway / tui / channels / plugins / sandbox / ...）。全量 import 会扩大启动路径；这里没有提供可复现的耗时结果，因此只讨论 lazy-load 的代码结构。
 
 **实现思路：**
 
@@ -642,12 +631,9 @@ program
 2. **dynamic import `import('./...')`**：只在 user 跑这个子命令时才 load 那个文件。
 3. **每个子命令对应一个独立文件**：实现拆分，每个文件只 import 自己需要的依赖。
 
-**启动时间对比：**
+**怎样测启动收益：**
 
-- 全 import：`openclaw --help` 600ms（19 文件 + 各自依赖）
-- lazy-load：`openclaw --help` 50ms（只 import register.subclis.ts 跟 commander）
-
-**实际差距 10 倍以上**。CLI 用户体感很明显。
+在同一 commit 和 production build 下，分别开启、关闭 `OPENCLAW_DISABLE_LAZY_SUBCOMMANDS`，对 `openclaw --help` 与一个真实子命令各跑多次，报告冷启动、热启动和分位数。没有这组数据时，只能说 lazy-load 缩短了 import 路径，不能写成 10 倍提速。
 
 **坏处：**
 
@@ -658,7 +644,7 @@ program
 
 **追问**：「Python 怎么做？」`importlib.import_module(name)` 在 action 函数里。Click + lazy-loading 也支持。注意 Python 启动开销主要来自 import，所以效果更明显。
 
-**Hermes 没做 lazy-load**：因为 platform adapter 都内置，启动时全 load。但每个 adapter 有 `check_<platform>_requirements()`，只有依赖装了的 adapter 才真正 instantiate。是另一种 lazy 策略。
+**Hermes 没做 lazy-load**：因为 platform adapter 都内置，启动时全 load。但每个 adapter 有 `check_<platform>_requirements()`，只有依赖装了的 adapter 才实际 instantiate。是另一种 lazy 策略。
 
 **源码**：[`openclaw/src/cli/program/register.subclis.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/cli/program/register.subclis.ts)。
 </details>
@@ -666,9 +652,9 @@ program
 <details>
 <summary>**Q6 · 实战**：你给自己的 agent 加多通道入口，从 0 到生产怎么走？</summary>
 
-四阶段：**core CLI → MCP → IDE 集成 → 聊天平台**。
+按 **core CLI → MCP → IDE 集成 → 聊天平台** 四个 entry scope 推进；每层先用协议、生命周期和依赖 fixture 验收。
 
-**Week 1 · core CLI**
+**阶段 1 · core CLI**
 
 ```python
 # main.py
@@ -699,7 +685,11 @@ if __name__ == "__main__":
 
 参考 Codex `codex` + `codex exec` 思路。
 
-**Week 2 · MCP server**
+**验收门槛**：交互、one-shot 和 doctor fixture 都能返回结构化结果，依赖缺失时给出可行动错误。
+
+**阶段 2 · MCP server**
+
+**前置**：core CLI 的状态和退出码契约已经稳定。
 
 ```python
 # mcp_serve.py
@@ -722,7 +712,11 @@ if __name__ == "__main__":
 
 参考 Hermes `mcp_serve.py`。
 
-**Week 3 · IDE 集成（最难）**
+**验收门槛**：list/call、参数校验、版本协商和错误映射在独立 MCP client fixture 中通过。
+
+**阶段 3 · IDE 集成**
+
+**前置**：MCP protocol trace 已经可回放，且明确 stdio/daemon 的生命周期边界。
 
 走 MCP 路线：Cursor / VS Code / Cline 都已支持 MCP server。用户在 IDE 配 `mcp_servers.json`：
 
@@ -739,7 +733,11 @@ IDE 启动子进程，stdio 跟 agent 通信。所有 IDE 共用同一 protocol�
 
 不要自己写私有协议。
 
-**Week 4-5 · 聊天平台**
+**验收门槛**：IDE 关闭/重启、daemon 重连和 session 恢复可重放，协议错误不会卡住客户端。
+
+**阶段 4 · 聊天平台（按需）**
+
+**前置**：有明确的平台调用方，且 adapter 生命周期、认证和脱敏规则已定义。
 
 参考 Hermes `BasePlatformAdapter`：
 
@@ -759,12 +757,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
 `check_telegram_requirements()` 检查 `python-telegram-bot` 装没装，缺了优雅降级。
 
+**验收门槛**：每个平台的 connect、send、receive、断线恢复和依赖诊断都有 fixture，缺依赖不会误报已连接。
+
 **关键经验：**
 
-1. **第一周只做 CLI，don't gold-plate**：先让一个用户能用
-2. **第二周 MCP**：IDE 集成靠 MCP 一次完成，不要自己造协议
-3. **第三周不要做更多 channel**：先把 CLI + MCP 跑稳
-4. **第四周再加 Telegram / Discord 等**：每个 channel 是一个 PR，不要一次性全加
+  1. **先做 CLI，don't gold-plate**：先让一个用户能用
+  2. **协议入口复用 MCP**：不要自己造私有协议
+  3. **CLI + MCP 通过 fixture 后再加 channel**：先把核心路径跑稳
+  4. **按真实需求逐个加 Telegram / Discord 等**：每个 channel 是一个可回滚的变更
 
 **追问**：「daemon vs 进程模型？」第一阶段不需要 daemon，每次启动都 fresh state。需要 session 跨进程时（IDE 关了又开）才上 daemon + UDS。先简单后复杂。
 </details>
@@ -783,7 +783,7 @@ class TelegramAdapter(BasePlatformAdapter):
 **`--bare`**：
 
 - 跳过所有 "smart" 行为：plugin、LSP、hook、auto-detect IDE、telemetry
-- 但仍然可以交互，仍然有完整 tool support
+- 但仍然可以交互，仍然有较全 tool support
 - 适合：CI 环境、SDK 调用、需要可预测行为的场景
 
 **为什么需要 `--bare`？**
@@ -807,7 +807,7 @@ CI 跑 claude 时遇到的真实问题：
 
 > --bare: Skip all "automation" behavior. Useful for CI / SDK.
 
-**追问**：「这种 flag 应当默认开 vs 默认关？」默认关，明确开。理由：用户 90% 时间在 dev 环境跑 agent，应当默认享受 plugin / LSP / hook 这些便利。CI / SDK 是边缘情况，让用户显式开 `--bare`。
+**追问**：「这种 flag 应当默认开还是默认关？」交互入口默认保留 plugin、LSP 和 hook，CI / SDK 显式开启 `--bare`。这是按入口语义做的默认值，不依赖未经统计的使用时长比例。
 
 **类似的设计：**
 
@@ -858,12 +858,12 @@ export const CHANNELS: Record<string, ChannelInfo> = {
 
 **vs Hermes 方案：**
 
-Hermes 把 17 platform 全内置主仓库。好处：质量统一、breaking change OpenClaw 一处改、用户体验最简单。坏处：仓库大、第三方贡献难。
+Hermes 把 17 platform 全内置主仓库。好处是兼容性修复可以集中落地，用户也不必寻找插件；代价是主仓库和平台测试矩阵持续增长，外部贡献更难独立发布。
 
 **两种方案的适用场景：**
 
 - **OpenClaw 模式**：你期待长期有几十个 channel，且大多由生态维护
-- **Hermes 模式**：你期待 10-20 个 channel，且都由你 / 你的团队维护
+- **Hermes 模式**：你预计会维护一组固定 channel，并愿意承担适配器与兼容性测试
 
 **追问**：「能不能两条腿走？」可以。Hermes 主仓库带 17 个核心 platform，同时提供 plugin API 让第三方写额外 platform。OpenClaw 现在的 channels-plugins 实际也是「官方维护核心 + 留外部贡献空间」。这是混合模式。
 
@@ -939,19 +939,19 @@ all = ["python-telegram-bot", "discord.py", "slack-bolt", ...]
 
 用户用 `pip install hermes[telegram]` 或 `pip install hermes[all]`。主包不带平台 SDK，extras 才装。
 
-**追问**：「为什么不让用户必须装所有 SDK？」用户可能只用 Telegram，没必要被迫装 discord.py（200MB 依赖 + 完全用不到）。pip extras 让用户按需选。
+**追问**：「为什么不让用户需要装所有 SDK？」用户可能只用 Telegram，没必要被迫装未使用的平台 SDK；具体依赖体积随版本和平台变化。pip extras 让用户按需选。
 
-**类似的设计：** TensorFlow 有 `tensorflow[gpu]`、PyTorch 有 `torch[cu118]`、numpy 不强制 SciPy。这是「主包 + extras」最佳实践。
+**类似的设计：** TensorFlow、PyTorch 等项目也提供可选依赖；是否采用「主包 + extras」要看安装体验、发布矩阵和运行时探测。
 
 **源码**：[`hermes-agent/gateway/run.py:2663-2820`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/gateway/run.py#L2663-L2820) + 每个 platform 文件的 `check_xxx_requirements`。
 </details>
 
 <details>
-<summary>**Q10 · 开放**：综合四家长处，设计「通用多通道入口框架」。</summary>
+<summary>**Q10 · 开放**：按入口生命周期设计一个共享状态框架，并给出兼容性测试。</summary>
 
 5 层架构：
 
-**Layer 1 · 入口路由（必需）**
+**Layer 1 · 入口路由（需要）**
 
 ```ts
 // CLI dispatch
@@ -966,7 +966,7 @@ program
 
 参考 Claude Code commander dispatch。
 
-**Layer 2 · 协议 server 入口（必需）**
+**Layer 2 · 协议 server 入口（需要）**
 
 ```python
 # MCP server (Codex/Claude/Hermes)
@@ -982,7 +982,7 @@ acp_server = AcpServer(handler)
 acp_server.serve()
 ```
 
-参考 4 家都给公开协议入口。
+根据真实调用方选择一个已验证的协议入口；上面的 MCP 与 ACP 只是两种不同示例。
 
 **Layer 3 · 平台 adapter 抽象（可选，看场景）**
 
@@ -1023,7 +1023,7 @@ async fn bridge(stdin: Stdin, stdout: Stdout) {
 
 参考 Codex `stdio-to-uds` crate。
 
-**Layer 5 · 入口探测 / doctor（必需）**
+**Layer 5 · 入口探测 / doctor（需要）**
 
 ```python
 def doctor():
@@ -1048,24 +1048,22 @@ def doctor():
 - OpenClaw 贡献：sub-CLI lazy-load + channels-plugins catalog + ACP
 - Hermes 贡献：BasePlatformAdapter + `check_xxx_requirements` + 17 platform 实现
 
-**实现工作量：**
+**按入口 scope 评估**：
 
-- Layer 1-2：1 周（必需）
-- Layer 3：2 周（可选）
-- Layer 4：2 周（IDE 集成才需要）
-- Layer 5：3 天
-
-4-6 周 v0.1。
+- **Layer 1-2 · core CLI 与自动化入口**：先固定共享状态、退出码和诊断契约。**验收**：交互与 one-shot fixture 都能启动、返回结构化结果，并在依赖缺失时给出可行动错误。
+- **Layer 3 · 协议入口**：只有出现明确的外部调用方才加入 MCP/ACP。**前置**：核心 API 已稳定；**验收**：list/call、版本协商和错误映射在独立客户端 fixture 中通过。
+- **Layer 4 · IDE 桥接**：仅在需要双向流、重连或跨进程 session 时加入。**前置**：协议入口已有端到端 trace；**验收**：IDE 关闭/重启、daemon 重连和状态恢复可重放。
+- **Layer 5 · 聊天平台**：按真实平台需求逐个加入，而不是一次铺开。**前置**：adapter 生命周期、认证和脱敏契约明确；**验收**：每个平台的 connect、send、receive、断线恢复与依赖诊断都有 fixture。
 
 **关键决策：**
 
-1. **CLI + MCP 是 day 1**：所有 agent 都该有这两个入口
-2. **聊天 platform 不要急着做**：等用户真正要求再加
+1. **先交付一个人工入口和一个自动化入口**：MCP 只在外部工具链成为明确调用方时进入首版
+2. **聊天 platform 不要急着做**：等用户实际要求再加
 3. **不要造私有协议**：MCP / ACP 已经够好
 4. **doctor 早做**：用户排错入口
-5. **lazy-load 早做**：CLI 启动 < 100ms 是标准
+5. **lazy-load 早做**：先定义目标机器和启动 SLO，再用冷、热启动 benchmark 验证
 
-**追问**：「微服务化是不是更好？」对小项目（< 10K LoC）多 binary / 微服务都过度。Codex 的 multi-binary 不是必需的，是因为 Codex 团队 50+ 人有人单独维护 app-server。MVP 阶段 single binary + subcommand 是对的。
+**追问**：「微服务化是不是更好？」代码行数和团队规模都不能单独回答。只有当入口需要独立生命周期、权限或发布节奏时才拆进程；否则 single binary + subcommand 通常更容易起步。
 
 **源码组合**：[`codex/codex-rs/cli/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/cli/) + [`codex/codex-rs/stdio-to-uds/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/stdio-to-uds/) + `claude-code/src/main.tsx` + [`openclaw/src/cli/program/register.subclis.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/cli/program/register.subclis.ts) + [`hermes-agent/gateway/`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/gateway/)。
 </details>

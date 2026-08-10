@@ -1,34 +1,76 @@
 ---
-title: 18 · Cron 与后台任务
+title: 18 · 后台任务失败后，谁来收尾
 sidebar:
   order: 18
-description: codex cloud-tasks、Claude Code 双轨 cron（CronCreateTool 加 scheduler）、OpenClaw 完整 cron 子系统（service 加 isolated-agent 加 delivery）、Hermes croniter 加 jobs.json：四家怎么让 agent 在你不在的时候也跑。
+description: 把后台任务拆成调度、隔离、交付和失败状态，帮助你处理重启漏跑、重复触发与结果未送达。
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
-import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## 后台任务需要自己的生命周期
+## 后台任务失败后，谁来收尾？
 
-<Verdict tldr="让 agent 在用户不在的时候也能跑起来，听上去简单，但涉及好几条独立工程线。要回答的核心问题至少有四个：怎么决定 agent 应该什么时候动手（定时？延时？周期？一次？）、跑出来的结果怎么送达用户（默默落盘？主动通知？推到外部系统？）、跑这件事用谁的 session（占用用户当前对话？还是另起一个干净的环境？）、出错了怎么收尾（默默重试？退避？告警？自动停掉？）。四家系统在这几个问题上的答案分歧巨大。Codex 把这件事整个搬到了云端：本地客户端干脆不做 cron，所有需要长时间或者周期性运行的任务都推给云端的任务服务（cloud-tasks，跑在 OpenAI 后端的托管任务表，本地客户端只是轮询拉结果）去管，云端有更稳定的环境、更适合的隔离、还能并行多条思路再让用户选一个最优。Claude Code 做了一个贴近 IDE 用户的本地 cron：围绕一个简单的标准 cron 表达式（cron expression：「分 时 日 月 周」5 字段时间表达式，是 Unix cron 的事实标准）建了一整套用户能直接调用的工具，并且认真考虑了多个 IDE 窗口同时打开同一份配置时怎么避免重复触发这种现实问题（scheduler lock 跨进程互斥锁，保证同一份配置只被一个 scheduler 拥有）。OpenClaw 是教科书级的本地 cron 子系统：除了支持三种调度形态（at 指定时刻、every 固定间隔、cron 完整 cron 表达式），还为生产环境配齐了隔离执行（isolated-agent，开一个独立的 session 跑任务，不占用户当前对话）、失败退避（exponential backoff 指数退避：每次失败后等待时间翻倍）、独立告警通道（failure 走单独的 destination，避免错误信息混进用户日常 channel）、四种交付模式、几十条针对真实生产 bug 写的回归测试。Hermes 则走最克制的路线：选用业界标准的 cron 解析库（croniter，Python 生态最常见的 cron 表达式解析与下一次时间推算库）、用一份 json 文件做持久化、给单次任务加一个 2 分钟的宽限期（ONESHOT_GRACE_SECONDS=120，进程刚重启时哪怕错过了触发时间，只要不超过 2 分钟仍然补跑）来容忍重启抖动，并把 cron prompt 视为最高安全敏感度的输入做严格扫描（_CRON_THREAT_PATTERNS 一组严格的正则，外加 10 种不可见 Unicode 字符的检查，防止恶意 prompt 偷偷塞进定时任务）。结论：要做个人开发场景的 cron 参考 Claude Code，要做生产级别的 cron 参考 OpenClaw，要做安全敏感的 cron 参考 Hermes，长任务能上云就上云参考 Codex。" />
+<Verdict tldr="后台任务最难处理的不是有没有触发，而是重复触发、执行成功却交付失败，以及重启后漏掉一次性动作。本章沿调度、隔离、失败状态和交付四条路径读源码；这里没有统一 benchmark，测试向量也不等于线上事故。"/>
 
-## 四种后台任务系统
+后台任务不是把 cron 表达式塞进 while 循环。它需要一个可恢复的生命周期：何时触发、在哪里执行、结果是否送达、下一次是否还要重试。
+
+## 先写清任务的终态
+
+| 约束 | 必须记录的状态 | 失败时的动作 |
+| --- | --- | --- |
+| 重启不能漏掉提醒 | 计划时间、上次触发、宽限窗口 | 一次性任务在窗口内补跑，过期则标记错过 |
+| 任务不能污染用户会话 | session target、skills snapshot | 为后台任务开独立 session，并能自动关闭 |
+| 执行成功不代表用户收到 | run status、delivery status | 交付失败走独立告警，不重复执行已成功动作 |
+| 配置错误不能重试风暴 | schedule error 与 execution error 分开 | 配置错误停用；短暂执行错误退避 |
+
+这张表是状态契约，不是对四个产品的打分。
+
+## 只在生命周期分叉处比较
+
+### 需要长期在线环境时：Codex
+
+Codex 把长任务放进 cloud tasks，本地客户端负责查看摘要与选择 apply。这个边界避开了笔记本睡眠和网络中断；代价是代码要进入托管环境，用户必须接受远端执行。
+
+### 需要本地、可控的提醒时：Claude Code
+
+Claude Code 的 cron 任务字段很窄：表达式、prompt、是否周期、是否持久化。scheduler lock 防止多个 IDE 窗口重复触发，默认过期也让短期提醒不会无限运行。
+
+### 需要区分执行与交付时：OpenClaw
+
+OpenClaw 将 `lastRunStatus` 与 `lastDeliveryStatus` 分开，并分别记录连续执行错误和调度错误。独立 session、确定性 stagger 和 failure destination 都围绕这两个终态服务。
+
+### 需要把持久化输入先拦住时：Hermes
+
+Hermes 用 croniter 与 jobs.json 保持实现小巧；一次性任务有 `ONESHOT_GRACE_SECONDS=120`。写入 cron 的 prompt 会过威胁模式和不可见 Unicode 扫描。源码观察不等于攻击拦截率。
+
+## 一个可取消的最小任务
+
+先保存不可逆动作之前的状态，再执行：
+
+```text
+created -> due -> running -> executed -> delivered
+                         \-> failed -> retrying | disabled
+```
+
+每次状态转移写入任务 id、attempt、时间和错误类别。若运行中进程退出，恢复器应能判断工具是否已经产生副作用，而不是盲目重跑。
+
+落地前检查：
+
+- `at`、`every`、`cron` 是否使用不同的时间语义？
+- 主 session 与 isolated session 的权限、日志和关闭路径是否分开？
+- run 成功但 webhook 失败时，用户会收到什么？
+- cron prompt 的测试向量和线上 incident 是否明确区分？
+
+## 源码底稿：按实现展开
 
 <details>
-<summary>读前提示（按需展开）</summary>
-
-- **四个核心问题**：什么时候触发、结果怎么送达、用谁的 session 跑、出错怎么收尾，必须分别回答。
-- **执行位置分歧最大**：Codex 本地干脆不做 cron，全推给云端 cloud-tasks；OpenClaw 在本地配齐 isolated-agent、exponential backoff、独立 failure destination。
-- **宽限期决定重启容忍度**：Hermes 用 ONESHOT_GRACE_SECONDS=120 补跑错过不超 2 分钟的单次任务，扛住进程重启抖动。
-- **最大的坑**：cron prompt 是最高安全敏感度输入，Hermes 用 _CRON_THREAT_PATTERNS 正则加 10 种不可见 Unicode 检查严格扫描。
-
-</details>
+<summary>源码底稿：按实现展开</summary>
 
 <Diagram
   src="/diagrams/18-cron-background-base.svg"
@@ -38,38 +80,25 @@ import SourceBlock from '@components/SourceBlock.astro';
 
 四家在调度、隔离、交付、失败处理上的差异：
 
-<CompareTable
-  rows={[
-    { label: '调度模型', values: ['cloud-tasks 走远端 task 表（无本地 cron）', 'CronTask.cron 5 字段表达式加本地 timezone', 'CronSchedule 3 种：at、every、cron 加 tz 加 staggerMs', 'croniter（标准 cron）加 ONESHOT_GRACE_SECONDS=120'] },
-    { label: '触发循环', values: ['cloud backend 推送（codex 客户端轮询 TaskSummary 列表）', '1s tick 加 chokidar 文件监听加 scheduler lock 跨进程互斥', '每 job 独立 timer 加 arm、rearm（防 tight loop）加 stagger 防雪崩', 'scheduler.py 内嵌 asyncio 循环'] },
-    { label: '执行隔离', values: ['cloud env、sandbox（环境配置走 EnvironmentRow）', 'inline、teammate、assistant mode（permanent 留 morning-checkin、dream）', 'main session 或 isolated-agent（独立 session 加 skills-snapshot 冻结加 subagent-followup）', '默认在 main session。可走 isolated session 标记'] },
-    { label: '失败处理', values: ['cloud backend 自管 retry', '`removeCronTasks` 加 `recurringMaxAgeMs` 自动过期（默认配置）', 'consecutiveErrors backoff 加 scheduleErrorCount 自动 disable 加 failureAlert 走独立 destination 加 cooldownMs', '日志加错误状态加用户手动 retry'] },
-    { label: '交付', values: ['cloud-tasks UI 拉结果', 'fire 时调 `onFire(prompt)` 注入到当前 session queue', '`CronDelivery` 4 模式（none、announce、webhook）加 accountId 加 bestEffort', '输出落 `~/.hermes/cron/output/{job_id}/{ts}.md` 加选配走 platform adapter'] },
-    { label: '安全', values: ['cloud 端处理', '依赖 `allowed-tools` 收敛', '靠 sandbox 加 ExecHost 收敛', '`_CRON_THREAT_PATTERNS` 10 条 critical 加 10 个 invisible unicode 扫描 prompt'] },
-  ]}
-  caption="后台任务 等于 调度模型 乘 执行隔离 乘 失败处理 乘 交付路径"
-  dimensionLabel="维度"
-/>
-
 ## 四套系统怎样调度 Cron 与后台工作
 
 ### Codex · 把后台跑的活整个搬上云
 
-Codex 处理后台任务的方式可以一句话概括：**本地客户端永远是用户主动驱动的开发工具，凡是需要离开用户视线长时间运行的任务，都让云端去跑**。这背后的取舍很实际：用户的笔记本会关机、会断网、会进睡眠，把一个需要「在用户不在的时候稳定地、周期性地、几十分钟地跑」的任务放在这种环境里，本身就是个不可靠的选择。
+Codex 的源码把长任务放进 cloud tasks；本地客户端读取摘要，并让用户选择要 apply 的结果。这个部署选择把持续运行交给托管环境，也把网络、凭证、配额和远端数据边界带进系统。是否适合，取决于任务能否接受远端执行。
 
-云端环境则相反：它一直在线，有更可控的资源配额，本来就有一整套现成的调度基础设施（Kubernetes 的 CronJob、各家云的事件总线），没必要在客户端这一层重复造轮子。
+托管环境可以提供持久进程和调度基础设施，但可用性仍取决于具体部署、服务依赖和配额；源码结构本身不等于 SLA，也不能推出它在所有时候都在线。
 
-因此 Codex 给云端任务搭了一个独立的子模块，本地客户端这边只起一个「窗口」的作用：让你看到当前账号下有哪些云端任务、它们处于什么状态、跑完之后的结果是什么。任务列表的数据来源始终是云端这份，客户端只是缓存了一份摘要用来显示。每个任务还会绑定一个「环境」：可以理解成一份配置好的运行容器，里面已经预装了工具、注入了凭证、克隆了对应仓库。任务每次启动都在同样的环境里跑，避免因为环境漂移而产生奇怪的行为。
+源码还展示了任务环境绑定和多分支 apply 的数据模型。并行分支是否启动、能开多少个、费用如何，都由 runner 容量、模型选择和配额决定；这里不能把云端说成总是便宜，也不能把本地说成做不到。
 
-这个云端架构里有一项设计值得记住，那就是**让同一份任务并行跑出多个版本，再让用户选最满意的那个 apply**。比如同一个「修这个 bug」的任务，云端可以同时用不同的 prompt、不同的模型、不同的策略跑出几条独立分支，全部跑完之后用户在客户端里逐条看 diff，选最对的那条应用到本地仓库。这种「先发散再收敛」的做法在本地几乎不可行：本地没有那么多算力同时跑几条任务，而云端的资源是按需弹性的，做这件事的成本反而很低。
+`BestOfModalState` 支持同一任务的多分支结果由用户挑选。实际并行度和成本需要结合 runner、模型、任务时长与配额测量，不能从这个状态结构推导出“先发散再收敛”在本地不可行。
 
 客户端则配合做了对应的体验：apply 不是简单的「成功、失败」两态，而是分成完全成功、部分成功（有些路径冲突）、彻底失败三档，部分成功时会把跳过的路径和冲突路径列出来让用户决定下一步怎么处理。
 
-代价是显然的：如果用户的网络断开或者云端服务挂了，整个后台任务体系就停了。这种产品形态也假定了所有用户都接受「我的代码任务会在某种远端环境里跑」这个前提。Codex 选这条路是因为它的产品定位本身就是「开发助手加云端协作」，这套架构跟它的整体定位是匹配的。
+这条路径的代价也很具体：网络或云端服务故障会影响任务；如果产品要求离线运行，或敏感代码不能离开本机，就需要另一种部署。
 
 ### Claude Code · 把 cron 做成 IDE 里的一等工具
 
-Claude Code 走完全相反的方向：它把整套 cron 能力做在本地，让用户在 IDE 里就能像调用任何普通工具那样创建、查看、删除定时任务。它的判断是：IDE 用户开机就开着 IDE，本地 cron 完全够用，而且响应远比「跨网络调用云端」快得多。
+Claude Code 把 cron 放在本地 IDE 进程里；只要负责调度的进程和机器保持运行，这种方案不需要远端任务服务。机器睡眠、IDE 退出和本地权限会直接影响触发；源码没有给出与云端方案的性能对照。
 
 它把「一个定时任务到底由什么组成」这件事抽得很清楚：围绕一份只有少数几个核心字段的数据结构展开：任务标识、cron 表达式、触发时要执行的 prompt、创建时间和上次触发时间（用来在进程重启之后还能正确计算下一次该什么时候跑）、是周期重复还是单次触发、是不是要落盘持久化（默认只活在当前 session 内、关闭即丢）、以及一个特殊的「永久标记」：只有 IDE 内置的几个特殊任务（比如每天早上的简报、夜间整理）才允许打这个标记，绕过常规的「超过 30 天自动过期」规则。
 
@@ -144,17 +173,17 @@ const inputSchema = lazySchema(() =>
 
 </SourceBlock>
 
-真正让这套设计在 IDE 场景下能跑得稳的是背后的调度器。它每秒检查一次有没有任务该触发，但还做了几件特别细致的事来应对真实使用中的边缘情况。第一件是**等文件写完再读**：当用户的配置文件刚被另一个进程改写时，简单的 read 可能会读到一半，所以调度器在读之前先要求文件至少有 300 毫秒没被再写过，这才是一个「稳定」的状态。
+背后的调度器处理了 IDE 多进程场景中的几类边缘情况。当前源码每秒检查一次任务，并在读取配置前等待 300 毫秒的无写入窗口。这里的 1 秒和 300 毫秒是实现常量，不是经过本站测量的通用最优值；目标是减少半写入读取和触发延迟之间的冲突。
 
 第二件是**多窗口互斥**：IDE 用户经常同时开好几个窗口，每个窗口都有一份独立的调度器进程，如果没有任何协调机制，同一个任务就会被每个窗口分别触发一次。它的解法是用一个本地文件做跨进程的锁：只有持有锁的那个窗口真正去触发任务，其他窗口降级成「观察者」，每隔几秒探测一次锁还活不活：如果发现持锁者已经下线（比如进程崩了），就有一个观察者接手成为新的持锁者。
 
 第三件是**默认让周期任务在一个月后自动过期**：避免一份 `*/5 * * * *` 的任务跑了半年都没人维护、悄悄地消耗着每一次的触发成本。如果某个内置功能需要「永远跑」（比如每天早上的 IDE 早报），就让它显式地打上「永久」标记跳过过期。第四件是**默认不落盘**：大多数用户敲下的 cron 任务只是「今天提醒我一下」这种短期需求，没必要污染长期持久化的配置。要让一个任务跨 session 存活下来，必须显式地说「我要把它保存下来」。
 
-### OpenClaw · 教科书级的本地 cron 子系统
+### OpenClaw · 本地 cron 的分层实现
 
-如果说前两家是在选择"本地还是云端"这个二元问题，OpenClaw 则是在认真回答"如果我决定在本地做 cron，那它的完整形态应该是什么样"。它的实现里光 cron 子模块就有上百个文件，几乎覆盖了你能想到的每一个生产边界。
+如果说前两家是在选择"本地还是云端"，OpenClaw 则是在回答"本地 cron 需要哪些状态和运维边界"。它的实现里 cron 子模块文件很多，源码展示了调度、隔离、交付和失败处理的多个面；文件数量或列举的模块不能证明覆盖了所有生产边界。
 
-首先是**调度形态本身就有三种**。最常见的当然是 cron 表达式风格的周期任务，但还有两种值得单独处理的情况：一种是"指定一个时刻只跑一次"（比如下周三早上 9 点跑一次），另一种是"每隔固定的毫秒数就跑一次"（比如每 30 秒检查一次某个状态）。这三种调度形态在内部用一个带标签的联合类型区分开来，每种形态都有自己专属的"下次什么时候跑"的计算逻辑，避免把所有情况硬塞进同一个 cron 表达式而失去表达力。
+源码把调度显式分成**三种形态**：cron 表达式风格的周期任务、"指定一个时刻只跑一次"（比如下周三早上 9 点跑一次），以及"每隔固定的毫秒数就跑一次"（比如每 30 秒检查一次某个状态）。内部用带标签的联合类型区分它们，每种形态都有自己的 next-fire 计算逻辑，避免把不同意图硬塞进同一个 cron 表达式。
 
 <SourceBlock path="REF/openclaw/src/cron/types.ts" lines="4-67" system="openclaw" summary="一个 cron 任务的三种调度形态被显式区分：指定时刻、固定间隔、cron 表达式；并且为每种形态保留专属的字段。">
 
@@ -198,7 +227,7 @@ export type CronFailureAlert = {
 
 </SourceBlock>
 
-配合调度形态的还有几个实用的修饰参数：**时区**：尤其重要，团队跨时区时同样的「每天早 9 点」在不同地区意味着不同的时刻。**抖动窗口**：这一项是个很巧的工程细节，下文还会回来谈。**触发后的执行环境**：可以选择就在当前主 session 里跑，也可以选择启动一个独立的隔离 session 来跑。**唤醒时机**：是等到下一次心跳才统一处理，还是发现到点就立即去跑。
+配合调度形态的还有几个修饰参数：**时区**：团队跨时区时同样的「每天早 9 点」在不同地区意味着不同的时刻。**抖动窗口**：源码提供的确定性偏移，下面会展开。**触发后的执行环境**：可以选择就在当前主 session 里跑，也可以选择启动一个独立的隔离 session 来跑。**唤醒时机**：是等到下一次心跳才统一处理，还是发现到点就立即去跑。
 
 接下来是**任务运行状态的持久化设计**。OpenClaw 把「一个任务的状态」刻画得很细：下次该跑的时间、上次跑的时间、上次跑成功还是失败、连续失败次数、上次执行结果有没有送达用户、送达的最终状态是什么。
 
@@ -238,7 +267,7 @@ export type CronJob = CronJobBase<
 
 这套状态分得这么细，是因为它要回答几个不同的问题。「任务执行成功了吗」和「任务结果送达用户了吗」在生产中是**两件完全不同的事**：一个任务可能跑得很顺利、产出了正确的结果，但配置在它上面的 webhook 此刻挂了，结果送不出去；反过来，任务本身崩了，也根本谈不上送达。如果把这两件事合并成一个「成功、失败」标志，就会发生「明明任务挂了用户却没收到告警」或者「任务一切正常但用户被反复告警」这种荒谬情形。OpenClaw 用两条独立的状态轨道追踪它们，对应的告警通道也是独立的。
 
-类似地，**连续失败次数**和**调度配置错误次数**也被分成两个计数。如果一份任务的 cron 表达式本身写错了，那是配置问题，应该尽快停掉避免无效触发；如果是任务执行出错（网络抖动、外部 API 偶发挂掉），那应该用指数退避的方式继续尝试，并且在错误累积到一定次数后才告警。两件事的容忍阈值天然不同，混在一起会让「配置错误本应立即停」和「执行错误应当宽容地重试」互相干扰。
+类似地，**连续失败次数**和**调度配置错误次数**也被分成两个计数。如果一份任务的 cron 表达式本身写错了，可以把它作为配置错误尽快停掉，避免无效触发；如果是任务执行出错（网络抖动、外部 API 偶发挂掉），一种可用策略是指数退避并重试，再按错误频率设置告警阈值。两件事的容忍阈值不同，混在一起会让「配置错误本应立即停」和「执行错误可以重试」互相干扰。
 
 前面提到的**抖动窗口**也是这种"看上去小但能救命"的工程细节。想象一下一千个用户都把任务配成"每天早上 9 点"，如果调度器死板地按 9:00:00 触发，那一刻整套系统会同时向模型 API 打过去一千次请求，这要么撑爆 API 配额，要么因为外部限流导致绝大多数任务集体失败。抖动窗口的做法是给每个任务在原定时刻基础上加上一段确定性的、最长不超过几十秒的偏移，让这一千个任务自然散布在 9:00 到 9:05 之间，外部 API 的瞬时压力一下子被分摊掉。
 
@@ -246,21 +275,21 @@ export type CronJob = CronJobBase<
 
 接下来是**为什么 cron 任务最好不要直接跑在用户的主 session 里**。如果 cron 触发时往主 session 的消息队列里塞东西，用户回来打开 IDE 会看到一堆"莫名其妙"的对话历史，prompt 的前缀缓存也会因为这些注入失效，更糟的是任务跑工具调用的过程跟用户正在交互可能产生并发冲突。OpenClaw 的解法是**为每个 cron 任务启动一个完全独立的 session**：不继承主 session 的对话历史、有独立的工作目录、跑完会自动关闭。
 
-跟独立 session 配套的还有一个重要的设计：**skills 快照锁定**。一个任务被创建出来的时候，它依赖的工具集合（也就是 skills 配置）是当时那一刻的样子。一段时间之后用户可能改了 skills（删掉了某个、新增了某个、调整了行为），但 cron 任务每次触发时使用的，仍然是它创建时被冻结下来的那一份配置。这一点保证了行为的可预测性：你今天配的「每天跑某检查」明天不会因为你今晚改了某个 skill 就突然行为漂移。
+跟独立 session 配套的还有一个重要设计：**skills 快照锁定**。任务创建时记录依赖的工具集合，后续触发继续使用这份快照。它能减少 skill 配置变化造成的一类漂移，但不能冻结外部 API、权限、模型或 runner，因此不能据此保证行为完全可复现。
 
 OpenClaw 在测试上也花了功夫：它为这个 cron 子系统写了几十个测试文件，其中相当一部分命名直接就是过往真实 bug 的编号（「issue-22895-每隔多久才算到下一次」这种）。这种做法把测试当成了生产 bug 的活化石：每修一个生产线上发现的边界 case，就留一条以 issue 编号命名的回归测试盯着它，避免未来重现。
 
-### Hermes · 用最克制的方案完成 cron 的全部职责
+### Hermes · 用一套小型方案处理 cron
 
-Hermes 选择不重新发明轮子：它直接采用业界标准的 cron 解析库来处理调度表达式，把所有任务存在一个简单的 json 文件里，每次执行的结果落到本地一个按任务、时间组织的目录里。整体结构很紧凑，但每一处选择都有自己明确的理由。
+Hermes 使用一个 cron 解析库处理调度表达式，把所有任务存在一个简单的 json 文件里，每次执行的结果落到本地一个按任务、时间组织的目录里。这里描述的是当前实现，不构成通用标准建议。
 
 任务的存储路径和权限都被显式收紧：存放配置的目录权限是 700（只有所有者能进），任务文件权限是 600（只有所有者能读写）。这种 Unix 风格的目录权限本身就是一道防御，避免同一台机器上的其他用户读到 cron 配置，更避免他们偷偷写入新的 cron 任务。
 
-一个特别值得记住的设计是**给单次任务的 2 分钟宽限期**。想象一下用户说"今天 10 点提醒我一下"，但 agent 进程恰好在 9:59:55 重启了，重启需要五秒钟，按严格的"过了点就不再触发"逻辑，这个任务就永远不会响。Hermes 的做法是当 agent 重新启动后，检查"现在距离原定触发时刻是不是还在 2 分钟之内"，如果是，就立即补跑一次。
+源码还为单次任务提供**2 分钟宽限期**。想象一下用户说"今天 10 点提醒我一下"，但 agent 进程恰好在 9:59:55 重启了，重启需要五秒钟，按严格的"过了点就不再触发"逻辑，这个任务就永远不会响。Hermes 的做法是当 agent 重新启动后，检查"现在距离原定触发时刻是不是还在 2 分钟之内"，如果是，就立即补跑一次。
 
 两分钟这个值是经验取舍：太短覆盖不了正常的重启窗口，太长就违背了用户的"在 10 点"的初衷（11 点再补跑一次"提醒开会"就完全没意义了）。周期任务因为反正下一次还会触发，所以不需要这种宽限。
 
-但 Hermes 在 cron 上做得最重的事不在调度本身，而在**安全扫描**。它很清楚一件事：cron 任务的 prompt 是一段「在用户不在的时候、用 agent 的全部权限去执行」的指令：这等价于一份高权限的入口，必须用对待「系统级输入」的标准来审。
+Hermes 在 cron 上的主要额外边界不在调度本身，而在**安全扫描**。cron 任务可能在用户不在时运行，并继承实际配置授予的工具与权限；因此应按这条 authority 边界来审，而不是把它当普通聊天文本。
 
 <SourceBlock path="REF/hermes-agent/tools/cronjob_tools.py" lines="41-68" system="hermes" summary="任何即将写入 cron 配置的 prompt，都要先过一遍专门为 cron 场景设计的威胁特征库；任何不可见 Unicode 字符也会被直接拦下。">
 
@@ -300,24 +329,24 @@ def _scan_cron_prompt(prompt: str) -> str:
 
 除了正则特征，还专门列了一组不可见 Unicode 字符（零宽空格、零宽连接、双向覆盖等），这些字符肉眼根本看不见，但会进入模型的输入流，被攻击者用来绕过基于关键词的扫描或者反转字符显示顺序。任何一条命中，整次写入直接拒绝。
 
-除了 prompt 扫描之外，Hermes 还做了几件让 cron 长期可维护的小事。它会把每个任务的「触发来源」显式记到任务自身上：是哪个聊天平台、哪个频道、哪个会话触发的，这样将来这个任务跑出结果时，系统就知道该把结果送回到哪一条原始对话里去，而不是默默落盘谁也不知道。它还在数据格式上对老版本任务做了兼容：早期版本里「用的 skill」是一个单字段，新版本变成了数组，于是读取时统一规范化一遍，避免一次格式演进就让所有老任务挂掉。
+除了 prompt 扫描之外，Hermes 还做了几件让 cron 长期可维护的小事。它会把每个任务的「触发来源」显式记到任务自身上：是哪个聊天平台、哪个频道、哪个会话触发的，这样将来这个任务跑出结果时，系统就知道该把结果送回到哪一条原始对话里去，而不是默默落盘谁也不知道。它还在数据格式上对老版本任务做了兼容：早期版本里「用的 skill」是一个单字段，新版本变成了数组，于是读取时统一规范化一遍，避免格式演进让旧任务批量失效。
 
-这种细节看起来不起眼，但在生产里跑过半年的系统里很值钱。
+这种细节的价值需要结合运行时数据验证；源码本身只能说明它们针对哪些维护问题。
 
 ## 本地能力与云端能力
 
 <Diagram
   src="/diagrams/18-tradeoff.svg"
   alt="四家 cron 系统在本地能力和云端能力两个维度上的位置"
-  caption="OpenClaw 本地最完整；Codex 全押云；Claude Code 跟 Hermes 在本地中间路线。"
+  caption="四个实现分别把重心放在本地调度、IDE 生命周期、受限文件存储和托管任务上；坐标表示实现侧重，不是完整度排名。"
 />
 
 四家的策略：
 
-- **OpenClaw 在左上**：本地教科书级 cron 子系统 + delivery + failure-alert，断网也能跑。
-- **Claude Code 在中上偏左**：1s tick + chokidar + scheduler lock 跨进程互斥，IDE 风格。
-- **Hermes 在中部**：croniter + jobs.json + 10 条威胁扫描，工程克制。
-- **Codex 在右下**：本地无 cron，长任务全推 cloud-tasks，bestOf 并行选最优。
+- **OpenClaw 在左上**：本地调度 + delivery + failure-alert；调度可留在本机，任务本身是否依赖网络要另看。
+- **Claude Code 在中上偏左**：源码中的 1 秒 tick + chokidar + scheduler lock，面向 IDE 生命周期。
+- **Hermes 在中部**：croniter + jobs.json + 当前源码列出的 10 条威胁模式，扫描范围受规则集限制。
+- **Codex 在右下**：所审阅客户端把这类工作交给 cloud-tasks，并展示 bestOf 分支的 apply 结果。
 
 并列起来看四种 cron 子系统：
 
@@ -331,7 +360,7 @@ def _scan_cron_prompt(prompt: str) -> str:
 
 ### 误区 1：让周期任务默认一直跑下去
 
-把「周期任务」当成「一旦创建就永远跑」是一种常见的设计偷懒。一份 `*/5 * * * *` 看上去人畜无害，但半年之后没人再记得它存在，每次触发都在悄悄消耗成本。更稳的做法是默认给周期任务设一个最长存活时间（比如 30 天），过了这个时间自动让它过期：如果用户希望某个任务长期存在，让他显式表态「我要把它标记为永久任务」，这是一种「主动续约比被动消亡更安全」的设计。
+让周期任务无限运行会留下无人维护的成本和权限。Claude Code 当前源码使用 30 天默认过期，这是一个实现配置，不是通用期限。自己的系统应根据任务风险、触发成本和续约流程选择 TTL；需要长期运行时再要求显式续约或永久标记。
 
 同时，对那种已经连续失败多次的坏任务，应该自动停掉而不是让它继续白白触发：把这两件事合起来，整个 cron 子系统才不会变成一个「只增不减」的垃圾收集场。
 
@@ -341,53 +370,31 @@ def _scan_cron_prompt(prompt: str) -> str:
 
 ### 误区 3：把 cron 任务直接塞进用户当前的主 session
 
-如果 cron 触发时把 prompt 直接 enqueue 进用户的主 session，会产生一系列让人头疼的副作用：用户回来打开 IDE 发现对话历史里多了一堆莫名其妙的消息、prompt 的前缀缓存被这些注入打乱、任务执行过程中跑工具调用可能跟用户正在做的事互相冲突。更稳健的做法是给 cron 任务启动一个完全独立的 session，跟主 session 完全隔离，跑完之后才把"任务跑完了、结果是 xxx"作为一条独立的通知回到主对话。
+如果 cron 触发时把 prompt 直接 enqueue 进用户的主 session，会产生一系列让人头疼的副作用：用户回来打开 IDE 发现对话历史里多了一堆莫名其妙的消息、prompt 的前缀缓存被这些注入打乱、任务执行过程中跑工具调用可能跟用户正在做的事互相冲突。更稳健的做法是给 cron 任务启动一个独立 session，并由 runner 明确 close、日志和通知路径；是否与主 session 完全隔离，取决于具体实现。
 
-OpenClaw 还在此基础上多做了一步：把任务依赖的 skills 也一并冻结到任务创建时刻，这样后续即使用户改了 skills 配置，cron 任务的行为也不会突然漂移。
+OpenClaw 还在此基础上多做了一步：把任务依赖的 skills 也一并冻结到任务创建时刻。这能减少 skills 配置变化带来的行为漂移；外部状态、runner 和权限变化仍需单独控制。
 
 ### 误区 4：相信用户输入的 cron prompt
 
-cron 任务的 prompt 是"在用户不在的时候、用 agent 的全部权限去执行"的指令，它的安全敏感度等价于一份系统级输入，不应该被当成普通的用户文本处理。任何写入到 cron 配置里的 prompt 都应该先过一遍威胁特征扫描，覆盖经典的提示注入模板、读取已知凭证文件的命令、外发密钥的脚本片段、植入 SSH 后门或修改 sudoers 的关键字、以及毁灭式的 `rm -rf /` 类命令。
+cron 任务可能在用户不在场时执行，并继承配置给它的工具与权限；因此它的 prompt 风险边界不应低于系统级输入。写入 cron 配置前，应按实际工具权限扫描提示注入、凭证读取、密钥外发、SSH 后门和危险命令等模式。
 
-除了正则模式，还要专门扫一遍不可见 Unicode 字符，这些字符肉眼看不见但会进入模型输入流，是绕过基于关键词的扫描的常见手段。这一步不能省。
+如果 cron prompt 会进入高权限执行路径，还应检查不可见 Unicode 字符。这能覆盖一类关键词绕过，但仍需与运行时权限、审批和审计配合，不能把规则命中率当成安全覆盖率。
 
-## 我的判断：调度成功不等于交付成功
-
-<ScoreCard
-  systems={[
-    {
-      name: 'Codex',
-      scores: { '本地 cron': 1, '云任务': 5, '隔离': 4, '失败处理': 3, '交付': 3 },
-    },
-    {
-      name: 'Claude Code',
-      scores: { '本地 cron': 5, '云任务': 1, '隔离': 4, '失败处理': 3, '交付': 3 },
-    },
-    {
-      name: 'OpenClaw',
-      scores: { '本地 cron': 5, '云任务': 2, '隔离': 5, '失败处理': 5, '交付': 5 },
-    },
-    {
-      name: 'Hermes',
-      scores: { '本地 cron': 4, '云任务': 1, '隔离': 3, '失败处理': 3, '交付': 4 },
-    },
-  ]}
-  caption="5 维评分（1=最弱，5=最强）。"
-/>
+## 收尾责任要分成执行与交付
 
 ## 从一个可取消任务开始
 
 <BuildRecipe
   steps={[
     { title: '1. 选调度模型', detail: '只需要 cron 表达式：croniter 或 cron-parser 直接完成。需要 at / every / cron 三种：参考 OpenClaw 的 CronSchedule discriminated union。' },
-    { title: '2. 加 recurring vs one-shot 区分', detail: 'one-shot 跑完即删（Claude Code 的 fire-then-delete），recurring 跑完算 next-fire 重新排。one-shot 加 grace seconds（Hermes 120s）兜底错过的触发。' },
+    { title: '2. 加 recurring vs one-shot 区分', detail: 'one-shot 跑完即删（Claude Code 的 fire-then-delete），recurring 跑完算 next-fire 重新排。Hermes 当前配置用 120 秒 grace window；自己的窗口要按启动耗时与误触发代价测量。' },
     { title: '3. 加 durable 选项', detail: '默认 session-only 不落盘；显式 durable=true 才进 .claude/scheduled_tasks.json 或 ~/.hermes/cron/jobs.json。避免 session 内的临时提醒污染长期存储。' },
-    { title: '4. 加 scheduler lock', detail: '多 session 同时跑同一份 cron 文件，必须有跨进程互斥（Claude Code 的 scheduler lock），否则 fire 会重复。' },
-    { title: '5. 加 isolated-agent 选项', detail: '生产场景下，cron 应该跑在独立 session（OpenClaw 的 isolated-agent + skills-snapshot），避免污染用户正在用的 session。' },
+    { title: '4. 加 scheduler lock', detail: '多进程可能同时拥有同一份 cron 文件时，需要互斥或单 owner 机制；Claude Code 使用 scheduler lock。单进程部署不必照搬同一种锁。' },
+    { title: '5. 加 isolated-agent 选项', detail: '任务可能与用户会话争用工具、权限或上下文时，考虑 OpenClaw 的 isolated-agent + skills-snapshot；轻量提醒可以保留在主 session。' },
     { title: '6. 分离 execution / delivery status', detail: 'OpenClaw 的 lastRunStatus + lastDeliveryStatus 两个字段。webhook 失败不能掩盖 job 失败，job 失败也不能假装交付完成。' },
     { title: '7. 加失败 backoff + 告警', detail: 'consecutiveErrors 做指数退避，scheduleErrorCount 超阈值自动 disable，failureAlert 走独立 cooldownMs 防告警风暴。' },
-    { title: '8. 加 prompt 扫描', detail: 'cron prompt 是在用户不在场时执行的 system 等级指令。Hermes 的 _CRON_THREAT_PATTERNS 10 条是底线。' },
-    { title: '9. 加 staggerMs', detail: '所有 `0 9 * * *` 任务同一时刻触发会打爆模型 API。OpenClaw 的 deterministic stagger 给每 job 加随机 0~staggerMs 偏移。' },
+    { title: '8. 加 prompt 扫描', detail: 'cron prompt 可能在用户不在场时触发高权限工具。Hermes 当前的 10 条 _CRON_THREAT_PATTERNS 可作为已知模式起点，不代表完整覆盖。' },
+    { title: '9. 加 staggerMs', detail: '大量 `0 9 * * *` 任务同一时刻触发可能形成 API 峰值。OpenClaw 的 deterministic stagger 给每 job 加可复现的偏移，把请求分散到一个窗口。' },
   ]}
 />
 
@@ -403,7 +410,7 @@ cron 任务的 prompt 是"在用户不在的时候、用 agent 的全部权限�
 6. **隔离要求多高？**：高 → isolated-agent + skills-snapshot；低 → main session 直接跑。
 7. **prompt 来源可信吗？**：来自用户 / 模型自己写 → 强制扫描；来自系统配置 → 信任。
 
-如果 5 个以上 yes，整 cron 子系统参考 OpenClaw；2-3 个 yes 参考 Claude Code；不到 2 个就写个 setTimeout 就够了。
+不要按 yes 数量直接选产品。离线运行、多进程互斥、跨会话持久化、隔离执行和独立交付分别引入不同状态；只实现任务实际需要的分支，再用重启、重复触发和交付失败测试验证。
 
 ## 沿着 Scheduler 读源码
 
@@ -423,6 +430,8 @@ cron 任务的 prompt 是"在用户不在的时候、用 agent 的全部权限�
     { label: 'Hermes · cron jobs storage', path: 'REF/hermes-agent/cron/jobs.py', system: 'hermes', lines: '30-80' },
   ]}
 />
+
+</details>
 
 ## 接着读什么
 
@@ -449,9 +458,9 @@ cron 任务的 prompt 是"在用户不在的时候、用 agent 的全部权限�
 
 **重叠和区别**：
 
-- Cron job 必然是 background（不阻塞）
+- Cron job 只描述调度时间表；runner 可以在前台或后台执行，是否阻塞由执行器决定
 - Background task 不一定是 cron（可以是用户触发后挂起的）
-- Long-running task 不一定是 background（可以是「用户等」的长前台任务）
+- Long-running task 也不一定是 background（可以是用户等待的长前台任务）
 
 **例子**:
 
@@ -566,13 +575,13 @@ pub struct TaskSummary {
 
 **bestOf 多分支**:
 
-`BestOfModalState` 让一个任务并行跑 N 个分支（不同 prompt / 不同 model），UI 里选最优结果 apply。本地永远做不到这种并行（资源不够）。
+`BestOfModalState` 让一个任务表达 N 个分支（不同 prompt / 不同 model），UI 里选结果 apply。实际并行需要 runner 资源和配额；同一模式也可以部署在本地，前提是机器能够承受它。
 
 **对比 Claude Code / OpenClaw 的取舍**:
 
-- Claude Code 服务的是「IDE 用户」，IDE 一直开着，本地 cron 用得上
-- OpenClaw 服务的是「自托管 agent」，必须本地能跑（不一定有 cloud）
-- Codex 服务的是「Codex 产品用户」，cloud 当然可用
+- Claude Code：本地调度依赖 IDE 或其他 scheduler 进程持续运行
+- OpenClaw：自托管部署可以把任务留在本地，也可以接入部署者提供的其他运行环境
+- Codex：任务状态与执行环境由 cloud tasks 管理
 
 每个产品的「典型部署环境」不一样，cron 策略也不一样。
 
@@ -675,7 +684,7 @@ def should_fire_now(job):
 - 太长（1h）: 错过 1 小时再补跑可能不是用户想要的（"提醒我 10 点开会" 11 点补跑没意义）
 - 120s = 2 分钟: 覆盖 agent 重启时间，又不过于宽松
 
-**实际工程值得记忆**:
+**宽限窗口的工程含义**:
 
 类似的「grace period」概念在很多调度系统：
 - AWS EventBridge: 默认 1 分钟
@@ -698,9 +707,9 @@ def should_fire_now(job):
 <details>
 <summary>**Q6 · 实战**：给你的 agent 加 cron 系统，从 0 到 1 的路线图？</summary>
 
-5 阶段：
+下面的八步只是实现拆分，不是工期承诺；具体耗时取决于现有调度器、存储、权限系统和测试设施。
 
-**Week 1 · MVP**
+**Step 1 · MVP**
 
 ```python
 import schedule
@@ -717,7 +726,7 @@ def cron_runner():
 
 参考 `python-schedule` 库，先跑通。
 
-**Week 2 · 持久化**
+**Step 2 · 持久化**
 
 ```python
 @dataclass
@@ -734,7 +743,7 @@ def save_jobs(jobs: list[CronJob]):
 
 参考 Hermes `jobs.json` + `~/.youragent/cron/` 目录布局。
 
-**Week 3 · 调度器 + 隔离**
+**Step 3 · 调度器 + 隔离**
 
 ```python
 import croniter
@@ -755,7 +764,7 @@ class Scheduler:
 
 参考 OpenClaw 1s tick 模型 + croniter 标准 cron 语法。
 
-**Week 4 · 失败处理 + 告警**
+**Step 4 · 失败处理 + 告警**
 
 ```python
 async def fire_with_retry(job: CronJob):
@@ -773,7 +782,7 @@ async def fire_with_retry(job: CronJob):
 
 参考 OpenClaw `consecutiveErrors` + `failureAlert`.
 
-**Week 5 · scheduler lock**
+**Step 5 · scheduler lock**
 
 ```python
 def acquire_lock(cwd: Path) -> bool:
@@ -788,7 +797,7 @@ def acquire_lock(cwd: Path) -> bool:
 
 参考 Claude Code scheduler lock 文件互斥 + ts 心跳.
 
-**Week 6+ · 隔离执行**
+**Step 6 · 隔离执行**
 
 ```python
 async def run_job_isolated(job: CronJob):
@@ -805,7 +814,7 @@ async def run_job_isolated(job: CronJob):
 
 参考 OpenClaw isolated-agent + skills-snapshot.
 
-**Week 7+ · 威胁扫描**
+**Step 7 · 威胁扫描**
 
 ```python
 CRON_THREAT_PATTERNS = [
@@ -823,7 +832,7 @@ def scan_cron_prompt(prompt: str) -> Optional[str]:
 
 参考 Hermes `_scan_cron_prompt` 10 条 critical + 10 invisible unicode.
 
-**Week 8+ · delivery 模式**
+**Step 8 · delivery 模式**
 
 ```python
 class CronDelivery(Enum):
@@ -911,14 +920,14 @@ Claude Code 的 cron 是注入 prompt 到当前 session，主 session 在跑就�
 
 **实际工程值得记的点**:
 
-- 长任务必须隔离
-- skill 等可变状态必须 snapshot
-- 隔离 session 要有 autoClose，否则资源泄露
-- 隔离 session 的 logs 要能 query 到（不能完全黑盒）
+- 如果任务会长期占住前台会话、需要独立取消或需要单独恢复，就把它放进隔离 session
+- 如果结果要求可重复，记录 skill、模型和配置版本，或在调度时保存快照；如果任务本来就应跟随最新配置，则在执行时解析并留下版本记录
+- 会创建隔离 session 的调度器要定义关闭和回收策略，并验证异常退出路径
+- 需要排障或审计时，隔离 session 的日志应能按任务查询，而不是只留一个成功/失败状态
 
 **追问**: "isolated-agent 跟 subagent 区别？" subagent 是 sync 调用（主 agent 等结果），isolated-agent 是 async（独立跑，主 agent 不等）。`subagent-followup` 是 OpenClaw 让 isolated-agent 完事后回通知主 agent 的机制。
 
-**追问**: "isolated-agent 的成本？" 每次 spawn 一个 new agent context（包括 system prompt + tool box），token 成本是 main session 的 100%。可以 lazy spawn。
+**追问**: "isolated-agent 的成本？" 每次 spawn 都会创建新的 agent context（包括 system prompt 和 tool box）；实际 token 成本取决于上下文长度、模型和工具调用，不能简单按 main session 的固定百分比估算。可以按需 spawn。
 
 **源码**: [`openclaw/src/agents/isolated-agent.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/isolated-agent.ts).
 </details>
@@ -982,7 +991,7 @@ _CRON_THREAT_PATTERNS = [
 
 **追问**: "如果用户写 base64 编码的 cron 怎么办？" base64.*decode 是威胁 pattern，自动 ask。signature: 用户被诱导复制粘贴 base64 prompt 是常见社工。
 
-**追问**: "怎么测 cron 安全？" red team 测试：写 20 条 malicious cron prompt，看 scanner 拦截率。production 推 > 95%。
+**追问**: "怎么测 cron 安全？" 先固定 threat model、平台、扫描器版本和输入集合，再记录拦截、误报、漏报与副作用。没有这组实验材料，不给出通用 production 阈值。
 
 **源码**: `hermes-agent/scheduler.py:_CRON_THREAT_PATTERNS + _INVISIBLE_CHARS`.
 </details>
@@ -990,7 +999,7 @@ _CRON_THREAT_PATTERNS = [
 <details>
 <summary>**Q9 · 工程**：cron 跑出错怎么自动判定 disable 还是 retry？</summary>
 
-OpenClaw 的策略最完整：consecutiveErrors + scheduleErrorCount + backoff。
+OpenClaw 把 `consecutiveErrors`、`scheduleErrorCount` 和 backoff 分开记录。这里关注的是错误分类，不是完整度排名。
 
 **两个独立计数**:
 
@@ -1044,19 +1053,19 @@ interface FailureAlert {
 }
 ```
 
-`after: 3` = 失败 3 次后告警；`cooldownMs: 3600000` = 1 小时内不重复告警；`destination` 走独立 webhook（不走 cron 主 delivery）。
+这里的 `after: 3` 和 `cooldownMs: 3600000` 是示例配置，用来说明告警阈值与冷却窗口是两个字段；部署值应来自错误频率和响应目标。
 
 **为什么 cooldown？**
 
-否则一个 cron job 持续失败，告警每次都发，user 收到 100 条同样的告警，根本没法看。
+否则一个 cron job 持续失败时，每次触发都可能重复告警；“100 条”只是告警风暴示例，不是本站运行数据。
 
 **为什么独立 destination？**
 
-cron 主 delivery 可能就是失败方（如 webhook url 挂了）。告警必须走独立路径（如 email）才能保证 user 知道。
+cron 主 delivery 可能就是失败方（如 webhook URL 不可用）。告警走独立路径（如 email）可减少同源故障，但独立通道也可能失败，仍需监控送达状态。
 
 **对比 Claude Code 的策略**:
 
-Claude Code 用 `recurringMaxAgeMs` 自动过期：30 天没人 confirm 就自动删。简单但不智能。
+Claude Code 当前 `recurringMaxAgeMs` 配置会让未续约任务在 30 天后过期。它解决的是生命周期上限，不判断任务业务价值。
 
 **追问**: "如何区分「业务挂了」vs「网络抖动」？" 错误类型分类：NetworkError / TimeoutError 算抖动（不计入 consecutiveErrors），BusinessError / SyntaxError 算硬挂（计入）。
 
@@ -1068,9 +1077,9 @@ Claude Code 用 `recurringMaxAgeMs` 自动过期：30 天没人 confirm 就自�
 <details>
 <summary>**Q10 · 开放**：综合四家，设计一个通用 cron 系统。</summary>
 
-7 层架构：
+下面是从四份源码拼出的七层示例。它不是通用最低配置；可按部署是否多进程、是否有外部交付、是否执行高权限工具删减。
 
-**Layer 1 · CronJob 数据模型（必备）**
+**Layer 1 · CronJob 数据模型（需要持久状态时）**
 
 ```python
 @dataclass
@@ -1100,7 +1109,7 @@ class CronJob:
 
 参考 OpenClaw CronSchedule + Claude Code CronTask + Hermes job.
 
-**Layer 2 · 调度器（必备）**
+**Layer 2 · 调度器（需要本地触发时）**
 
 ```python
 class Scheduler:
@@ -1121,7 +1130,7 @@ class Scheduler:
 
 参考 Hermes croniter + OpenClaw 1s tick.
 
-**Layer 3 · 跨进程互斥（必备）**
+**Layer 3 · 跨进程互斥（多个 scheduler 共享任务时）**
 
 ```python
 class SchedulerLock:
@@ -1145,7 +1154,7 @@ class SchedulerLock:
 
 参考 Claude Code scheduler lock.
 
-**Layer 4 · 隔离执行（推荐）**
+**Layer 4 · 隔离执行（会争用会话状态或权限时）**
 
 ```python
 async def fire_isolated(job: CronJob):
@@ -1167,7 +1176,7 @@ async def fire_isolated(job: CronJob):
 
 参考 OpenClaw isolated-agent + skills-snapshot.
 
-**Layer 5 · 失败处理（必备）**
+**Layer 5 · 失败处理（任务允许重试时）**
 
 ```python
 async def handle_failure(job: CronJob, error: Exception):
@@ -1184,7 +1193,7 @@ async def handle_failure(job: CronJob, error: Exception):
 
 参考 OpenClaw failure-handler.
 
-**Layer 6 · Delivery（推荐）**
+**Layer 6 · Delivery（结果需要离开运行环境时）**
 
 ```python
 class Delivery(Enum):
@@ -1200,7 +1209,7 @@ async def deliver(job: CronJob, result: str):
 
 参考 OpenClaw 4 模式.
 
-**Layer 7 · 威胁扫描（必备）**
+**Layer 7 · 威胁扫描（prompt 来源不完全可信时）**
 
 ```python
 CRON_THREAT_PATTERNS = [
@@ -1224,28 +1233,23 @@ def scan_cron_prompt(prompt: str) -> Optional[str]:
 
 参考 Hermes _scan_cron_prompt + _INVISIBLE_CHARS.
 
-**核心设计原则**:
+**这份示例需要显式做出的选择**:
 
-1. **持久化先**: jobs.json 比 SQLite 更简单
-2. **lock 必须**: 多窗口必出 bug
-3. **隔离默认开**: 主 session 干净
-4. **威胁扫描必须**: cron 是攻击载体
-5. **failure auto-disable**: 5 次连续失败自停
+1. **存储按查询需求选**: jobs.json 表面更小；并发查询和迁移需求上升时再评估 SQLite
+2. **按 owner 模型选锁**: 多窗口共享任务时要互斥；单 owner 不需要同样机制
+3. **按争用风险选隔离**: 独立 session 减少相互污染，但增加上下文和运维成本
+4. **按权限边界做扫描**: 规则扫描只覆盖已知模式，外层权限仍要限制
+5. **阈值来自配置**: 示例代码的 5 次连续失败不是通用自停标准
 6. **delivery 分模式**: 不同场景不同路径
 7. **cloud 选项可选**: 看部署环境
 
-**复刻成本**:
-
-- Layer 1-3 + 7: 必备，3-4 周
-- Layer 4-6: 推荐，2-3 周
-
-总共 v0.1 一个月，v1.0 两个月。
+**实现成本**：本文没有该组合架构的项目日志，不能给出周数。应分别估算调度、持久化、互斥、隔离、交付、安全扫描和故障注入测试。
 
 **追问**: "多机部署怎么 lock？" Redis SETNX 或 etcd lease。文件锁不跨机。
 
 **追问**: "怎么测 cron 系统？" freezegun 冻结时间 + 跑几个周期看是否正确触发 / 退避。
 
-**源码 mosaic**: 四家精华叠加。
+**源码 mosaic**：按任务边界组合四个实现中的部件；本站没有对这个组合做端到端 benchmark。
 </details>
 
 </details>

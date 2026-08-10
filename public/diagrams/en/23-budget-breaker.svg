@@ -11,7 +11,7 @@
       .ok  { font: 700 10.5px sans-serif; fill: #15803d; }
     </style>
   </defs>
-  <text x="440" y="26" class="h" text-anchor="middle">Budgets & breaker: check order in one iteration</text>
+  <text x="440" y="26" class="h" text-anchor="middle">Budgets &amp; breaker: check order in one iteration</text>
   <text x="440" y="44" class="t-s" text-anchor="middle">Budgets are checked BEFORE the model call (mini-swe-agent); the breaker counts CONSECUTIVE failures, any success resets</text>
   <g filter="url(#wb23b)">
     <rect x="40" y="90" width="130" height="44" rx="8" fill="#e0e7ff" stroke="#1e293b" stroke-width="1.6" />

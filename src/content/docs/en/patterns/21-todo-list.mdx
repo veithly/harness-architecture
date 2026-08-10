@@ -1,53 +1,61 @@
 ---
-title: "21 · Todo List: Task Checklist and Progress Surface"
+title: "21 · Todo Is Not a Plan: What Survives Compaction?"
 sidebar:
   order: 21
-description: "How an agent tracks complex work at runtime: breaking goals into a visible checklist, updating progress, surviving compaction and resume, and keeping plans, memory, and execution state separate."
+description: "Keep approval plans, execution todos, and durable tasks separate so compaction and resume preserve a verifiable next action."
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
-import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
 import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## A todo keeps the goal in view
+## A todo is not a plan: what survives compaction?
 
-<Verdict tldr="A todo list is not Plan Mode, not long-term memory, and not prose in the final answer. It is the runtime progress surface for complex work: split the user goal into a small set of visible tasks, track each task with a tiny status machine, update it as facts change, and preserve unfinished work across compaction, resume, and UI surfaces. Codex has the cleanest split: `update_plan` is explicitly a TODO/checklist tool, disallowed in Plan Mode, and emits `PlanUpdate` events rendered by the TUI and app server. Claude Code has the richest task surface: `TodoWrite` manages session-local todos with `content`, `status`, and `activeForm`, while Tasks V2 adds file-backed tasks with owner, blockers, claim logic, and reminders. Hermes has the lightest version: an in-memory `todo` tool per session, with replace or merge writes, and only pending / in_progress items re-injected after compaction. OpenClaw does not have a model-owned todo list; it projects real runtime progress from tool calls, tool updates, child sessions, and compaction continuity. The rule for your own agent: keep approval plan, execution todo, and durable background task separate." />
+<Verdict tldr="An unapproved plan, the current execution focus, and a durable background task need different recovery rules. This chapter follows execution-todo state and compares checklists, file-backed tasks, and runtime events only where their resume behavior differs. Source observations are not retention or completion-rate experiments."/>
 
-## Four progress surfaces
+A todo tells the agent what to do next. A plan waits for approval. A durable task must continue across processes. Put them in one table and resume will turn “proposed” into “started”.
+
+## Keep three state surfaces separate
+
+| Surface | Stores | On compaction or resume |
+| --- | --- | --- |
+| Approval plan | A proposal the user has not accepted | Show as proposal; do not mark it running |
+| Execution todo | Unfinished steps and current focus | Re-inject `pending` and `in_progress` only |
+| Durable task | Owner, dependencies, retries, terminal state | Restore from events or a task file |
+
+Codex rejects `update_plan` in Plan Mode. Claude Code splits `TodoWrite` from Tasks V2. Hermes re-injects unfinished items after compaction. OpenClaw relies more on runtime events and child-session relay. Compare them only when you need one of those recovery contracts.
+
+## A minimum state that changes the next action
+
+```json
+{"id":"t-1","content":"run targeted tests","status":"in_progress","activeForm":"Running targeted tests","updated_at":"2026-08-10"}
+```
+
+Completion should carry verification evidence, not just the model's assertion. A single-agent CLI can replace the whole list. Add owner, blockers, claims, and locks when work crosses processes or people.
+
+Before shipping, ask:
+
+- Is there at most one `in_progress` item?
+- Do completed items leave active context while remaining auditable?
+- Does resume use the latest successful structured state instead of guessing from prose?
+- Can a reader distinguish Plan, Todo, and Task in the API and UI?
+
+## Source notebook: implementation details
 
 <details>
-<summary>Before reading (optional)</summary>
-
-- **A todo list is not Plan Mode, memory, or prose**: it is the runtime progress surface — visible tasks, a tiny status machine, updated as facts change.
-- **Four shapes**: Codex's `update_plan` is a pure checklist tool disallowed in Plan Mode; Claude Code layers `TodoWrite` with file-backed Tasks V2 (owner, blockers, claim logic); Hermes keeps an in-memory `todo` tool per session; OpenClaw has no model-owned todo and projects progress from runtime events.
-- **Structured state determines survivability**: only structured todos can be preserved across compaction, resume, and UI surfaces — Hermes re-injects only pending / in_progress items after compaction.
-- **Keep three things separate**: approval plan, execution todo, and durable background task; fusing them is the trap.
-
-</details>
+<summary>Source notebook: implementation details</summary>
 
 <Diagram
   src="/diagrams/21-todo-list-base.svg"
   alt="Four todo and progress surfaces: Codex update_plan, Claude Code TodoWrite and Tasks, OpenClaw progress events, Hermes todo tool"
   caption="A todo list is useful when progress becomes structured state, not just text in a reply."
   wide
-/>
-
-<CompareTable
-  rows={[
-    { label: 'Core abstraction', values: ['`UpdatePlanArgs`: optional `explanation` plus `plan[]`, each item has `step` and `status`', '`TodoWrite` TodoItem; Tasks V2 turns this into file-backed `TaskSchema`', 'ACP `tool_call` / `tool_call_update` events plus parent-stream progress relay', '`TodoStore`: session-local in-memory task list exposed through the `todo` tool'] },
-    { label: 'Status set', values: ['`pending` / `in_progress` / `completed`', '`pending` / `in_progress` / `completed`; Tasks V2 adds owner, blockers, metadata', '`in_progress` / `completed` / `failed` from runtime events', '`pending` / `in_progress` / `completed` / `cancelled`'] },
-    { label: 'Write model', values: ['The model submits the current checklist through `update_plan`', '`TodoWrite` writes the whole session list; Tasks V2 uses create/update task tools', 'Runtime emits events as tools and child agents actually run', '`merge=false` replaces the list; `merge=true` updates by id'] },
-    { label: 'Resume path', values: ['Events flow to TUI / app-server notifications, not a durable plan file', 'TodoWrite can be restored from transcript; Tasks V2 persists JSON files', 'Session events, parent relay, and compaction summaries preserve active task state', 'Hydrates from latest todo tool response; compaction injects unfinished items only'] },
-    { label: 'Plan relation', values: ['`update_plan` is rejected in Plan Mode', '`plans.ts` handles plans; TodoWrite / Tasks handle execution progress', 'Plan and progress are projected through runtime events, not one model-owned table', 'No separate approval plan; `todo` is just execution focus'] },
-    { label: 'Main risk', values: ['Too coarse for owner/blocker/team workflows', 'Powerful but conceptually split across Plan Mode, TodoWrite, and Tasks V2', 'No unified model-owned checklist for remaining semantic work', 'In-memory first; depends on history and compaction for continuity'] },
-  ]}
-  caption="The same word todo can mean a model checklist, an IDE task board, a runtime event stream, or compaction recovery focus."
-  dimensionLabel="Dimension"
 />
 
 ## How four systems implement task state
@@ -122,7 +130,7 @@ Session focus and team task boards have different reminder loops.
 
 Hermes keeps a single in-memory `TodoStore` per agent/session. It supports replace and merge writes, adds a `cancelled` state, and exposes everything through one `todo` tool.
 
-Its best idea is compaction behavior: only unfinished items return to active context.
+One notable implementation choice is its compaction behavior: only unfinished items return to active context.
 
 <SourceBlock path="REF/hermes-agent/tools/todo_tool.py" lines="90-118" system="hermes" summary="Hermes only injects pending and in_progress todos after compaction.">
 
@@ -149,7 +157,7 @@ OpenClaw focuses on progress projection. Its ACP translator emits `tool_call` wi
 
 The auto-reply projector turns those events into visible tool summaries. The parent-stream relay forwards child-agent progress back to the parent session.
 
-This is the right choice for a multi-channel operator surface: the most reliable progress source is often the runtime event stream, not a model-authored checklist.
+For a multi-channel operator surface, runtime events are a direct source of tool and child-session facts; whether they are more reliable than a model-authored checklist depends on the event coverage and trace.
 
 OpenClaw also shows the guardrail this design needs: no-progress detection. `tool-loop-detection.ts` distinguishes unchanged polling loops, ping-pong loops, and global repeat circuit breakers; the parent-stream relay has a no-output watcher that emits a stall notice when a child session stops producing output.
 
@@ -163,7 +171,7 @@ A final answer that says what the agent will do next is not task management beca
 
 The state machine stays small. `pending` / `in_progress` / `completed` is enough for the current execution surface. Add `failed`, `cancelled`, owner, or blockers only when the runtime really needs them.
 
-There must be one current focus. Codex requires at most one `in_progress`; Claude Code requires exactly one; Hermes also says only one. Without that rule, a todo list becomes a wishlist and recovery loses the next action.
+One current focus makes a single todo table recoverable. Codex requires at most one `in_progress`; Claude Code and Hermes use stricter wording. Parallel work can live under a parent task or durable task layer instead of being treated as several top-level focuses.
 
 Completion should lower attention. Claude Code only completes fully accomplished items, Codex crosses completed items out, Hermes does not re-inject completed items after compaction, and TodoWrite clears all-done lists.
 
@@ -172,29 +180,19 @@ Completion should lower attention. Claude Code only completes fully accomplished
 <TradeOff
   title="Four implementation paths"
   options={[
-    { name: 'Model-owned checklist', pros: ['Best for single-agent coding CLIs', 'The model knows the next focus', 'Easy to render in UI'], cons: ['Can be marked complete too early', 'No owner/blocker semantics', 'Needs reminders and resume'] },
+    { name: 'Model-owned checklist', pros: ['Fits a single-agent coding CLI current-focus surface', 'The model knows the next focus', 'Easy to render in UI'], cons: ['Can be marked complete too early', 'No owner/blocker semantics', 'Needs reminders and resume'] },
     { name: 'File-backed tasks', pros: ['Works across IDE windows and agents', 'Supports owner and blockers', 'Auditable after restart'], cons: ['Requires locks and migrations', 'More complex than current-focus todo', 'Easy to overbuild'] },
-    { name: 'Runtime event stream', pros: ['Grounded in tool and child-agent facts', 'Excellent for operator UI', 'Naturally captures failure states'], cons: ['Does not express remaining semantic work alone', 'Needs summary continuity', 'Needs aggregation and dedupe'] },
-    { name: 'Compaction injection', pros: ['Great for long-context agents', 'Avoids repeating completed work', 'Cheap to implement'], cons: ['Depends on history and compression', 'Weak audit story', 'IDs depend on model quality'] },
+    { name: 'Runtime event stream', pros: ['Grounded in tool and child-agent facts', 'Can support an operator UI', 'Captures failure states when emitted'], cons: ['Does not express remaining semantic work alone', 'Needs summary continuity', 'Needs aggregation and dedupe'] },
+    { name: 'Compaction injection', pros: ['Can help long-context agents', 'Avoids repeating completed work', 'Often small to implement'], cons: ['Depends on history and compression', 'Weak audit story', 'IDs depend on model quality'] },
   ]}
   caption="Choose based on whether your product is a CLI, IDE, operator runtime, or long-context agent."
 />
 
 The core split is three layers: approval plan, execution todo, and durable task. Plans are for user approval. Todos are for current execution focus. Durable tasks are for background or team work with owners, blockers, locks, and retries.
 
-## My take: keep only what changes the next action
+## On resume, keep only state that changes the next action
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: 'Cleanest minimum', reason: 'Small schema, explicit Plan Mode rejection, and evented UI rendering make it ideal for coding CLI progress.', risk: 'Too coarse for team tasks or durable background work.' },
-    { system: 'Claude Code', value: 'Richest IDE surface', reason: 'TodoWrite adds discipline, activeForm, reminders, restore, and verification nudges; Tasks V2 adds durable task semantics.', risk: 'Plan Mode, TodoWrite, and Tasks V2 must be explained as separate layers.' },
-    { system: 'OpenClaw', value: 'Best operator projection', reason: 'Tool calls, tool updates, and child-agent progress are projected as runtime events across channels.', risk: 'No single model-owned checklist for remaining semantic tasks.' },
-    { system: 'Hermes', value: 'Lightest compaction recovery', reason: 'A tiny TodoStore plus unfinished-only injection solves many repeat-work failures.', risk: 'In-memory first; continuity depends on history and compression.' },
-  ]}
-  caption="Copy Codex for a CLI, Claude Code for IDE/team workflows, OpenClaw for operator progress, and Hermes for long-context recovery."
-/>
-
-## Start with minimal task state
+## Minimal implementation: keep task state recoverable
 
 <BuildRecipe
   title="Todo List / Progress Surface"
@@ -227,7 +225,7 @@ The core split is three layers: approval plan, execution todo, and durable task.
 <Diagram
   src="/diagrams/21-tradeoff.svg"
   alt="Three-layer todo architecture: approval plan, execution todo, durable task, plus event stream and compaction recovery"
-  caption="The stable design is layered: plan for approval, todo for execution focus, durable task for background and team work."
+  caption="A testable starting point is layered: plan for approval, todo for execution focus, durable task for background and team work."
   wide
 />
 
@@ -258,6 +256,8 @@ The core split is three layers: approval plan, execution todo, and durable task.
     { system: 'OpenClaw', path: 'REF/openclaw/CHANGELOG.md', lines: '293-293', desc: 'Compaction continuity preserves active task status' },
   ]}
 />
+
+</details>
 
 ## Appendix: exercises and review
 
@@ -331,9 +331,9 @@ Agents often treat code written as work completed. A verification nudge forces c
 </details>
 
 <details>
-<summary>**Q10 · Checklist**: What is the minimum production progress surface?</summary>
+<summary>**Q10 · Checklist**: Which progress surfaces does a task shape need?</summary>
 
-Use a tiny schema, enforce one active focus, event updates to UI and transcript, restore unfinished work after compaction or resume, and require evidence before completion.
+One testable starting point is a tiny schema, an explicit current focus, event updates to UI and transcript, unfinished-work recovery after compaction or resume, and evidence matched to the completion risk. A single-agent CLI may not need every additional surface.
 
 Add reminders, durable tasks, and runtime progress events only when the product shape needs them.
 </details>

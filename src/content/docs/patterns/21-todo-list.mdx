@@ -1,53 +1,61 @@
 ---
-title: 21 · Todo List：任务清单与进度面
+title: 21 · Todo 不是计划：压缩后怎样继续
 sidebar:
   order: 21
-description: agent 运行时如何用 todo list 管理复杂任务：拆分、标记进度、恢复上下文、提醒更新、避免把计划、记忆和执行清单混成一团。
+description: 分开 approval plan、execution todo 与 durable task，让任务在压缩和恢复后仍保留可验证的下一步。
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
-import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
 import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## Todo 的工作是让目标留在视野里
+## Todo 不是计划：压缩后怎样继续？
 
-<Verdict tldr="Todo list 不是 Plan Mode，也不是长期记忆，更不是最后回复里的进度描述。它是 agent 在执行复杂请求时的运行时进度面：把用户目标拆成少量可见任务，用 pending / in_progress / completed 这类小状态机跟踪，随着实际执行不断更新，并在压缩、恢复、跨 UI 同步时保留当前未完成工作。Codex 把这个点做得最干净：`update_plan` 明确是 TODO/checklist tool，甚至在 Plan Mode 里禁用，状态更新会变成 `PlanUpdate` 事件，TUI 再渲染成 Updated Plan 和标题进度。Claude Code 做得最完整：旧路径是 `TodoWrite`，要求复杂任务主动写 todo、每次开始前标 `in_progress`、完成后标 `completed`，并带 `activeForm` 给 UI；新路径是 file-backed Tasks V2，增加 owner、blocks、claim 和提醒。Hermes 做得最轻：一个 session 内存里的 `todo` tool，支持 replace 或 merge，压缩后只把 pending / in_progress 注回上下文。OpenClaw 没有模型托管的 todo list，而是把工具调用和子 agent 进度作为事件流投影给操作者。结论：自己做 agent 时要把 approval plan、execution todo、durable background task 三层分开；最小实现学 Codex，IDE/团队协作学 Claude Code，长上下文恢复学 Hermes，运营可视化学 OpenClaw。" />
+<Verdict tldr="计划尚未获批、当前执行焦点和后台任务状态，需要不同的恢复规则。本文只追 execution todo 的生命周期，比较 checklist、文件任务和运行时事件何时产生不同结果。源码观察不等于用户留存或完成率实验。"/>
 
-## 四种任务进度面
+Todo 的作用是告诉 Agent 下一步要做什么；Plan 是等待批准的提案；durable task 则要跨进程继续。把三者塞进一张表，恢复时就会把“想做”误当成“已开始”。
+
+## 先把三个状态面分开
+
+| 状态面 | 保存什么 | 压缩或恢复时怎么处理 |
+| --- | --- | --- |
+| approval plan | 用户尚未批准的方案 | 只作为 proposal 展示，不标成执行中 |
+| execution todo | 当前未完成步骤与焦点 | 只回注 `pending` / `in_progress` |
+| durable task | owner、依赖、重试和终态 | 从持久化事件或任务文件恢复 |
+
+Codex 的 `update_plan` 在 Plan Mode 中被拒绝；Claude Code 的 `TodoWrite` 与 Tasks V2 分层；Hermes 在压缩后只注入未完成项；OpenClaw 更依赖运行时事件和子 session relay。这些差异只在需要哪种恢复语义时才值得比较。
+
+## 一个能改变下一步的最小状态
+
+```json
+{"id":"t-1","content":"run targeted tests","status":"in_progress","activeForm":"Running targeted tests","updated_at":"2026-08-10"}
+```
+
+完成状态要附验证证据，不能只接受模型说“完成了”。单 agent CLI 可用整体替换；跨进程或多人协作再引入 owner、blocks、claim 和锁。
+
+落地前检查：
+
+- 是否限制同时只有一个 `in_progress`？
+- completed 项是否从 active context 移走但仍可审计？
+- 压缩后是否从最近一次成功状态恢复，而不是从自然语言猜？
+- Plan、Todo、Task 的 UI 和 API 名称能否让读者分辨？
+
+## 源码底稿：按实现展开
 
 <details>
-<summary>读前提示（按需展开）</summary>
-
-- **todo list 是运行时进度面**：不是 Plan Mode，不是长期记忆，也不是最后回复里的进度描述。
-- **托管方式分歧最大**：Codex 的 update_plan 明确是 checklist tool、在 Plan Mode 里直接禁用；OpenClaw 没有模型托管 todo，全靠事件流投影给操作者。
-- **状态机决定可恢复性**：pending / in_progress / completed 小状态机跟踪执行，Hermes 压缩后只把未完成项注回上下文。
-- **第一优先**：把 approval plan、execution todo、durable background task 三层分开，别混成一张表。
-
-</details>
+<summary>源码底稿：按实现展开</summary>
 
 <Diagram
   src="/diagrams/21-todo-list-base.svg"
   alt="四系统 todo list 与任务进度面对照：Codex update_plan、Claude Code TodoWrite 与 Tasks、OpenClaw progress events、Hermes todo tool"
   caption="Todo list 的核心不是把计划写漂亮，而是把当前执行状态变成可更新、可恢复、可展示的状态机。"
   wide
-/>
-
-<CompareTable
-  rows={[
-    { label: '核心抽象', values: ['`UpdatePlanArgs`：`explanation` 加 `plan[]`，每项只有 `step` 和 `status`', '`TodoWrite` 的 `TodoItem`；Tasks V2 进一步变成 `TaskSchema` 文件任务', 'ACP `tool_call` / `tool_call_update` 事件，外加 parent stream 进度转发', '`TodoStore`：session 内存任务表，`todo` tool 读写'] },
-    { label: '状态集', values: ['`pending` / `in_progress` / `completed`', '`pending` / `in_progress` / `completed`，Tasks V2 另有 owner、blocker、metadata', '`in_progress` / `completed` / `failed` 来自运行时事件，不是模型自填 checklist', '`pending` / `in_progress` / `completed` / `cancelled`'] },
-    { label: '写入方式', values: ['模型调用 `update_plan` 整体提交当前 checklist', '`TodoWrite` 整体写入；Tasks V2 用 `TaskCreate` / `TaskUpdate` 做增量文件任务', '运行时根据工具和子 agent 执行自然产生事件', '`merge=false` 整表替换；`merge=true` 按 id 更新'] },
-    { label: '恢复方式', values: ['事件进入 TUI / app-server 通知；不是长期计划文件', '旧 `TodoWrite` 可从 transcript 恢复；Tasks V2 存 `~/.claude/tasks/.../*.json`', 'session event、parent relay、compaction summary 保留 active task status', '从历史里的最近 `todo` tool 响应 hydrate；压缩后只注入未完成项'] },
-    { label: '与计划关系', values: ['`update_plan` 在 Plan Mode 里直接报错，避免 approval plan 与执行清单混用', '`plans.ts` 管计划文件，`TodoWrite` / Tasks 管执行进度', '计划和进度通过事件投影分开，todo 不由模型集中持有', '没有单独 approval plan；`todo` 是轻量执行焦点'] },
-    { label: '主要风险', values: ['状态太粗，适合单 agent 执行，不适合多人 claim/block', '能力最强但路径分裂：TodoWrite、Tasks V2、Plan Mode 要讲清边界', '没有模型托管 checklist，复杂目标可能散在对话和摘要里', '内存优先，若历史或压缩链路断掉会丢任务面'] },
-  ]}
-  caption="同样叫 todo，真实系统里至少有四种含义：模型自管 checklist、IDE 任务表、运行时事件流、压缩恢复焦点。"
-  dimensionLabel="维度"
 />
 
 ## 四套系统怎样落地进度状态
@@ -154,7 +162,7 @@ Tasks V2 还不是简单的「大号 TodoWrite」。`TaskUpdateTool` 只有 Todo
 
 ### Hermes · 轻量 todo，压缩后只带未完成项
 
-Hermes 的 `todo` tool 是最小但很实用的一版。它是每个 AIAgent / session 一份内存 `TodoStore`，支持整表替换和按 id merge，状态多了一个 `cancelled`。它最值得抄的是压缩恢复策略：`format_for_injection()` 只注入 `pending` 和 `in_progress`，不注入 `completed` / `cancelled`，避免压缩后模型把已经做完的事又做一遍。
+Hermes 的 `todo` tool 是一份小型实现。它是每个 AIAgent / session 一份内存 `TodoStore`，支持整表替换和按 id merge，状态多了一个 `cancelled`。其中一个可复用的实现选择是压缩恢复策略：`format_for_injection()` 只注入 `pending` 和 `in_progress`，不注入 `completed` / `cancelled`；是否适合自己的 runtime，要结合恢复和审计需求验证。
 
 <SourceBlock path="REF/hermes-agent/tools/todo_tool.py" lines="90-118" system="hermes" summary="Hermes 压缩后只注入未完成 todo，已完成或取消的项不会重新进入 active context。">
 
@@ -186,15 +194,15 @@ OpenClaw 没有一个等价的模型自管 todo list。它的重点是把工具�
 
 OpenClaw 也给了一个反面提醒：事件流不是越多越好，必须能识别「无进展」。`tool-loop-detection.ts` 会把相同参数且结果不变的 polling、ping-pong 调用和全局重复调用分别标成 warning / critical；父子 session relay 还有 no-output watcher，子 session 长时间没输出时会给 parent session 发 stall 提示。
 
-也就是说 runtime progress surface 至少要有 no-progress detector，否则 UI 只是在展示卡死过程。
+如果 runtime progress surface 对用户承诺“正在运行”，就应配 no-progress detector，或明确显示它只反映最近事件而不代表仍在前进。
 
 ## Todo 系统已经形成的共识
 
 第一，共同点不是「都有 todo list」，而是都把**进度从 prose 里拿出来**。Codex 用协议事件，Claude Code 用工具状态和任务文件，OpenClaw 用 ACP runtime event，Hermes 用 tool JSON。只在最终回复里写「我接下来会做 A/B/C」不算任务管理，因为 UI、恢复、提醒、压缩都读不到它。
 
-第二，状态机都非常小。`pending` / `in_progress` / `completed` 是最稳定的三态。Hermes 多一个 `cancelled`，OpenClaw 多一个 `failed`，Claude Tasks V2 多 owner 和 blocker，但核心还是「未开始、正在做、已结束」。
+第二，状态机都非常小。`pending` / `in_progress` / `completed` 是几个快照里反复出现的基础三态。Hermes 多一个 `cancelled`，OpenClaw 多一个 `failed`，Claude Tasks V2 多 owner 和 blocker，但核心仍是「未开始、正在做、已结束」。
 
-第三，必须有唯一当前焦点。Codex tool spec 要求最多一个 `in_progress`；Claude prompt 要求 exactly one；Hermes schema 也写了 only ONE item in_progress。没有这个约束，todo list 会退化成愿望清单，模型不知道下一步该推进哪个。
+第三，单张当前 todo 表需要一个明确焦点。Codex tool spec 要求最多一个 `in_progress`，Claude prompt 和 Hermes schema 更严格；并行任务可以放在父任务或 durable task 层，不应把不同层的约束混为通用规则。
 
 第四，完成态要谨慎处理。Claude Code 要求只在 fully accomplished 时标完成，还加 verification nudge；Hermes 干脆不把 completed 注回 active context；Codex TUI 把 completed 划掉。完成项是审计痕迹，不应该继续抢注意力。
 
@@ -207,10 +215,10 @@ OpenClaw 的 changelog 专门强调 compaction continuity 要保留 active task 
 <TradeOff
   title="Todo list 的四种实现取舍"
   options={[
-    { name: '模型托管 checklist', pros: ['最适合单 agent coding CLI', '模型知道目标拆分和下一步焦点', '实现简单，UI 可直接渲染'], cons: ['容易被模型过早标完成', '不天然适合多人 claim/block', '需要提醒和恢复机制'] },
+    { name: '模型托管 checklist', pros: ['适合单 agent coding CLI 的当前焦点', '模型知道目标拆分和下一步', '实现简单，UI 可直接渲染'], cons: ['容易被模型过早标完成', '不天然适合多人 claim/block', '需要提醒和恢复机制'] },
     { name: '文件化 Task 系统', pros: ['适合团队任务、IDE、长任务', 'owner / blocker / metadata 可审计', '进程重启后仍可恢复'], cons: ['复杂度明显上升', '要处理锁、迁移、并发 claim', '不应拿来替代轻量当前焦点'] },
     { name: '运行时事件流', pros: ['真实反映工具和子 agent 执行', '适合多渠道 operator UI', '失败和完成来自外部事实'], cons: ['模型没有统一剩余任务表', '需要 compaction summary 兜住语义目标', '事件多时要去重和聚合'] },
-    { name: '压缩注入焦点', pros: ['长上下文 agent 最实用', '只带未完成项，避免重复做完工', '实现成本低'], cons: ['依赖历史或压缩链路', '缺少持久审计', '任务 id 质量取决于模型'] },
+    { name: '压缩注入焦点', pros: ['可用于长上下文 agent', '只带未完成项，避免重复做完工', '实现面通常较小'], cons: ['依赖历史或压缩链路', '缺少持久审计', '任务 id 质量取决于模型'] },
   ]}
   caption="不要问系统要不要 todo list，先问它是单 agent CLI、IDE 团队任务、多渠道运行时，还是长上下文压缩恢复。"
 />
@@ -223,19 +231,9 @@ OpenClaw 的 changelog 专门强调 compaction continuity 要保留 active task 
 
 Codex 和 Claude Code 都在源码里把这三层拆开了。自己做 agent 时如果只做一张巨大表，会同时背上审批、执行、恢复、审计、团队协作五种责任，最后每一种都不可靠。
 
-## 我的判断：只保留能改变下一步的信息
+## 恢复时只保留能改变下一步的状态
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '最干净的最小模型', reason: '`update_plan` schema 小，Plan Mode 中禁用，事件进入 TUI 和 app-server；非常适合 coding CLI 当前任务进度。', risk: '状态粗、无 owner/blocker，不适合团队任务或长后台任务。' },
-    { system: 'Claude Code', value: '最完整的 IDE 任务面', reason: '`TodoWrite` 有使用纪律、activeForm、提醒、恢复；Tasks V2 又补上文件化、owner、blocks、claim。', risk: 'TodoWrite、Tasks V2、Plan Mode 三套概念必须解释清楚，否则用户和模型都会混用。' },
-    { system: 'OpenClaw', value: '最适合 operator 进度投影', reason: '工具调用、工具更新、子 agent relay 都变成可投影事件，适合多渠道 UI 和父子 session。', risk: '没有模型自管 checklist，复杂目标的剩余工作需要靠摘要和 active task continuity 兜底。' },
-    { system: 'Hermes', value: '最轻的长上下文恢复', reason: '一个内存 TodoStore 加压缩后只注入未完成项，就解决了很多重复做工和丢焦点问题。', risk: '内存优先，若历史恢复和压缩注入不稳定，todo 状态也会丢。' },
-  ]}
-  caption="如果只能抄一个：单人 CLI 抄 Codex；IDE 和团队任务抄 Claude Code；多渠道进度抄 OpenClaw；长上下文恢复抄 Hermes。"
-/>
-
-## 从最小任务状态开始
+## 最小实现：任务状态先保持可恢复
 
 <BuildRecipe
   title="Todo List / Progress Surface 复刻方案"
@@ -268,7 +266,7 @@ Codex 和 Claude Code 都在源码里把这三层拆开了。自己做 agent 时
 <Diagram
   src="/diagrams/21-tradeoff.svg"
   alt="todo list 三层架构：approval plan、execution todo、durable task，以及事件流和压缩恢复"
-  caption="最稳的设计是三层分工：计划给人批准，todo 给执行聚焦，durable task 给后台和团队协作。"
+  caption="一个可测试的起点是三层分工：计划给人批准，todo 给执行聚焦，durable task 给后台和团队协作。"
   wide
 />
 
@@ -301,6 +299,8 @@ Codex 和 Claude Code 都在源码里把这三层拆开了。自己做 agent 时
     { system: 'OpenClaw', path: 'REF/openclaw/CHANGELOG.md', lines: '293-293', desc: 'compaction continuity 保留 active task status 和 batch progress' },
   ]}
 />
+
+</details>
 
 ## 附录：练习与复盘
 
@@ -356,7 +356,7 @@ Claude Code 旧 `TodoWrite` 在 allDone 时把 session todo 清空。Codex TUI �
 
 非交互或 SDK 场景下，进程状态不一定稳定，AppState 可能没有旧 todo。Claude Code 的 `sessionRestore.ts` 扫 transcript 里最后一次 `TodoWrite` tool_use，把 todo list 恢复出来，保证 resume 后仍知道未完成工作。
 
-这说明 todo list 虽然不是长期 memory，但也不能只存在模型脑子里。最小实现至少要让它进入可重放事件或 transcript。追问：恢复哪个版本？答：恢复最近一次成功提交的 todo 状态，不要从多次零散自然语言里推断。
+这说明 todo list 虽然不是长期 memory，但也不能只存在模型脑子里。一个可回放事件或 transcript 记录就能提供恢复锚点；恢复哪个版本，应由提交语义和风险决定，不要从零散自然语言里推断。
 </details>
 
 <details>
@@ -392,9 +392,9 @@ Agent 最常见的错觉是「我改完了」等于「任务完成了」。Claud
 </details>
 
 <details>
-<summary>**Q10 · 总结**：一个 production agent 的 todo/progress surface 至少要有哪些层？</summary>
+<summary>**Q10 · 总结**：按任务形态，一个 todo/progress surface 可以有哪些层？</summary>
 
-最小五层：一是小 schema，三态加内容；二是单一当前焦点，限制 `in_progress`；三是事件化，让 UI 和 transcript 读得到；四是恢复和压缩，只保留未完成工作；五是完成验证，不让模型无证据地关闭任务。
+一种可测试的起点是：小 schema，明确当前焦点，事件化供 UI 和 transcript 读取，恢复/压缩只保留未完成工作，以及与风险匹配的完成验证。单 agent CLI 不一定需要下面所有层。
 
 再往上做三层：reminder，长时间不更新时提醒；durable task，跨进程/团队协作用；runtime progress event，工具和子 agent 的真实执行状态单独投影。追问：最忌讳什么？答：把计划、todo、memory、cron、审计全塞进一张万能表。那不是任务管理，是边界丢失。
 </details>

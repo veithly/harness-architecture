@@ -1,6 +1,9 @@
 ---
-title: 02 · Agent Loop
-description: From chat turns to a controlled execution loop, four ways. Codex, Claude Code, OpenClaw, and Hermes each run it differently.
+title: "02 · Agent Loop: where to resume after an interrupt"
+description: Trace interruption, retry, and context recovery so your loop can resume without repeating side effects.
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 sidebar:
   order: 2
 ---
@@ -8,28 +11,16 @@ sidebar:
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 import AgentLoopSVG from '@components/AgentLoopSVG.astro';
 
-## What the loop must survive
+## Where the loop resumes after an interrupt
 
-<Verdict tldr="Agent Loop is «make the model run in a loop». On paper it looks like a while loop wrapped around a few prompt lines, but writing it down properly reveals that an agent's engineering quality is determined less by the loop itself than by the four safety nets around it: when does it stop (run forever and burn tokens, stop too early and leave the task unfinished); how does it recover after a crash (restart from zero, or resume from the last breakpoint); who judges whether the model's answer is right (trust model self-evaluation, or actually verify by running commands); how does it compress when context overflows (direct truncation loses key info, full summary loses details). The four systems answer these questions very differently. Codex splits the loop into a 4-layer event machine (submit / event / turn / goal), writes every step to a rollout file for replay, and chains four hard verifiers (run-tests exit code, apply_patch grammar check, goals.rs convergence detection, execpolicy command review) and refuses to trust model self-evaluation; the strictness only works in coding scenarios. Claude Code goes the opposite way: it labels every `continue` site with a `transition.reason` tag (7 reasons total: `reactive_compact_retry`, `max_output_tokens_escalate`, `token_budget_continuation`, etc.) so any external observer can read the rollout and see at a glance why the loop is still running, and stacks 4 context-compression pipelines (`applyToolResultBudget → snipCompact → contextCollapse → autocompact`, cheap-before-expensive) with a 3-strike circuit breaker (the comment cites «~250K wasted API calls/day globally» as the reason). OpenClaw is the only one with the loop spec written into official docs (`docs/concepts/agent-loop.md` spells out the 5-step pipeline `receive → context_pack → model_call → tool_dispatch → response`): the agent RPC returns `runId` without blocking and `agent.wait` fetches results asynchronously, turning the loop into «an observable background job» rather than a function call; a session lane serialises a session's runs to avoid file-lock races; a dozen plugin hooks (`before_tool_call`, `after_tool_call`, `tool_result_persist`) make the verifier fully middleware-driven. Hermes keeps the main loop a single `while` line but stuffs in everything a long-runner needs: IterationBudget (parent 90 / subagent 50 + grace call), `memory_manager.prefetch_all()` before the loop starts to inject cross-session preferences, `insights.py` self-grading after the loop ends, and `checkpoint_mgr.new_turn()` at every turn for interrupt-and-resume. Pick Codex for a coding agent, Claude Code for an IDE tool, OpenClaw for a control plane, Hermes for a long-runner." />
+<Verdict tldr="If the process dies on turn 37, can the agent resume without repeating a side effect? We read the loop through that recovery question: Codex rollouts, Claude Code transition reasons, OpenClaw run and session events, and Hermes checkpoints preserve different facts. This is source analysis, not a measured recovery benchmark." />
 
-## The smallest loop and four execution lanes
-
-<details>
-<summary>Before reading (optional)</summary>
-
-- **The loop is not the hard part**: an agent's engineering quality is determined by the four safety nets around it—stop condition, crash recovery, answer verification, context compression.
-- **Four loop shapes**: Codex runs a 4-layer event machine (submit / event / turn / goal) with replayable rollout files; Claude Code tags every `continue` with one of 7 `transition.reason` labels; OpenClaw returns `runId` and treats the loop as an observable background job; Hermes keeps one `while` line plus IterationBudget (parent 90 / subagent 50 + grace call).
-- **The stop condition sets the token bill**: run forever and burn tokens, stop too early and leave the task unfinished.
-- **Give compression a fuse**: stack pipelines cheap-before-expensive (`applyToolResultBudget → snipCompact → contextCollapse → autocompact`) and trip a 3-strike circuit breaker—Claude Code cites ~250K wasted API calls/day without one.
-
-</details>
+## Define recovery before drawing the loop
 
 Every agent loop boils down to these four phases. Watch the 30-second animation:
 
@@ -39,18 +30,18 @@ Then put all four systems in the **same swim-lane diagram** and the engineering 
 
 <Diagram src="/diagrams/02-agent-loop-lanes.svg" alt="Swim-lane comparison of Agent Loop across four systems" caption="Same loop, four different engineering bets: stop condition, verifier, resumability, and concurrency model all differ." />
 
-## Four loops, four failure models
+## Compare only implementations that change recovery
 
 <CompareTable
   systems={['Codex', 'Claude Code', 'OpenClaw', 'Hermes']}
   dimensionLabel="Dimension"
   rows={[
     { label: 'Loop home', values: ['codex-rs/core/src/codex_thread.rs + agent/control.rs', 'src/query.ts:241 queryLoop() (async generator)', 'docs/concepts/agent-loop.md + src/runtime.ts', 'run_agent.py · run_conversation()'] },
-    { label: 'Iteration unit', values: ['Turn / TurnContext / Goal', 'State + transition.reason tag (7 reasons)', 'pi-agent-core embedded run + 3 event streams', 'IterationBudget (default 90 + grace call)'] },
+    { label: 'Iteration unit', values: ['Turn / TurnContext / Goal', 'State + transition.reason tag (7 reasons)', 'pi-agent-core embedded run + 3 event streams', 'IterationBudget (90-step default in this snapshot + grace call)'] },
     { label: 'Stop condition', values: ['model finish + goal convergence + rollout flush', 'no tool_use in stream / stopHooks.preventContinuation / maxTurns', 'lifecycle:end/error + runtime timeout', 'iteration budget exhausted → inject summary prompt'] },
     { label: 'Default verifier', values: ['run tests / apply_patch check / goals.rs', 'TOKEN_BUDGET 90% threshold + stopHooks blockingErrors', 'before/after_tool_call hooks + skill policy', 'skill insights + memory commit (deferred)'] },
     { label: 'Resumability', values: ['rollout event log → resume_agent_from_rollout', 'contextCollapse commit log + autocompact summary boundary', 'explicit SessionManager lifecycle', 'trajectory_compressor + memory_manager'] },
-    { label: 'Concurrency', values: ['agent/control.rs supports multi-agent + sub-agents', 'TaskType 7 variants + queryTracking.depth chain', 'per-session lane + global lane', 'parent 90 / child 50 steps, sub-agent isolation'] },
+    { label: 'Concurrency', values: ['agent/control.rs supports multi-agent + sub-agents', 'TaskType 7 variants + queryTracking.depth chain', 'per-session lane + global lane', 'snapshot defaults: parent 90 / child 50 steps, sub-agent isolation'] },
   ]}
   caption="Same loop, four engineering trade-offs"
 />
@@ -71,13 +62,13 @@ At the bottom is **Turn**: one "model speaks → tool runs → model speaks agai
 
 Above Turn is **Goal**: long-cycle task target (e.g. "fix this bug" might span dozens of Turns), implemented via `apply_goal_resume_runtime_effects` and `continue_active_goal_if_idle` for "resume by goal" rather than "resume by last conversation" (if last crash was mid-Turn, recovery doesn't need to resume from that Turn but from "this Goal's last stable state", clearer logic).
 
-This 4-layer abstraction is Codex's deepest engineering distinction from the other three.
+This four-layer split is one of the more recognisable choices in the pinned Codex snapshot.
 
-**Verifier design**: Codex does not trust the model's own claims. The model saying "I'm done" doesn't count; there must be external hard verification. `goals.rs` maintains each Goal's convergence state (which sub-goals are touched, which aren't); each Turn's end checks once whether all Goals are reached. `apply_patch` does grammar validation on model-generated patches (wrong grammar means refusal, forcing the model to rewrite); `run tests` looks at test exit codes (0 means pass, non-0 means feed back error and let the model continue fixing); `execpolicy` reviews each shell command using Starlark DSL rules (commands not on whitelist are directly refused). Four hard verifiers in series leave the model almost no room to "pretend it's done". The cost is that this only works in coding scenarios. Let Codex write a PRD or do research and all four verifiers fall silent (no tests to run, no patch to apply).
+**Reviewable signals**: Codex does not use model self-assessment as the only source of truth, but its signals live at different layers. `goals.rs` tracks Goal budget and runtime state; it does not prove business completion. `apply_patch` rejects malformed or stale patches. A host-configured test command can contribute an exit-code signal. `execpolicy` reviews shell commands; it constrains actions rather than judging task completion. A host can combine the applicable signals into a coding workflow gate, but the snapshot does not show them wired in series by default, and weak tests can still allow false completion. PRDs and research need source, structure, or human review instead.
 
 **Persistence design**: every step writes events via `flush_rollout()` to the rollout JSONL file; this file is the loop's "physical timeline". Machine restart? Read rollout to rebuild state. User wants to see agent history? Replay rollout. Want behavioural analysis? Aggregate multiple rollouts. `resume_agent_from_rollout` (in `agent/control.rs`) is the entry for resuming from any rollout file. Multi-agent communication runs through the same mechanism: `send_inter_agent_communication` writes inter-subagent messages into rollout too, so subagents can be spawned / interrupted / shut down like independent processes. The parent agent observes rollout to know what subagents are doing, with no extra IPC mechanism.
 
-> Codex has the deepest loop engineering of the four, but this depth has a specific cost: all abstractions are designed around coding scenarios (Turn / Goal / patch / tests), making cross-scenario reuse difficult.
+> Codex exposes more loop state than the other pinned snapshots in this comparison. Its Turn, Goal, patch, and test abstractions are coding-specific, so reuse outside that domain still needs evaluation.
 
 ### Claude Code · Models all "why is the loop iterating again" reasons explicitly as transition tags, external analyzers can see at a glance
 
@@ -111,11 +102,11 @@ There are 7 reasons total: `reactive_compact_retry` (must rerun this iteration a
 
 These 7 tags are the loop's "black box": anytime you open a rollout, the transition sequence shows you precisely why the loop didn't exit / why it retried / why it compressed.
 
-**4 context-compression pipelines**: Claude Code doesn't trust "single compression strategy", splitting compression into 4 independent steps run in order (each tier independently judges whether to trigger). Step 1 `applyToolResultBudget` trims tool return values per-tool cap (e.g. Read returns a 10MB file, trim to 2000 lines); cheap but removes most waste. Step 2 `snipCompact` plus `microcompact` does local trimming (identifying obviously redundant message snippets and deleting in place); still cheap. Step 3 `contextCollapse` folds confirmed history fragments into "view references" placed in collapse store, with the REPL main array only keeping view handles instead of full content; this step starts to get expensive but greatly reduces context size. Step 4 `autocompact`: across threshold, fork an independent agent to summarise the entire history; most expensive but most effective. The first two steps are cheap (local LLM or pure string processing), the last two expensive (forked full agent for full-text summary). Any tier failing 3 times consecutively trips the circuit breaker (`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3`); the code comment directly cites production data: "1,279 sessions had 50+ consecutive failures (up to 3,272) in a single session, wasting ~250K API calls/day globally". Without the breaker, OOM state would waste a failed compression API call every iteration.
+**4 context-compression pipelines**: Claude Code doesn't trust "single compression strategy", splitting compression into 4 independent steps run in order (each tier independently judges whether to trigger). Step 1 `applyToolResultBudget` trims tool return values per-tool cap (e.g. Read returns a 10MB file, trim to 2000 lines); cheap but removes most waste. Step 2 `snipCompact` plus `microcompact` does local trimming (identifying obviously redundant message snippets and deleting in place); still cheap. Step 3 `contextCollapse` folds confirmed history fragments into "view references" placed in collapse store, with the REPL main array only keeping view handles instead of full content; this step starts to get expensive but greatly reduces context size. Step 4 `autocompact`: across threshold, fork an independent agent to summarise the entire history; usually the costliest step; its effect on retention and task quality needs evaluation on a fixed task set. The first two steps are cheap (local LLM or pure string processing), the last two expensive (forked full agent for full-text summary). Any tier failing 3 times consecutively trips the circuit breaker (`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3`); the code comment directly cites production data: "1,279 sessions had 50+ consecutive failures (up to 3,272) in a single session, wasting ~250K API calls/day globally". Without the breaker, OOM state would waste a failed compression API call every iteration.
 
 **Loop exit conditions**: Claude Code uses 3 signals to judge whether to exit. The first is "no tool_use block in the stream". Line 557's comment directly states `stop_reason === 'tool_use'` is unreliable (model sometimes has stop_reason as something else but actually produced tool_use), so the code counts blocks itself rather than trusting stop_reason. The second is `handleStopHooks` (line 1267) returning `preventContinuation: true`: stop hook can force-block the loop's exit, or inject `blockingErrors` that loop back so the model sees them and continues (e.g. lint still has errors so don't allow exit). The third is `maxTurns` hard cap (line 1705), preventing the model from infinite looping.
 
-**TOKEN_BUDGET soft verifier** (`query/tokenBudget.ts`): beyond hard exit conditions, there's a soft exit mechanism. Below 90% of budget, every turn nudges the model to continue; after 3 consecutive continues that each added under 500 tokens, the loop judges this as diminishing returns and proactively stops. The verifier becomes a "token-convergence-driven budget gatekeeper": if the model has gotten so verbose each iteration adds only 500 tokens of info, the task is effectively done, and continuing only wastes tokens.
+**TOKEN_BUDGET soft verifier** (`query/tokenBudget.ts`): beyond hard exit conditions, there's a soft exit mechanism. Below 90% of budget, each turn nudges the model to continue; after 3 consecutive continues that each add under 500 tokens, the source marks diminishing returns and stops. That is a resource signal, not proof that the task is complete; pair it with tests, goal state, or human review.
 
 **Multi-agent model**: `Task.ts` enumerates 7 `TaskType`: `local_bash` (local bash call), `local_agent` (local agent subtask), `remote_agent` (remote agent call), `in_process_teammate` (same-process collaboration agent), `local_workflow` (local workflow), `monitor_mcp` (MCP monitor agent), `dream` (proactive thinking while sleeping). `queryTracking { chainId, depth }` (line 347) tracks the subagent call chain, ensuring subagents can't infinitely nest.
 
@@ -133,7 +124,7 @@ A user sends a message in Telegram, the agent runs for 30 seconds; during that t
 
 This design makes the loop a "first-class background resource" rather than "one function call", a natural fit for multi-channel / multi-user scenarios.
 
-OpenClaw is the only one of the four with the entire loop officially documented (`docs/concepts/agent-loop.md` lines 18-148), letting team members read docs to understand the loop (without reading source).
+Among these four snapshots, OpenClaw is the one that publishes the whole loop as a document (`docs/concepts/agent-loop.md` lines 18-148). The document gives the boundary first; source is still needed to verify implementation details.
 
 This is because OpenClaw is open source and needs to let external developers quickly understand the loop. The 5-step pipeline:
 
@@ -143,19 +134,15 @@ This is because OpenClaw is open source and needs to let external developers qui
 4. **`subscribeEmbeddedPiSession`**: bridges internal events produced by pi-agent-core to 3 external streams: `assistant` (model speaks) / `tool` (tool calls) / `lifecycle` (session state changes). External consumers subscribing to these three streams can fully observe loop state.
 5. **`agent.wait`**: blocks on `lifecycle: end | error` events, either getting the final result or getting the error.
 
-**Verifier design**: OpenClaw goes the "verifier completely middleware-driven" route. A dozen plugin hooks (`before_tool_call` / `after_tool_call` / `tool_result_persist` / `tool_loop_detection` etc.) make the verifier not hardcoded into the loop but registered as pluggable middleware. E.g. want to add an "PR must have reviewer to merge" verifier to a corporate agent? Write a plugin hook registered to after_tool_call, no need to modify loop source. This design is the root reason OpenClaw is the most fork-friendly.
+**Verifier design**: OpenClaw uses middleware. A dozen hooks (`before_tool_call` / `after_tool_call` / `tool_result_persist` / `tool_loop_detection` etc.) keep verifier logic outside the main loop. A rule such as "a PR needs a reviewer before merge" can live in a hook; the trade-off is a longer path to debug.
 
 **Session lane design**: multiple runs within the same session are forced to serialise (won't run concurrently), avoiding races on tool state / history messages. E.g. user sends 3 consecutive messages, OpenClaw processes them serially in send order (rather than running 3 loops simultaneously fighting for the same conversation history). Codex and Hermes don't do this explicitly (default assumes single-user single-session), so concurrent scenarios are prone to issues.
 
-### Hermes · Simplest main loop but stuffed with everything a long-running agent needs, spreading verifier across the time axis
+### Hermes · Budget, memory, and checkpoints around a simple loop
 
-Hermes' starting point on agent loop is: long-running agents (a day, a week, a month) and short-running agents (one session) are completely different species.
+The Hermes snapshot connects cross-session memory, self-evaluation, and skill feedback before and after a run. That lets later runs read earlier feedback; source structure alone does not show that task quality improves over time.
 
-Short-running agents pursue "this single task must be done right" (so need strong verifiers), long-running agents pursue "accumulate improvement across sessions" (so need memory + self-grading + skill self-learning).
-
-Under this judgement, single loops don't need to be written complex, verifiers don't need to be hard-blocked. Single-loop crashes are OK; next run will be smarter due to memory.
-
-Forcing hard verifiers makes the agent too rigid to handle long-running scenario diversity.
+The main loop has no built-in `run tests`-style completion gate. That avoids forcing one oracle onto an open-ended assistant, but CI, deployment, and other high-risk work still need host-provided acceptance checks. Recovery also depends on checkpoint contents, tool idempotency, and side-effect logs.
 
 The main loop (`run_agent.py:9333`) is a traditional while loop:
 
@@ -166,15 +153,15 @@ while (api_call_count < self.max_iterations
 
 This single while line is followed by everything a long-running agent needs:
 
-**IterationBudget design**: parent agent defaults to 90 steps, sub-agent to 50 (sub-agent intentionally shorter than parent, preventing sub-agent from running too many steps wasting parent's budget). On exhaustion, instead of directly exiting, it gives the model one "grace call" to say a last word (giving the model a chance to summarise current progress rather than interrupting mid-stream). Even after a grace call is insufficient, it enters `_handle_max_iterations()` stripping all tools and asking the model to do a final summary (stripping tools forces the model not to attempt new actions, focus on summary). This "soft fallback" is Hermes' design for loop convergence: not a forced kill, but graceful exit guidance.
+**IterationBudget design**: in the pinned snapshot, the parent defaults to 90 steps and a subagent to 50. Exhaustion triggers one grace call to summarise progress; `_handle_max_iterations()` then removes tools and asks for a final response. This is a resource backstop, not proof of convergence. Recalibrate the limits for the model, tool cost, and workload.
 
-**Memory front-loading**: Hermes calls `_memory_manager.prefetch_all()` once before the loop starts, prefetching all of the current user's long-term memory (preferences, past tasks, person relationships etc.) into RAM at once. This way all memory queries during the entire loop read from RAM, saving N RAG-call latencies. This "batch prefetch instead of on-demand query" design is specially optimised for long-running agents. A single session might use memory 50 times; if each query goes live, that's 50 LLM embeddings + vector DB queries. Prefetch once and cache for the whole loop, and this latency drops to zero.
+**Memory front-loading**: Hermes calls `_memory_manager.prefetch_all()` before the loop and loads long-term memory into RAM. This may reduce repeated retrieval during the run, with trade-offs in initial load, freshness, and irrelevant-memory contamination. Query count, latency, and hit quality require session telemetry; they cannot be inferred as "zero latency" from the call site.
 
-**Verifier design**: Hermes intentionally has no `run tests`-style hard verifier. Self-evaluation lives in two places: `agent/insights.py` calls one LLM after loop ends to evaluate "how did this run go" (4-5 dimensions of scores + improvement suggestions), writing the result to memory; skills' `manual_compression_feedback` allows skills to define their own "success criteria" (e.g. cron skill sees whether the task actually triggered after running). Loop ends and writes back to memory, next similar task prefetch will inject these experiences. The verifier is **spread across the time axis**: single loop is not strict, but every run is better than the last.
+**Verifier design**: Hermes has no `run tests`-style hard verifier in this loop. `agent/insights.py` evaluates a completed run and writes feedback to memory; `manual_compression_feedback` lets a skill provide its own signal. A later run can read that feedback, but improvement is a hypothesis to test with repeated tasks, controls, and regression cases, including memory contamination.
 
-**Interrupt + Checkpoint design**: every turn starts with `checkpoint_mgr.new_turn()` creating a checkpoint, and the entire loop checks the `_interrupt_requested` flag. Long-running agents can therefore return to the last checkpoint after being interrupted (no need to rerun from scratch). This is essential for long-running scenarios: an agent that has run for 3 hours interrupted halfway can only restart from zero without checkpoints.
+**Interrupt + Checkpoint design**: each turn starts with `checkpoint_mgr.new_turn()`, and the loop checks `_interrupt_requested`. The source shows a recorded turn boundary. Whether recovery avoids repeated external side effects depends on the checkpoint payload and should be tested with injected failures.
 
-> Hermes' loop philosophy in one sentence: it's OK if a single loop runs short, cross-session accumulation is the real output. Same user a month later, Hermes is much smarter than day one because memory keeps accumulating, skills keep getting triggered, insights keep being written back.
+> The source confirms that Hermes stores feedback and makes it available to later runs. Month-over-month success, memory contamination, and regression remain measurements to collect.
 
 ## Five places where loops usually break
 
@@ -185,7 +172,7 @@ All five source comparisons remain here. On a first read, scan the labels and co
 
 ### Four prompt-assembly implementations
 
-The system prompt is a hyperparameter to the loop. Same model, different prompt, different loop behavior. Look at any production agent and the prompt has roughly 7 layers stacked into one big string:
+The system prompt changes how a model interprets tools and constraints, but the effect size needs a fixed-model task evaluation. For comparison, the four snapshots below are mapped onto seven information categories; this is not a required layer count for production agents.
 
 <Diagram src="/diagrams/02-prompt-layers.svg" alt="7 common layers in an agent system prompt" caption="Same backbone in all four systems; the difference is how many files, what enters the cache, and who can override." />
 
@@ -447,7 +434,7 @@ range of tasks including answering questions, writing and editing code...
 
 </SourceBlock>
 
-**Takeaway**: the four systems sit on a continuous spectrum from cache-friendly to flexible. Codex picks the most stable end (changing a prompt = one git commit). Hermes picks the most flexible end (users overwrite `SOUL.md` directly). Claude Code picks the hardest middle path: explicit cache boundary + 5-tier priority. OpenClaw approximates "main agent / subagent / minimal" with three `PromptMode` presets.
+**Takeaway**: the four systems sit on a continuous spectrum from cache-friendly to flexible. Codex keeps prompt changes in versioned files; Hermes lets users overwrite `SOUL.md`; Claude Code exposes an explicit cache boundary and priority layers; OpenClaw uses three `PromptMode` presets. These are different maintenance choices, not a stability ranking.
 
 ---
 
@@ -458,7 +445,7 @@ range of tasks including answering questions, writing and editing code...
 
 ### Four context-compaction implementations
 
-All four agents run long. All four eventually hit the context window. The interesting differences live in "when to compact, what to compact, who runs the summary."
+The four snapshots include long-running paths, and any task that approaches a provider limit needs a capacity strategy. The useful differences are "when to compact, what to compact, and who runs the summary."
 
 <Diagram src="/diagrams/02-compression-decisions.svg" alt="4 core decisions for context compaction" caption="Every agent has to answer these four questions; different answers produce different systems." />
 
@@ -610,7 +597,7 @@ Pre-compact can also fire a silent memory flush turn that pushes durable notes i
 
 `identifierPolicy: 'strict' | 'off' | 'custom'` controls whether the summary preserves opaque IDs (issue numbers, commit hashes). Compaction itself becomes a target for external rules.
 
-**Takeaway**: on the compaction target axis, the four systems pick whole history (Codex), 4-stage pipeline (Claude Code), two-layer split (OpenClaw), mid-history with head+tail protection (Hermes). On the summarizer axis: main model, forked agent, configurable separate model, mandatory cheap aux. Two details worth copying into any production agent: Hermes's `SUMMARY_PREFIX` (prevents prompt injection from the summary itself) and Claude Code's circuit-breaker + threshold ladder.
+**Takeaway**: the four snapshots compact different material and use different summarizers. Hermes's `SUMMARY_PREFIX` marks a summary as non-instructional, while Claude Code adds a circuit breaker and threshold ladder. Whether either choice reduces injection or retry failures requires adversarial samples and run logs.
 
 ---
 
@@ -697,7 +684,7 @@ OpenClaw's `before_tool_call` / `after_tool_call` / `tool_result_persist` hooks 
 
 Permission denials, rule violations, retry counters all attach to different hooks. The cost of middleware-style verifier: long debug chains. You need `--trace` to follow what happened.
 
-**Takeaway**: each system's recovery approach maps to a different use case. Codex's replay-event-stream gives the most reliable recovery path but pays a disk-IO cost. Claude Code's 7 transition tags expose retry reasons directly to observers, but adding custom recovery logic means forking. Hermes splits short-term checkpoint and long-term memory into two timescales, ideal for long-running sessions that accumulate know-how. OpenClaw's hook-frame abstraction lets you bolt on recovery policy without touching the core, at the cost of writing that policy yourself.
+**Takeaway**: each recovery approach maps to a different use case. Codex's replay event stream supports reconstruction and audit of recorded state, while recovery fidelity still depends on flush/fsync, external side effects, and schema compatibility, and it adds disk IO and storage. Claude Code's 7 transition tags expose retry reasons directly to observers, but adding custom recovery logic means forking. Hermes separates short-term checkpoints from long-term memory, which fits tasks that need cross-session experience but gives up step-by-step replay. OpenClaw's hook-frame abstraction lets you add recovery policy without touching the core, at the cost of defining and testing that policy yourself.
 
 ---
 
@@ -770,12 +757,12 @@ Tools default to serial because the trajectory model assumes a single time axis.
 
 The stop decision drives loop output quality. Stop too early and the task is unfinished. Stop too late and tokens burn or the loop spins forever. The four systems implement three verifier shapes.
 
-<Diagram src="/diagrams/02-verifier-types.svg" alt="3 verifier shapes" caption="Hard (external rules) / soft (budget + heuristic) / give-up (model self-stop). Production wants at least hard + soft; give-up is fallback only." />
+<Diagram src="/diagrams/02-verifier-types.svg" alt="3 verifier shapes" caption="Hard checks provide external completion evidence; soft checks manage budgets and repetition; model self-stop is only a runtime signal. High-risk workflows usually also need a resource cap, while soft checks remain task-dependent." />
 
 <CompareTable
   rows={[
     { label: 'Hard verifier', values: ['`goals.rs` convergence + `apply_patch` validation + `run tests` exit code + `execpolicy`', 'None (query.ts has no plugin hook for verifiers)', 'Plugin hooks: `before_tool_call` / `after_tool_call` / `tool_result_persist`, attach anywhere', 'No structured hard verifier; skills decide for themselves'] },
-    { label: 'Soft verifier', values: ['Backoff retry cap + iteration cap', '`TOKEN_BUDGET` 90% threshold nudge + 3 consecutive < 500-token deltas trigger diminishing returns stop', '`compaction-safeguard` + safety-timeout', 'IterationBudget 90/50 + grace call + cooldown'] },
+    { label: 'Soft verifier', values: ['Backoff retry cap + iteration cap', '`TOKEN_BUDGET` snapshot uses 90% plus 3 consecutive < 500-token deltas', '`compaction-safeguard` + safety-timeout', 'snapshot IterationBudget 90/50 + grace call + cooldown'] },
     { label: 'Give-up verifier', values: ['Model `output_type: completed` event', 'No `tool_use` block in the stream', 'lifecycle:end', 'Model emits no tool_call → considered done'] },
     { label: 'Hard ceiling', values: ['Turn count + backend ratelimit', 'maxTurns (default high)', 'runtime timeout', 'iteration_budget exhaustion → grace call → forced summary'] },
   ]}
@@ -791,16 +778,16 @@ Claude Code has no plugin hook for an external hard verifier. Forcing the loop t
 
 The `stopHooks` system supports the reverse direction (forbid the model from self-stopping) but not "must pass this external check first."
 
-#### Codex · Hard verifier all the way down
+#### Codex · Feed reviewable signals into the event loop
 
-Codex makes "task done" a machine-checkable condition. Four hard verifiers chain together:
+The Codex snapshot feeds several state signals into the event loop; which ones form a completion gate depends on the host workflow:
 
 - `apply_patch` requires a valid patch (multi-version diff merge algorithm).
-- `run tests` runs the user's configured command; non-zero exit = not done.
+- `run tests` can run a user-configured command; a non-zero exit is a failure signal.
 - `execpolicy` reviews every command execution against the policy (allow / ask / deny).
 - `goals.rs` periodically checks whether the goal's done predicate is satisfied.
 
-Chained together, the loop doesn't stop easily. The trade-off: this only works for coding. Asking the loop to "write a PRD" or "do research" leaves all four hard verifiers idle.
+Together these signals reduce unsupported self-stops, but they do not prove business completion. They fit coding workloads with tests, patches, or goal state; PRD and research tasks need different reviewable completion evidence.
 
 #### OpenClaw · Verifier as middleware
 
@@ -815,33 +802,33 @@ Add `safety-timeout` and `compaction-safeguard` and the loop exit becomes a conj
 
 #### Hermes · Verifier spread across the timeline
 
-Hermes runs 90 iterations per loop (50 for subagents), then a forced grace call, summary, stop. Judging "did this loop run correctly" doesn't happen at loop end. Instead:
+In the pinned Hermes snapshot, the parent loop budget is 90 steps and the subagent budget is 50; exhaustion enters a grace call and summary. Judging "did this loop run correctly" does not happen at loop end. Instead:
 
 1. `agent/insights.py` runs self-evaluation.
 2. The evaluation is written into `memory`.
 3. Next similar task, `memory_manager.prefetch_all()` injects "how the previous attempt went well or badly" up front.
 
-Hermes's verifier is not a per-loop gate but a cross-session accumulator. Loose in the short term, convergent over time.
+Hermes writes feedback to cross-session memory rather than using it as a per-loop completion gate. Later runs can read that history, but improvement and contamination both need measurement.
 
-**Takeaway**: each system covers a different verifier region. Codex chains four hard verifiers so the loop earns external trust, but the design only fires for coding. OpenClaw abstracts the hard verifier into hooks, letting external code attach any check. Claude Code leans on `TOKEN_BUDGET` soft nudge to save tokens. Hermes spreads verification across cross-session memory accumulation. Building your own agent, all three tiers earn their keep: hard verifier for trust, soft verifier for token control, give-up verifier as fallback.
+**Takeaway**: each system exposes different evidence. Codex has patch, test, policy, and Goal signals; OpenClaw exposes hooks; Claude Code uses `TOKEN_BUDGET` to manage continuation; Hermes writes feedback into cross-session memory. Start from the task's failure cost, then decide which external checks, resource limits, and fallback signals belong in the completion gate.
 
 ---
 
 </details>
 
-## What production loops already agree on
+## Fields every recovery record needs
 
-The four systems share four obvious common understandings on Agent Loop design. These are engineering bottom lines that all production agents should follow:
+The four systems share four observable constraints in Agent Loop design. They are useful checks for your own implementation:
 
-**First, an agent must be a multi-step state machine, not single-turn Q&A**: all four understand that "user asks one round / agent answers one round" only works for FAQ scenarios; real tasks (fixing a bug, researching a topic, building a prototype) absolutely require the agent to take multiple actions (observe state → plan steps → act → verify result) before the goal is reached. Without multi-step state machines you have a chatbot, not an agent.
+**First, decide whether the task needs multi-step state**: bug fixes, cross-source research, and prototypes often require repeated observation and action. A single retrieval or deterministic tool call may not need a full loop. State-machine complexity should follow the task path and recovery requirements, not the product label.
 
-**Second, Observe → Plan → Act → Verify must be embedded in the core loop**: all four run this same minimal four-step cycle, differing only in implementation (Codex's Observe is the rollout event stream; Claude Code's Plan is explicitly modeled via transition.reason; OpenClaw's Act is middleware-driven via plugin pipeline; Hermes' Verify is spread across the time axis via insights). Understanding this four-step cycle means understanding the skeleton of all agent systems.
+**Second, use Observe → Plan → Act → Verify to find missing state**: this is a shared lens for reading the implementations, not a requirement for four named modules. Codex exposes rollout events, Claude Code records transition reasons, OpenClaw routes tools through hooks, and Hermes writes post-run insights.
 
-**Third, must have a verifier as backstop for "model confidence ≠ ground truth"**: none of the four allow the loop to entirely depend on model self-evaluation to decide whether to stop. See chapter 05 for the three-tier verifier (hard / soft / lazy) design. A production-grade agent must have all three; missing one tier means failure.
+**Third, leave room for a verifier when "model confidence ≠ ground truth"**: none of the four lets the loop rely only on self-evaluation. See chapter 05 for the three tiers. High-risk workflows need at least an externally checkable completion signal and a hard resource cap; whether to add a soft verifier depends on the task.
 
-**Fourth, must have explicit termination conditions (max_steps / token_budget / goal_done)**: all four design multiple termination conditions to prevent infinite looping. Codex uses turn count + goal convergence + rollout flush; Claude Code uses maxTurns + stop_hook + token_budget; OpenClaw uses lifecycle:end/error + runtime timeout; Hermes uses IterationBudget exhaustion + grace call. Any agent without termination conditions will eventually burn through quota.
+**Fourth, configure termination conditions (max_steps / token_budget / goal_done)**: each snapshot exposes some stop or budget signal. If an execution path has no reachable stop, repeated calls and uncontrolled cost become much more likely. Production tests should record the stop reason and prove that each limit fires under failure.
 
-## Choose by completion signal
+## Tie recovery to the side-effect boundary
 
 <Diagram
   src="/diagrams/02-tradeoff.svg"
@@ -851,30 +838,26 @@ The four systems share four obvious common understandings on Agent Loop design. 
 
 The four systems represent four typical trade-offs in Agent Loop design.
 
-**If you're building a coding agent and tasks are machine-verifiable (exit code / tests / patch grammar)**: borrow from Codex's submit / event / turn / goal four-tier event machine route. Every step writes to disk for replay; 4 hard verifiers in series make the loop completely independent of model self-evaluation; rollout physical recoverability lets any interruption resume cleanly. The cost is this strict constraint only works in coding scenarios. Outside coding the 4 verifiers all fall silent.
+**If you're building a coding agent and tasks expose exit codes, tests, or patch grammar**: study Codex's submit / event / turn / goal state machine and rollout persistence. Then state which signals block completion and which only record runtime state. This reduces reliance on model self-assessment, but test coverage and business acceptance remain separate design problems.
 
-**If you're building IDE tools / desktop agents / scenarios needing strong observability**: borrow from Claude Code's transition.reason tags + 4 compression pipelines + TOKEN_BUDGET soft verifier route. Modeling all "why is the loop still running" reasons explicitly as tags lets any external observer see at a glance from rollout what the loop was doing; 4 compression pipelines + 3-time circuit breaker prevents OOM state from burning quota; TOKEN_BUDGET soft verifier makes "judging stop by token convergence rate" a 60-line algorithm, universal across scenarios. The cost is query.ts at 1729 lines coupling all paths together with no plugin hooks. Customising means forking.
+**If you're building IDE tools / desktop agents / scenarios needing strong observability**: borrow the `transition.reason` tags, 4 compression pipelines, and `TOKEN_BUDGET` soft-verifier route as a reference. Explicit reasons make rollouts easier to inspect; the soft verifier is a heuristic for workloads without an external oracle, so validate it after changing the model or task mix. The cost is `query.ts` at 1729 lines coupling all paths together with no plugin hooks; customisation carries fork or wrapper maintenance.
 
-**If you're building a control plane / multi-channel agent server / multi-user concurrent scenario**: borrow from OpenClaw's RPC background-job + session lane + plugin hooks route. Loop as "observable background job" rather than "function call" makes Telegram / Slack / Web multi-channel naturally fit; session lane serialises multiple runs in same session solving concurrent lock-grabbing; a dozen plugin hooks make verifier / audit / cache all middleware-driven, fork-friendliness highest. The cost is more hooks make debugging chains longer (a tool call passes through 5-6 layers of middleware, hard to locate issues), no built-in coding verifier.
+**If you're building a control plane / multi-channel agent server / multi-user concurrent scenario**: borrow OpenClaw's RPC background job, session lane, and plugin hooks. The job model supports multi-channel subscriptions, and the lane serialises runs within one session. Extensibility comes from hooks, with the matching cost of longer debugging paths and no built-in coding verifier.
 
-**If you're building a long-running assistant / cross-session learning scenario**: borrow from Hermes' IterationBudget + memory prefetch + insights self-evaluation route. Per-loop is lax (single loop running shorter is OK) but cross-session converges (memory accumulation makes next run smarter); grace call backstop lets budget exhaustion exit gracefully rather than hard-killed; insights spreads verifier across the time axis letting the agent improve cross-session. The cost is no structured hard verifier strongly relying on skill self-eval; large trajectories let compaction shift loop behavior over time (same trajectory observed at different times may have different compression levels).
+**If you're building a long-running assistant with cross-session feedback**: evaluate Hermes' IterationBudget, memory prefetch, and insights path. The grace call handles budget exhaustion and later runs can read recorded feedback. The gaps are equally concrete: there is no structured hard gate, and feedback benefit, memory contamination, and post-compaction regression need repeated-task evaluation.
 
-## My take: recovery before cleverness
+## Recovery depends on replayable side effects
 
-<ScoreCard
-  headers={['System', 'Score', 'Why', 'Risks']}
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: 'submit/event/turn event-machine + goals.rs + rollout persistence form the most engineerable minimum closure; goal-level resume', risk: 'Tightly coupled to repo + tests; no equivalent verifier outside the coding domain' },
-    { system: 'Claude Code', value: '★★★★★', reason: 'queryLoop() models every retry/recovery/exit as a transition tag; 4 context passes + TOKEN_BUDGET soft verifier + 7 TaskType variants for multi-agent', risk: 'query.ts is 1729 lines, every path coupled; no plugin hooks for external verifier middleware; customization requires fork' },
-    { system: 'OpenClaw', value: '★★★★★', reason: 'The only system to document the loop explicitly; session lanes solve tool races; a dozen plugin hooks = verifier-as-middleware', risk: 'No built-in coding verifier; long hook chains can be hard to debug without trace tooling' },
-    { system: 'Hermes', value: '★★★★', reason: '90/50 IterationBudget + grace call + memory prefetch is the best short-loop / long-term-memory coupling I have seen', risk: 'No structured verifier; leans on skill self-eval. Large trajectories let compaction shift loop behavior over time.' },
-  ]}
-  caption="Every score must come with evidence and risk. No naked stars."
-/>
+| Interruption or side-effect constraint | Route to borrow | Cost or unresolved boundary |
+| --- | --- | --- |
+| Only idempotent reads; restarting is acceptable | Messages plus a file snapshot | Cannot tell whether a tool ran before its result was logged |
+| Coding work needs replay and verifier state | Codex rollout plus checkpoints | Requires repository, test, and idempotency-key discipline |
+| Many channels need subscription, pause, and resume | OpenClaw run IDs and lifecycle events | Observability does not prove side-effect recovery |
+| Cross-context handoff matters more than single-turn speed | Anthropic progress files and git handoff | The next step and feature state must be explicit |
 
-## Build the smallest recoverable loop
+## Start with a replayable loop
 
-Below is the engineering recipe distilled from the four agent systems for "writing your own Agent Loop". Get the minimum viable version running first, then gradually add production-grade features, and finally avoid four common dead ends.
+When building an Agent Loop, make one observe-act-stop cycle recordable and replayable first. Add compaction, concurrency, and pluggable verifiers after that path is testable.
 
 <BuildRecipe
   title="Build Recipe"
@@ -889,15 +872,15 @@ Below is the engineering recipe distilled from the four agent systems for "writi
   ]}
   advanced={[
     'Session-aware: extract loop state into a serializable object (messages + tool history + verifier state), supporting save / load / fork / archive mid-flight; recovery does not need full re-run',
-    'Rollout / trajectory log (event-sourcing pattern): each step writes a JSON event to disk; loop state can be fully rebuilt from the event stream. Copying Codex on this single point is the most worthwhile move.',
-    'Pluggable verifiers: make tests / lint / type-check / human approval all registerable middleware (borrow from OpenClaw\'s tool-policy-pipeline); production agents must allow attaching custom verifiers',
-    'In-loop token / cost budget enforcement: borrow from Claude Code\'s TOKEN_BUDGET algorithm (90% threshold + 3 rounds of low increment = diminishing returns), avoiding OOM state burning through API quota',
+    'Rollout / trajectory log: write key inputs, tool outcomes, and stop reasons as JSON events. Full recovery still depends on external side effects, checkpoint payloads, and idempotency keys.',
+    'Pluggable verifiers: when a task has several external acceptance signals, tests / lint / type-check / human approval can be registerable middleware. A simple low-risk workflow need not begin with a generic plugin framework.',
+    'In-loop token / cost budget enforcement: use Claude Code\'s TOKEN_BUDGET algorithm (90% threshold + 3 rounds of low increment = diminishing returns) as a starting heuristic, then calibrate with your own run logs to keep OOM states from burning through API quota',
   ]}
   avoid={[
-    'Infinite loops (no hard stop condition): one day the model will get stuck in a dead loop (repeating same tool call / retrying same error indefinitely); without a hard cap it burns your quota; max_steps must be the first line of code you write',
-    'Letting model self-rate as the sole verifier: the model often claims completion before actually completing the task (hallucination thinks it did the work); without external verifier backstop you will inevitably crash',
+    'Infinite loops (no hard stop condition): a model can get stuck repeating the same tool call or retrying the same error; without a hard cap it can keep consuming quota. Define max_steps or an equivalent stop condition early, then calibrate it against task risk',
+    'Letting model self-rate as the sole verifier: self-reports cannot replace tests, goal state, or human review; without an external signal the risk of a false completion rises',
     'Coupling loop to UI making it un-runnable headless: UI exits and loop exits, no way to run in CI / cron / API contexts without UI; separating loop core from UI is something to do from day one',
-    'Multi-agent / sub-agent parallelism on day one: multi-agent complexity is an order of magnitude higher than single-agent (IPC / state isolation / fault tolerance); get single-agent stable first then consider; Claude Code\'s 7 TaskTypes were added later, not from day one',
+    'Multi-agent / sub-agent parallelism on day one: IPC, state isolation, and fault handling add substantial complexity; stabilise one agent first, then add this layer when the workload requires it',
   ]}
 />
 
@@ -905,7 +888,7 @@ Below is the engineering recipe distilled from the four agent systems for "writi
 
 <AgentLoopSVG duration={5} caption="The minimum-viable version above, in motion" />
 
-## Follow the main loop through source
+## Source paths for the recovery protocol
 
 <SourceTrail
   title="Source map & further reading"
@@ -958,7 +941,7 @@ The outer `done` predicate is itself a design choice: Codex uses `goals.rs` conv
 The closer the exit is to the model, the more chatbot-like the loop. The closer the exit is to external state, the more compiler-like it gets.
 
 **Source**: [`codex/codex-rs/core/src/codex_thread.rs:124-330`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/codex_thread.rs#L124-L330), `claude-code/src/query.ts:241-1728`.
-**Follow-up**: "Should Observe do ETL?" Yes. All four trim tool returns, fold stderr, dedup stdout before Plan, otherwise one step blows the context.
+**Follow-up**: "Should Observe do ETL?" The four snapshots show different forms of tool-result trimming or compaction. For oversized results, fold or truncate before Plan and test the limit on the target workload; one unbounded result can exhaust the context.
 </details>
 
 <details>
@@ -968,31 +951,31 @@ Codex uses `goals.rs` for hard convergence: decompose the user prompt into goals
 
 Claude Code uses `TOKEN_BUDGET` for a soft exit: at 90% context the loop nudges "wrap up"; three replies shorter than 500 tokens triggers diminishing-returns shutdown. Works for general agents because it assumes no verifiable goal.
 
-OpenClaw exposes stop as plugin hooks (`onStop`, `shouldStop`). The host framework votes. Built-in defaults are just `max_steps` + `toolloop_detection`. Best for extensibility, weakest as a turnkey solution.
+OpenClaw exposes stop as plugin hooks (`onStop`, `shouldStop`). The host framework votes. Built-in defaults are just `max_steps` + `toolloop_detection`; this supports extensibility, but the host must supply and test the completion policy.
 
 Hermes uses `IterationBudget(90, 50)`: 90 hard, 50 soft triggers `_handle_max_iterations` (inject summary request). Works for long-running sessions because it allows a graceful self-summarizing finale.
 
-Swapping them breaks things: Codex goals on a chatbot never converge. Hermes's 90-step cap on an IDE assistant cuts off mid-file. Claude Code's TOKEN_BUDGET on a coding agent may abort before tests pass.
+Using a mechanism outside its original task contract creates risks: if open-ended chat has no definable goal predicate, Codex-style goals may fail to signal completion; a fixed 90-step cap may stop an IDE task before its file edit or verifier finishes; TOKEN_BUDGET may encourage wrap-up before tests pass. Test representative trajectories for premature stops, budget exhaustion, and final verifier state rather than assuming interchangeability.
 
 **Source**: [`codex/codex-rs/core/src/goals.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/goals.rs), `claude-code/src/query/tokenBudget.ts`, [`hermes-agent/run_agent.py:8807-8970`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/run_agent.py#L8807-L8970).
 **Follow-up**: "Could I run Hermes-long then verify with Codex goals?" Yes, `goals.rs` is pure, but you need to translate Hermes trajectory into Codex conversation format.
 </details>
 
 <details>
-<summary>**Q3 · Trade-off**: Hard verifier, soft verifier, no-op cap: why do you need all three layers?</summary>
+<summary>**Q3 · Trade-off**: What do external checks, soft heuristics, and resource caps each do?</summary>
 
 Hard verifier is a script / compiler / test the loop runs: `cargo build` exit code, `pytest` pass rate, `apply_patch` clean apply. Pros: deterministic, externally auditable. Cons: only available where you can write an oracle.
 
 Outside coding it is hard.
 
-Soft verifier is a model-readable hint, e.g. Claude Code's `TOKEN_BUDGET` nudge at 90%. Does not force a stop, but changes model behavior. Pros: works everywhere. Cons: behavior depends on how obedient the model is to the nudge.
+Soft verifier is a model-readable hint, e.g. Claude Code's `TOKEN_BUDGET` nudge at 90%. It does not force a stop, but can change model behaviour. It is useful where no external oracle exists, while its effect depends on model and workload.
 
-No-op cap is a hard ceiling: `max_iterations`, `max_tokens`, `max_tool_calls`. Decides nothing about correctness, only stops runaway loops. Every system has this layer, only the numbers differ.
+Resource caps include `max_iterations`, `max_tokens`, and `max_tool_calls`. They say nothing about correctness; they only bound runaway execution.
 
-You need all three because they cover different failure modes: hard verifier catches "wrong path", soft catches "stuck stalling", no-op catches "tool deadlock". Drop any layer and prod will file a ticket.
+They cover different failure modes, but every task does not need a ritual three-layer stack. High-risk work with a usable oracle should start with an external check and a hard cap. Add a soft heuristic when run logs show repetition or low-value continuation.
 
 **Source**: [`codex/codex-rs/execpolicy/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/execpolicy/), `claude-code/src/query/tokenBudget.ts`, [`openclaw/docs/concepts/agent-loop.md`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/docs/concepts/agent-loop.md).
-**Follow-up**: "Can hard verifier be an LLM judge?" Yes, but rename to "structured soft verifier". For production combine real-hard + LLM-judge consensus.
+**Follow-up**: "Can a hard verifier be an LLM judge?" An LLM judge can return a structured score, but the result remains probabilistic. Whether to pair it with deterministic checks or human review depends on the cost of a false decision and the available oracle.
 </details>
 
 <details>
@@ -1011,15 +994,15 @@ Swap symptoms: fork-summarise first and the fork sees uncompressed tool returns 
 <details>
 <summary>**Q5 · Recovery**: When does Codex's replay-event-stream fit, and when does Hermes's checkpoint+memory fit?</summary>
 
-Codex writes every step as append-only events (`rollout/event.rs` has 30+ event types, stored at `~/.codex/rollouts/<session_id>.json`). Recovery replays from start to rebuild turn state.
+Codex writes every step as append-only events (`rollout/event.rs` has 30+ event types, stored at `~/.codex/rollouts/<session_id>.json`). Recovery replays from start to rebuild the recorded turn state; external side effects still need idempotency or reconciliation.
 
-Pros: stable recovery; the stream also gives auditing, replay, analytics. Cons: every step writes to disk, multi-MB after a long session; non-idempotent events (timestamps) must be filtered on replay.
+Pros: replayable, reviewable recovery for recorded events; the stream also gives auditing and analytics. Cons: every step writes to disk, and long sessions can produce multi-MB files; non-idempotent events (timestamps) need filtering on replay.
 
 Hermes uses a two-layer scheme in `agent/memory_manager.py`: short-term checkpoint (recent trajectory snapshot), long-term memory (structured facts/insights). Recovery rereads memory into system prompt instead of replaying steps.
 
 Pros: cross-session memory preserved, compact state. Cons: loses fine-grained step history, no step-level replay.
 
-Codex fits "must reproduce, must audit" tasks (coding, batch processing). Hermes fits "long-running, must accumulate experience" assistants (personal agent, ops bot). If you want both, you write both, at double the disk cost.
+Codex's event stream fits tasks that need reproduction and audit; Hermes's checkpoint plus memory fits assistants that accumulate experience across sessions. If you need both, persist both kinds of state and measure the added write and storage volume in the target workload.
 
 **Source**: [`codex/codex-rs/core/src/rollout.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/rollout.rs), [`hermes-agent/agent/memory_manager.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/memory_manager.py), [`hermes-agent/agent/trajectory.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/trajectory.py).
 **Follow-up**: "Where do Claude Code and OpenClaw sit?" Claude Code exposes transition tags but requires a fork to plug in custom recovery; OpenClaw uses hook frames + plugin-decided strategies.
@@ -1075,7 +1058,7 @@ Layer 5 (env hints) rarely OOMs because it is small, unless someone shipped `pwd
 Tools: Claude Code has `--print-system-prompt`. Hermes has `_PROMPT_DUMP_PATH`. Codex has `codex --dump-prompt`. OpenClaw has the `onPromptBuild` plugin.
 
 **Source**: `claude-code/src/utils/systemPrompt.ts`, `REF/hermes-agent/agent/memory_manager.py:inject_relevant_memories()`.
-**Follow-up**: "Could layer 0 (identity) bloat?" Almost never, unless someone literally pasted the README into identity. If it grows, 9/10 it is a prompt template misuse.
+**Follow-up**: "Could layer 0 (identity) bloat?" Compare section-level token deltas between the first and second run. If identity grows materially, check duplicate template assembly, README or project-instruction injection, and dynamic fields appended each turn; estimate frequency from prompt-section logs instead of a fixed rule of thumb.
 </details>
 
 <details>
@@ -1090,24 +1073,22 @@ You can also borrow Codex's goals.rs style: list the dimensions to evaluate as N
 OpenClaw's pure plugin route is not the model. Judge agents need built-in confidence schemas; external hooks fit awkwardly.
 
 **Source**: [`hermes-agent/tools/budget_config.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/tools/budget_config.py), `claude-code/src/query.ts`, [`codex/codex-rs/core/src/goals.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/goals.rs).
-**Follow-up**: "Does the judge agent need a TOKEN_BUDGET soft exit?" Yes, but with different numbers. Judges prefer short, high-confidence replies, so set the threshold at 50% rather than 90%.
+**Follow-up**: "Does the judge agent need a TOKEN_BUDGET soft exit?" It can be worth testing, but do not copy a 50% value by default. Observe the judge workload's token curve and keep the threshold configurable and reversible.
 </details>
 
 <details>
-<summary>**Q10 · Open-ended**: One day to turn an existing chatbot into a coding agent. Which three pieces go in first?</summary>
+<summary>**Q10 · Open-ended**: Which three paths should you validate first when turning a chatbot into a coding agent?</summary>
 
-First, **tools + sandbox** (4-6 hours). Implement `read_file` / `apply_patch` / `run_shell` running inside docker or an ssh child process. Without this it is still a chatbot.
+First validate a **restricted tool path**. Implement the smallest `read_file`, `apply_patch`, and `run_shell` surface inside a deliberately configured isolation boundary. Use one read-only task and one reversible edit to test permissions, paths, and error propagation.
 
-Second, **a hard verifier** (2 hours). Pick one binary signal, typically `cargo build` or `pytest`, and hook it at end of turn. Without it the loop edits files forever and says "done".
+Next attach **one external completion signal**. Choose `cargo build`, `pytest`, or a check closer to the repository's actual contract. Record what the loop does when the check fails and where weak coverage can still permit false completion.
 
-Third, **a stop condition + event stream** (2 hours). Borrow from Codex's `submit/next_event/turn`. Write every step as a JSON event. Stop predicate: `goal_satisfied || max_iterations || verifier_failed_3_times`.
+Then validate **termination and event records**. Emit structured model, tool, verifier, and stop-reason events. Exercise timeout, repeated failure, and user interruption so every exit path is observed. Tune thresholds from run data instead of assuming a fixed schedule or retry count.
 
-Without this debugging is misery.
-
-Subagents, memory, multi-channel entry can wait until next week. Priority zero is a small **system prompt rewrite**, usually 30 min, before tools land.
+Whether subagents, memory, or multiple channels belong in the next stage should follow failures in that minimum path. Test the system prompt with the tool schema and target model; it is not an isolated copywriting task with a universal estimate.
 
 **Source**: borrow from Codex's `apply_patch`, Claude Code's `dispatchToolUseBlocks`, OpenClaw's `agent-loop.md` for skeleton.
-**Follow-up**: "How risky is running shell on the host instead of a sandbox?" Very. Even with `--dry-run` for the first two days, you are one mis-parsed variable away from `rm -rf $HOME`.
+**Follow-up**: "How risky is running shell on the host instead of a sandbox?" It depends on command privileges, mounts, credentials, and network egress. `--dry-run` does not cover parser differences or indirect side effects; test hostile and misparsed inputs in isolation before widening access.
 </details>
 
 </details>

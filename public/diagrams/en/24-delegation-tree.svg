@@ -26,7 +26,7 @@
     <line x1="330" y1="136" x2="330" y2="200" stroke="#b45309" stroke-width="1.8" marker-end="url(#ar24t)" />
     
     <rect x="360" y="210" width="180" height="60" rx="8" fill="#fef9c3" stroke="#1e293b" stroke-width="1.5" />
-    <foreignObject x="370" y="216" width="160" height="30"><p xmlns="http://www.w3.org/1999/xhtml" style="font:700 10.5px sans-serif;color:#1e293b;margin:0;line-height:1.25">steps fixed & known</p></foreignObject>
+    <foreignObject x="370" y="216" width="160" height="30"><p xmlns="http://www.w3.org/1999/xhtml" style="font:700 10.5px sans-serif;color:#1e293b;margin:0;line-height:1.25">steps fixed &amp; known</p></foreignObject>
     <text x="450" y="262" class="t-s" text-anchor="middle" font-style="italic"></text>
     <line x1="540" y1="240" x2="566" y2="240" stroke="#1e293b" stroke-width="1.5" marker-end="url(#ar24t)" />
     <rect x="570" y="210" width="180" height="60" rx="8" fill="#dcfce7" stroke="#1e293b" stroke-width="1.6" />

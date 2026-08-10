@@ -1,0 +1,87 @@
+---
+const data = Astro.locals.starlightRoute.entry.data as typeof Astro.locals.starlightRoute.entry.data & {
+  author?: string;
+  last_verified?: string;
+  evidence?: 'source-analysis' | 'experiment' | 'official-docs' | 'mixed';
+};
+
+const isEnglish = Astro.locals.starlightRoute.lang === 'en';
+const evidenceLabels = {
+  'source-analysis': isEnglish ? 'Source analysis' : '源码对照',
+  experiment: isEnglish ? 'Experiment' : '实验',
+  'official-docs': isEnglish ? 'Official documentation' : '官方文档',
+  mixed: isEnglish ? 'Mixed evidence' : '混合证据',
+};
+const evidenceLabel = data.evidence ? evidenceLabels[data.evidence] : undefined;
+const hasMetadata = Boolean(data.author || data.last_verified || evidenceLabel);
+---
+
+<h1 id="_top">{data.title}</h1>
+
+{hasMetadata && (
+  <dl class="article-meta" aria-label={isEnglish ? 'Article metadata' : '文章信息'}>
+    {data.author && (
+      <div>
+        <dt>{isEnglish ? 'By' : '作者'}</dt>
+        <dd>{data.author}</dd>
+      </div>
+    )}
+    {data.last_verified && (
+      <div>
+        <dt>{isEnglish ? 'Verified' : '核验'}</dt>
+        <dd><time datetime={data.last_verified}>{data.last_verified}</time></dd>
+      </div>
+    )}
+    {evidenceLabel && (
+      <div>
+        <dt>{isEnglish ? 'Evidence' : '证据'}</dt>
+        <dd>{evidenceLabel}</dd>
+      </div>
+    )}
+  </dl>
+)}
+
+<style>
+  @layer starlight.core {
+    h1 {
+      margin-top: 1rem;
+      margin-bottom: 0;
+      color: var(--sl-color-white);
+      font-size: var(--sl-text-h1);
+      font-weight: 600;
+      line-height: var(--sl-line-height-headings);
+      letter-spacing: 0;
+    }
+
+    .article-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem 1.25rem;
+      margin: 0.85rem 0 0;
+      padding: 0.75rem 0;
+      border-top: 1px solid var(--aap-paper-line);
+      border-bottom: 1px solid var(--aap-paper-line);
+      color: var(--aap-ink-muted);
+      font-family: var(--aap-font-mono);
+      font-size: var(--aap-fs-xs);
+      line-height: 1.45;
+    }
+
+    .article-meta div {
+      display: inline-flex;
+      gap: 0.4rem;
+      align-items: baseline;
+      min-width: 0;
+    }
+
+    .article-meta dt {
+      color: var(--aap-ink-soft);
+      font-weight: 600;
+    }
+
+    .article-meta dd {
+      margin: 0;
+      color: var(--aap-ink);
+    }
+  }
+</style>

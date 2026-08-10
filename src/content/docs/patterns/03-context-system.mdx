@@ -1,6 +1,9 @@
 ---
-title: 03 · 上下文系统
-description: 装什么、怎么排、装多少：Codex / Claude Code / OpenClaw / Hermes 各自的 context 装载机
+title: 03 · 上下文系统：缓存、删减与信任边界
+description: 为长任务划分静态与动态 context，减少无谓重算，同时识别项目文件中的注入风险。
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 sidebar:
   order: 3
 ---
@@ -8,27 +11,15 @@ sidebar:
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
-## 上下文不是一段越来越长的聊天
+## 上下文变长时，先保护哪条边界
 
-<Verdict tldr="Context 系统决定模型每次推理时能看到什么。同一个模型加同样的工具，装上不同的 context 系统跑出来的表现差距比换模型还大。要回答四个问题：哪些内容是静态的（可缓存），哪些是动态的（每 turn 重算）；外部文件（AGENTS.md、CLAUDE.md、.cursorrules 等）该不该读，读进来后要不要做 prompt injection 扫描；项目级指令（lint 规则、commit 风格）怎么注入；不同身份（主 agent、subagent、coordinator）看到不同的 context 时是写死还是参数化。四家答案截然不同。Codex 走 fragment 注册表路线，`core/src/context/` 下定义 24 个 ContextualUserFragment trait（Rust 里的「接口」，每个 fragment 类型都实现这个 trait 来声明自己如何渲染、压缩、做 marker）实现，每个 fragment 都有 START/END marker（成对的文本边界标记，方便事后从已渲染的 prompt 里反向识别类型），事后靠 marker 反向识别类型（压缩时不丢分类），可观察性最强但代码量最大。Claude Code 走字符串数组加显式 cache boundary，`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`（一个魔法字符串，把 system prompt 数组切成「静态前半 + 动态后半」两段）把数组切两半让前半命中 Anthropic API prompt caching，`DANGEROUS_uncachedSystemPromptSection`（强制声明这段每轮都重算的 helper 函数，必须传 reason 说明为何破缓存）强制把含 PID 或时间戳的 section 标为不可缓存。OpenClaw 走模块化函数加三档 PromptMode（full、minimal、none），单点改动容易但 cache 命中率较低。Hermes 走 10 层显式装配加注入前安全扫描，身份层直接从 `~/.hermes/SOUL.md`（用户可改写的人格定义文件）读让用户改人格，`_scan_context_content`（注入前安全扫描函数）扫 9 类危险 pattern 加不可见 Unicode 后命中替换为 `[BLOCKED]` 占位符。要做强类型可观察 context 参考 Codex，要做 cache 友好参考 Claude Code，要做模块化加三模式适配参考 OpenClaw，要做安全严格的长跑助理参考 Hermes。" />
+<Verdict tldr="上下文变长时，删什么、缓存什么、又怎样处理不可信的项目文件？本文只回答这条装配冲突，沿着四个源码入口检查静态与动态边界、压缩和注入扫描；命中条件不同，选型也不同。" />
 
-## 真正进入上下文的七类材料
-
-<details>
-<summary>读前提示（按需展开）</summary>
-
-- **Context 系统决定模型每次推理能看到什么**：同模型同工具，换一套 context 系统的表现差距比换模型还大。
-- **组装方式分歧最大**：Codex 用 24 个 ContextualUserFragment 强类型 fragment 加 START/END marker，Claude Code 用 SYSTEM_PROMPT_DYNAMIC_BOUNDARY 切缓存边界，OpenClaw 用三档 PromptMode。
-- **静态与动态的切分决定 prompt cache 命中率**：静态可缓存，动态每 turn 重算。
-- **最大的坑是外部文件**：AGENTS.md、.cursorrules 不可默认信任，注入前要做 prompt injection 扫描（Hermes 的 _scan_context_content 命中即替换 [BLOCKED]）。
-
-</details>
+## 先问哪些材料值得进入上下文
 
 任意一个 agent 的 context 都是这几层东西拼出来的：
 
@@ -52,7 +43,7 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## 四套上下文系统，四种装配方式
+## 只比较会改变缓存或信任的实现
 
 ### Codex · 每种 context 做成强类型 Fragment 对象
 
@@ -92,13 +83,13 @@ pub trait ContextualUserFragment {
 
 每个具体 fragment 对应一份小 markdown 模板。`permissions/sandbox_mode/workspace_write.md` 是 sandbox 设为 workspace_write 时的提示词片段，按需 include 进对应 fragment 的 body。
 
-这种「小 markdown 文件加 fragment 类型」组合让 prompt 改动可以做精细 diff（哪个文件被改了一行 git log 一查就知道），调试时也更容易复现（每个 fragment 都能单独 render 出来检查）。这套设计把「context = 标记好类型的消息数组」做得很彻底，是四家里 context 工程细节最多的。代价是代码量大，24 个 fragment 都要写 trait impl 加模板文件，比直接字符串拼接重很多。
+这种「小 markdown 文件加 fragment 类型」组合让 prompt 改动可以做精细 diff（哪个文件被改了一行 git log 一查就知道），调试时也更容易复现（每个 fragment 都能单独 render 出来检查）。在当前 Codex 快照里，这条 fragment/marker 代码路径较为集中，便于追踪类型化 context 如何进入 replay 与 compaction；这是限定在该快照的实现观察，不用于跨系统排序。代价是代码量大，24 个 fragment 都要写 trait impl 加模板文件，比直接字符串拼接重很多。
 
-### Claude Code · 字符串数组加显式 cache boundary，把缓存命中率做得很深
+### Claude Code · 字符串数组加显式 cache boundary，标出缓存边界
 
 Claude Code 在 context 上的出发点是：context 工程的真正瓶颈不是「类型清不清晰」而是「能不能让 Anthropic API 的 prompt caching 命中」。一次正常对话中，绝大部分的 system prompt 内容（agent 身份、工具说明、常规规则）是不变的应该缓存。只有少数内容（当前时间、cwd、项目文件）会变。整个 system prompt 一坨字符串发过去，模型每次都重新付钱 process 几千个 token。
 
-切成静态前半加动态后半让前半命中 cache，成本可以下降 5-10 倍。
+切成静态前半加动态后半，可以让前半命中 cache。实际节省取决于 provider 定价、命中率和动态段大小，应从请求账单与缓存指标里测。
 
 Claude Code 因此不走 trait 或 fragment 路线（太重），把 prompt 编成 `string[]`：`buildEffectiveSystemPrompt()` 按 5 级优先级（overrideSystemPrompt、coordinator、subagent、customSystemPrompt、defaultSystemPrompt）搭出数组，里面塞一个魔法字符串 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 标记缓存边界。
 
@@ -111,13 +102,13 @@ cache 控制做得最细的是两个 helper 函数：
 - `systemPromptSection(name, compute)`：默认 memoized 的 section（第一次算了之后缓存，下次直接读缓存）。
 - `DANGEROUS_uncachedSystemPromptSection(name, compute, reason)`：显式声明这段每轮都重算，必须传 reason 解释为何要破缓存（比如「这段含当前 PID，必须每次都查」）。
 
-命名故意叫 DANGEROUS 是因为破缓存意味着 token 成本飙升，强迫开发者写 reason 论证。boundary 后置可以保住前半的 cache hit：把所有 DANGEROUS section 都放在 boundary 之后，前半永远不变所以总能命中 cache。
+命名故意叫 DANGEROUS，是因为破坏稳定前缀会增加 token 成本，也迫使开发者写 reason 说明。把 DANGEROUS section 放在 boundary 之后，可以让前半段保持稳定；是否命中 cache，仍要看请求序列和 API 返回的 token 字段。
 
 ### OpenClaw · 模块化函数加三档 PromptMode 适配不同身份
 
 OpenClaw 在 context 上的出发点是：不同身份（主 agent、subagent、外部调用方）需要看到的 context 完全不同。主 agent 需要完整 memory 加用户偏好加所有工具说明，subagent 只需要主 agent 派给它的任务和必要工具（不需要看 memory，不需要看 authorized senders 列表），外部调用方（比如想在自己的 prompt 里嵌入 OpenClaw 的工具说明）甚至想自己控制整个 prompt。
 
-用一坨字符串拼接得维护三份不同的 prompt 文件，用强类型 fragment 又太重，最好的折中是「模块化函数加模式开关」。
+OpenClaw 采用「模块化函数加模式开关」：比维护三份 prompt 少重复，也没有引入 Codex 那套 fragment 类型。
 
 实际实现是把整段 prompt 拆成十几个 `buildXxxSection()` 函数（每个返回 `string[]`），主入口 `system-prompt.ts` 按顺序调用装配。`PromptMode = 'full' | 'minimal' | 'none'` 三档分别对应主 agent、subagent、外部调用方：
 
@@ -125,11 +116,11 @@ OpenClaw 在 context 上的出发点是：不同身份（主 agent、subagent、
 - `minimal` 模式：砍掉 memory、authorized senders、project instructions 等只保留工具说明。
 - `none` 模式：什么都不生成（外部调用方自己拼）。
 
-subagent 不需要主 agent 的记忆与权限上下文，这个开关一掀就省一大段 token。
+subagent 可以跳过主 agent 的记忆与权限上下文。具体少发多少 token，取决于各 section 的实际长度。
 
 `ctx` 参数贯穿整条装配链。`ctx.projectInstructions`（项目级指令）、`ctx.skillsPrompt`（可用 skill 列表）、`ctx.availableTools`（具体工具集合）、`ctx.citationsMode`（要不要让模型加引用）等字段决定每个 buildXxxSection 输出什么。`ctx` 是 OpenClaw 把运行时状态传进 prompt 装配函数的统一接口。
 
-单点改动比 Codex 24 个 fragment 容易（找到对应 buildXxxSection 改即可），但 cache friendly 度不如 Claude Code 的显式 boundary（OpenClaw 没有 cache boundary 的概念，整个 prompt 一起当作动态部分发送）。
+修改某一段时，可以直接定位对应的 `buildXxxSection`。当前实现没有 Claude Code 那样的显式 cache boundary；最终缓存效果仍取决于生成出的 prefix 与 provider 规则，需要从请求 telemetry 核对。
 
 ### Hermes · 10 层显式装配加注入前安全扫描
 
@@ -176,59 +167,55 @@ def _scan_context_content(content: str, filename: str) -> str:
 
 </SourceBlock>
 
-这件事其他三家都没做。它们默认本地仓库的 `AGENTS.md` 和 `CLAUDE.md` 是可信的（假设是开发者自己写的）。Hermes 假设「用户可能 clone 了一个带恶意 AGENTS.md 的 repo」（攻击者通过 PR 投毒），把不信任边界拉到了文件读取层。这种偏执是长跑 agent 必备：单次会话被劫持还能容忍（用户立刻就发现），但长跑场景下劫持可能潜伏很久（agent 长期低频泄露数据），必须从源头堵住。
+在所比较的快照和文件读取路径里，Hermes 明确加入了注入扫描；这不能证明其他系统在别处没有防护。无论会话长短，外部仓库文件都应按不可信输入处理。扫描只覆盖已知模式，还要配合权限、隔离、来源提示和审计。
 
-## Context 已经形成的共识
+## 先固定上下文契约
 
-四家在 context 系统设计上有四个明显的共同认知，这是所有 agent 都该遵循的工程底线：
+四个快照都处理了来源、工具描述、项目指令和上下文容量，但做法与适用范围不同：
 
-**1 · context 必须分层（静态可缓存加动态每次重算）**：四家都认识到不能把整个 system prompt 当成一坨字符串送给模型。哪怕实现方式不同（Codex 用 fragment marker、Claude Code 用 boundary 字符串、OpenClaw 用 PromptMode、Hermes 用 10 层结构），都明确区分了不变的部分（agent identity、工具说明、静态规则）和会变的部分（cwd、时间、项目文件）。这种分层让 prompt caching 有可能命中，单次推理成本能降一个数量级。不做分层的 agent 会被 token 成本压垮。
+**1 · 区分稳定内容与动态内容**：四家都以不同方式标记 context 来源或模式。这样做可能提高缓存复用，也让压缩和审计更清楚；节省多少取决于 API 语义、提示变化和命中率，应从 telemetry 与账单测量。
 
-**2 · 工具签名用 JSON Schema 描述（详见 04 章）**：四家都把工具的输入参数用 JSON Schema 表达（而不是自然语言）。模型对 JSON Schema 的解析准确率显著高于自然语言描述，工具调用失败率能从 10% 降到 1% 以下。
+**2 · 工具签名用 JSON Schema 描述（详见 04 章）**：四家都把工具输入参数写成 JSON Schema，而不是只给自然语言说明。schema 把类型和必填关系交给机器校验；调用失败率仍要按模型、工具集和任务记录。
 
 **3 · 项目级 markdown 文件作为「项目语境」注入点**：四家都支持读 AGENTS.md、CLAUDE.md、.cursorrules、SOUL.md 这类项目根目录下的指令文件，让用户或团队能给 agent「这个项目特定的注意事项」（比如 lint 规则、commit 风格、技术债历史）。这是 agent 从通用助手变成项目专属助手的关键机制。
 
-**4 · 必须有 context budget 机制（到 token 上限自动压缩）**：四家都做 context budget（详见 02 章压缩管线），知道 agent 跑久了一定会撞 context window 上限。差别只在压缩策略激进程度（什么时候压、压什么、怎么压）。完全不做 budget 的 agent 跑久了一定崩。
+**4 · 长任务需要容量策略**：可以预算 token、截断低价值内容、压缩历史或拆成多轮。短而有界的调用未必需要完整压缩管线；当输入接近 provider 限制时，系统至少要有可观察、可测试的处理路径。
 
-## 缓存、灵活性与安全怎么取舍
+## 把缓存收益和信任成本放在一起
 
 <Diagram
   src="/diagrams/03-tradeoff.svg"
   alt="四个系统在「装配灵活度 × cache 命中率」两轴上的位置"
-  caption="横轴：装配灵活度（越右越能动态拼）。纵轴：cache 命中率。Claude Code 把 cache 拉到顶，Hermes 把灵活度拉到顶，Codex 和 OpenClaw 走折衷路线。"
+  caption="横轴表示装配灵活度，纵轴表示前缀稳定性。这是基于源码结构的定性位置，不是四家 cache 命中率实测。"
 />
 
 四家代表了 context 系统设计的四种典型取舍：
 
-**想最大化 cache 命中率（降低单次推理成本）**：参考 Claude Code 的显式 boundary 路线。一根魔法字符串切两半，前半永远缓存后半每次重算，让 Anthropic prompt caching 命中率拉到 80% 以上。代价是装配规则写死（加新 section 要硬编码进 systemPrompt.ts 5 级优先级的某一档）、外部钩子缺失（想插件化扩展只能 fork）。适合对单次推理成本特别敏感的场景。
+**想最大化 cache 命中率（降低单次推理成本）**：参考 Claude Code 的显式 boundary 路线。一根字符串把 prompt 切成稳定段和动态段，稳定段有机会被 API 复用，动态段每轮重算。实际命中率要用 `cache_read_input_tokens` 与 `cache_creation_input_tokens` 核对。代价是装配规则写死（加新 section 要硬编码进 systemPrompt.ts 5 级优先级的某一档）、外部钩子缺失（想插件化扩展只能 fork）。适合对单次推理成本特别敏感的场景。
 
-**想要最强类型安全和可观察性**：参考 Codex 的 fragment 加 marker 路线。24 个 ContextualUserFragment trait 把每种 context 内容做成强类型对象，rollout 反向识别类型、压缩时按类型选策略、单点改动改对应 fragment 即可。代价是代码量大（每加一种新 context 要写 trait impl 加模板文件加注册到 mod.rs）、缺少注入前安全扫描（默认本地仓库可信）。适合企业级、工程化要求高的场景。
+**需要强类型 context 和可追踪装配**：可以看 Codex 的 fragment 加 marker 路线。24 个 `ContextualUserFragment` trait 把不同来源做成类型对象，rollout 与压缩都能保留来源。代价是每种新 context 都要增加实现和模板，而且这个快照没有注入前扫描。
 
-**想适配多身份（主 agent、subagent、外部调用方）**：参考 OpenClaw 的 buildXxxSection 加 PromptMode 三档路线。模块化函数加三档模式让同一套代码同时服务三种身份，扩展新身份只需要加一个 PromptMode 值。ctx 参数贯穿装配链让运行时状态注入有统一接口。但它不显式切 cache（主 agent 和 subagent 走同一个 prompt 函数时 cache 会污染）。适合多通道、多角色 agent。
+**想适配多身份（主 agent、subagent、外部调用方）**：参考 OpenClaw 的 `buildXxxSection` 加 `PromptMode`。模块化函数让同一装配链服务不同身份；缓存是否互相影响取决于最终 prompt prefix 和 provider 规则，不能仅从共用函数推断。
 
-**做安全严格的长跑助理或让用户自由定制人格**：参考 Hermes 的 10 层装配加注入前扫描路线。10 层显式装配让每层职责清晰（agent identity 来自 SOUL.md 用户可改、frozen MEMORY snap 锁缓存稳定性、context files 外部输入扫描后注入），prompt injection 扫描把不信任边界拉到文件读取层（其他三家都没做）。代价是完全牺牲了 system prompt 的稳定 cache（10 层每层都可能变，cache 命中率低）、扫描规则需要持续更新（9 类 pattern 不够覆盖所有变种）。适合长跑、用户私人 agent 场景。
+**做安全要求较高、允许用户自定义身份的助理**：可以评估 Hermes 的 10 层装配和注入前扫描。`SOUL.md`、memory snapshot 与外部 context file 分层清楚，但正则只覆盖已知写法，不能替代权限隔离与来源提示；缓存成本也要从请求数据确认。
 
-## 我的判断：边界比模板更重要
+## 缓存之前先给输入分级
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★☆', reason: '24 个 fragment 把「context = 标类型的消息」做得很深，压缩时可按 marker 还原，prompt 文件全入仓可 diff', risk: 'fragment 加新种类要改 mod.rs，扩展性不如纯函数。缺少注入前安全扫描' },
-    { system: 'Claude Code', value: '★★★★★', reason: '显式 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 加 5 优先级加 `string[]` 分段缓存，是 cache 友好度天花板', risk: '加新 section 要硬编码进 systemPrompt.ts，外部钩子缺失' },
-    { system: 'OpenClaw', value: '★★★★☆', reason: 'buildXxxSection 模块化加 PromptMode 三档很实用，ctx 单点接入运行时状态', risk: 'cache 切分不显式，主 agent 加 subagent 同 prompt 时缓存会污染' },
-    { system: 'Hermes', value: '★★★★★', reason: '唯一在注入前扫 prompt injection 加不可见 Unicode 的，用户改 SOUL.md 直接换 agent 人格', risk: '完全牺牲了 system prompt 的稳定 cache。扫描规则需要持续更新（9 类 pattern 不够覆盖所有变种）' },
-  ]}
-  caption="评分依据：可工程化加真实风险，不做满分崇拜"
-  headers={{ system: '系统', value: '评分', reason: '亮点', risk: '风险' }}
-/>
+| 上下文约束 | 借鉴路线 | 代价或边界 |
+| --- | --- | --- |
+| 需要强类型标记和可回放压缩 | Codex fragment 与 marker | 扩展要改类型和注册表 |
+| 主要目标是 prefix cache 命中 | Claude Code 的显式 cache boundary | 动态段必须严格标注，接口耦合较强 |
+| 主 agent 与 subagent 需要不同提示 | OpenClaw 的 PromptMode | 灵活装配牺牲一部分缓存稳定性 |
+| 仓库文件可能不可信，任务跨会话 | Hermes 的分层装配与注入扫描 | 黑名单要持续维护，不能代替权限隔离 |
 
-## 从最小 Context 系统开始
+## 从静态、动态和外部输入三层开始
 
-下面是从四家提炼出来的「自己写 Context 系统」配方。先把基础打牢，再加生产级特性，最后避开四个常见死路。
+如果要自己实现 Context 系统，可以按下面的顺序落地：先让来源、优先级和预算可见，再处理缓存、压缩和注入风险。
 
 <BuildRecipe
   minimal={[
     '把 system prompt 写成 string[]，每段独立。这样能精细控制每段的缓存策略，也方便后续按段替换、压缩、调试（参考 Claude Code 的设计）',
-    '加一个 dynamic_boundary 标记把数组切两半，前半 cached（identity 加 tools 不会变），后半 ephemeral（cwd、时间、项目文件每次可能变）。这是 prompt caching 命中率从 20% 提到 80% 的关键',
+    '加一个 dynamic_boundary 标记把数组切两半，前半 cached（identity 加 tools 不会变），后半 ephemeral（cwd、时间、项目文件每次可能变）。用 API 返回的 cache_read_input_tokens 与 cache_creation_input_tokens 验证它是否真的改善命中率',
     '从 cwd 自动找 AGENTS.md、.cursorrules、CLAUDE.md 等项目级指令文件注入（按出现顺序优先级），让 agent 从通用助手变成项目专属助手',
     '加一行 `Now: <ISO time>` 在 prompt 末尾就有最小 env hint，让模型知道当前时间（避免「今天是几号」这种问题答错）',
   ]}
@@ -239,7 +226,7 @@ def _scan_context_content(content: str, filename: str) -> str:
     'cache 边界做成可观测：每次请求都暴露这次命中了多少缓存 token、多少非缓存 token，让你能监控 cache 命中率（参考 Anthropic API 的 cache_creation_input_tokens 和 cache_read_input_tokens 字段）',
   ]}
   avoid={[
-    '把 PID、时间戳、随机 ID 放在 prompt 最前面：这些字段每次都不一样，放前面会让所有缓存 miss（前缀变了缓存就废了）。必须放在 boundary 之后',
+    '把 PID、时间戳、随机 ID 放在 prompt 最前面：这些字段每次都不一样，在按前缀匹配的缓存规则下可能让缓存失效。通常应把它们放在 boundary 之后，并用请求 usage 验证',
     '把整个 AGENTS.md 不过滤就塞进 system prompt：这是 prompt injection 攻击的 #1 入口，攻击者通过 PR 在仓库里塞恶意 AGENTS.md 就能劫持 agent。至少要做基础的 pattern 扫描',
     '让所有 section 都被 model 看见同样深度的细节：subagent、coordinator、主 agent 看到同一份巨大 prompt 既浪费 token 又增加决策复杂度。按身份切 minimal、full 两档至少',
     '用一个超长 string 拼整段 prompt 不分段：没法做分段缓存（一处变全部 miss）、没法精细调试（找不到哪段出问题）、没法做单点修改（改一段要重写整个 string）',
@@ -254,7 +241,7 @@ def _scan_context_content(content: str, filename: str) -> str:
   caption="Identity、Tools、Skills 在 boundary 之前（cache 命中区），Env、Cwd、Mem 在 boundary 之后（每次重建）。"
 />
 
-## 沿着 Context 构造器读源码
+## 核对缓存与信任边界
 
 <SourceTrail
   entries={[
@@ -279,7 +266,7 @@ def _scan_context_content(content: str, filename: str) -> str:
 ### 练习
 
 1. **🟢 入门**：给你的 agent 加一个 `dynamic_boundary` 字符串，把 prompt 切两半，前半静态、后半动态。测试同一个用户连续两次提问的 token 计费有没有显著下降。
-2. **🟠 进阶**：实现一个 `Fragment` 抽象（marker 加 body）。给至少 3 类 fragment：UserInstructions、EnvironmentContext、AvailableTools。压缩历史时按 marker 反查类型，让工具列表那段永远不被丢掉。
+2. **🟠 进阶**：实现一个 `Fragment` 抽象（marker 加 body）。给至少 3 类 fragment：UserInstructions、EnvironmentContext、AvailableTools。压缩历史时按 marker 反查类型，降低工具列表被误删的风险。
 3. **🔴 挑战**：实现 Hermes 风格的注入前扫描：检测 `ignore previous instructions`、隐式 Unicode、HTML 注释注入。给 5 个真实 `AGENTS.md` 样本（含 1 个故意注入），让你的扫描器跑出来。
 
 ### 复盘题
@@ -287,13 +274,13 @@ def _scan_context_content(content: str, filename: str) -> str:
 <details>
 <summary>**Q1 · 概念**：「context window」「context system」「system prompt」三者到底怎么区分？</summary>
 
-Context window 是模型本身的硬限制：参数级的、token 级的，例如 GPT-5 是 256K，Claude 4.5 是 200K。它由模型架构决定，harness 改不了。
+Context window 是模型或服务暴露的 token 上限，具体数值随模型版本和 provider 更新。harness 可以压缩、筛选和分轮处理输入，但不能绕过当前 API 的上限；实现时应查当日官方文档。
 
 Context system 是 harness 这一侧的概念：决定**每次推理时，从用户消息、项目文件、记忆、工具结果这些原料里选哪些、按什么顺序、塞到哪个 slot**。这一层是工程问题，本章对比的就是四家在这一层的差异。
 
-System prompt 是 context system 输出的其中一段（通常是 role=system 的那段消息），主要装身份、工具规范、原则。它和 user message、tool result message 一起构成 model input，但 system prompt 是 cache 友好度最高的部分（不变）。
+System prompt 是 context system 输出的一段，通常装身份、工具规范和原则。它只有在内容稳定且 provider 支持相应缓存时才容易命中 cache；动态 system prompt 同样会失效。
 
-理解这套术语很关键：工程师抱怨「context 不够」，多半是 context system 没设计好（在压缩或者优先级排序上出问题），而不是 context window 不够大。256K window 配一个粗糙的 context system 还不如 100K window 配一个精细的。
+窗口大小不是充分条件。应在同一 provider、模型版本和任务集上，同时记录输入截断、关键信息保留、成功率、延迟与费用，再判断问题来自容量还是装配策略；单看 `256K` 或 `100K` 不能得出优劣。
 
 **源码定位**：[`codex/codex-rs/core/src/context/`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/context/) 是 Codex 的 context system 实现，`claude-code/src/utils/systemPrompt.ts` 是 Claude Code 的。
 **追问**：「context window 满了怎么办？」去看 [Agent Loop 的上下文压缩对照](/patterns/02-agent-loop/#五个容易把循环写坏的地方)：它比较了截断、折叠和摘要历史的顺序。
@@ -306,18 +293,16 @@ System prompt 是 context system 输出的其中一段（通常是 role=system �
 
 **Codex 风格**（fragment 加 marker）适合 prompt 内容多、多团队各自维护一段、且未来要做精细化压缩的场景。marker 让你压缩历史时知道「这段被压掉的原本是工具列表，丢不得」。代价是每加一种 fragment 都得改 `mod.rs`。
 
-**Claude Code 风格**（string[] 加 boundary）适合 prompt 不会爆炸增长、最关心 cache hit 的场景。boundary 字符串是个硬核的工程选择，效率高但扩展性差。
+**Claude Code 风格**（string[] 加 boundary）适合前缀稳定、需要观察 cache hit 的场景。特殊字符串让切分位置明确，也把缓存语义耦合到装配代码。
 
-**Claude Code 风格**（string[] 加 boundary）适合 prompt 不会爆炸增长、最关心 cache hit 的场景。boundary 字符串是个硬核的工程选择，效率高但扩展性差。
+**OpenClaw 风格**（buildXxxSection）适合需要区分主 agent、subagent 和外部调用方的场景。`PromptMode = full|minimal|none` 是三个现成档位；新增身份是否需要新档位要看实际差异。
 
-**OpenClaw 风格**（buildXxxSection）适合中等复杂度、想给 subagent 单独 mode 的场景。`PromptMode = full|minimal|none` 是个很聪明的抽象，三档基本覆盖所有需要。
+**Hermes 风格**（10 层顺序装配）适合需要用户改身份、并希望直接查看注入顺序的场景。它是否适合缓存，要看各层变化频率和 provider 规则。
 
-**Hermes 风格**（10 层硬编码）适合 prompt 短、用户允许改身份、对 cache 不敏感的场景。最大优势是可读性，拉开 `prompt_builder.py` 就知道顺序。
-
-实操建议：先用 Hermes 风格起步（最简单），prompt 段数超过 8 段或上线后发现 cache 命中率低，再升级到 Claude Code 风格的 boundary 切分。只有真正需要还原压缩内容时才上 Codex 风格。
+实操时先用能标出来源与优先级的最小结构。若 telemetry 显示 cache miss、prompt token 或维护冲突持续上升，再引入 boundary；只有需要在压缩后还原来源时，fragment 类型才可能抵消它的复杂度。
 
 **源码定位**：[`codex/codex-rs/core/src/context/fragment.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/context/fragment.rs)、`claude-code/src/utils/systemPrompt.ts`、[`openclaw/src/agents/system-prompt.ts`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/system-prompt.ts)、[`hermes-agent/agent/prompt_builder.py`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/prompt_builder.py)。
-**追问**：「我项目刚起步，要不要预留 fragment 抽象？」不要。先 string[]，三个月后看真实需求再重构。
+**追问**：「我项目刚起步，要不要预留 fragment 抽象？」先用 `string[]` 并记录来源；当压缩、审计或多人维护出现明确需求时再引入类型，不用预设时间点。
 </details>
 
 <details>
@@ -332,10 +317,10 @@ System prompt 是 context system 输出的其中一段（通常是 role=system �
 2. 用 OpenAI 风格的 `messages` 数组，把不稳定的部分放在尾端 message。
 3. 复刻 Claude Code 的字符串 boundary 方案。
 
-为什么 Claude Code 选魔法字符串而不是上面两种？因为它的 prompt 是一根 string，分两个 message 会破坏 Anthropic 的格式约定。放尾端 message 又会让动态内容离 user 太近，影响模型注意力分配。boundary 字符串是这个限制下的最优解。
+为什么 Claude Code 选 boundary 字符串？源码显示它需要在同一 prompt 装配路径里标出静态与动态区段。这个选择保持了现有格式，但也把缓存语义绑在一个特殊标记上。
 
 **源码定位**：`claude-code/src/utils/systemPrompt.ts`（`splitSysPromptPrefix` 实现）。
-**追问**：「OpenAI API 也有 prompt caching 吗？」有，2024 年开放，按 prefix 匹配。但 OpenAI 的策略不需要显式 boundary，它自动在 1024 token 边界切分。所以 Codex 不需要这种字符串。
+**追问**：「OpenAI API 也有 prompt caching 吗？」缓存能力、最低输入长度和计费规则会随 provider 与模型更新。实现前应查当前官方文档，并从响应 usage 字段核对命中；本章的 Claude Code boundary 不能反推 Codex 在所有模型上都不需要显式分段。
 </details>
 
 <details>
@@ -353,12 +338,12 @@ System prompt 是 context system 输出的其中一段（通常是 role=system �
 
 1. **白名单加黑名单**：先确认外部文件应该长什么样（markdown 段落加代码块），不符合就降权。再用黑名单 catch 已知坏 pattern。
 2. **LLM 级别审查**：让一个独立的小模型（cheap）先 review 外部文件，标注是否包含可疑的对你的元指令。Anthropic 自己的 Constitutional AI 就是这思路。
-3. **隔离执行**：永远不要让外部文件以 `role=system` 注入。要嵌入只能用 `role=user` 包一层「下面是用户提供的文件内容，仅作参考」。
+3. **隔离执行**：默认把外部文件当作不可信输入，不要直接放进 `role=system`。需要嵌入时，可用 `role=user` 包一层「下面是用户提供的文件内容，仅作参考」。
 
-Hermes 的实现在定义防御边界这件事上已经做得比其他三家好（其他三家完全没做），但还在 v1，需要持续演进。
+在这组快照的 context-file 读取路径里，Hermes 提供了最明确的扫描入口。它只匹配已知模式，不能据此给四个系统做总体安全排名。
 
 **源码定位**：[`hermes-agent/agent/prompt_builder.py:36-73`](https://github.com/NousResearch/hermes-agent/blob/2d59afd3da04812583ecbbf3be83539678a947c4/agent/prompt_builder.py#L36-L73)。
-**追问**：「不可见 Unicode 扫描值得做吗？」有用。`U+202E`（RIGHT-TO-LEFT OVERRIDE）这种字符可以让人看到的字符串和模型读到的字符串完全不同。Hermes 扫了 10 个最常见的，覆盖了 90% 已知攻击。
+**追问**：「不可见 Unicode 扫描值得做吗？」有用。`U+202E`（RIGHT-TO-LEFT OVERRIDE）这种字符可以让人看到的字符串和模型读到的字符串完全不同。Hermes 列出了 10 个 pattern；它们只能说明已知写法，不能当作完整防线。
 </details>
 
 <details>
@@ -368,14 +353,14 @@ Static context 是「在合理时间窗口内不变」的部分：identity promp
 
 Dynamic context 是「每次推理都可能不同」的部分：当前时间、当前 cwd 文件树、上一次 tool 的结果、刚刚加载的记忆条目。
 
-两者对 cache 计费的影响：现代 LLM API（Anthropic、OpenAI、Google）都做 prefix-based prompt caching。你发的请求 prefix 必须和缓存的 prefix 字符串完全相同（一个字符都不能差）才能命中缓存。**命中的部分按 1/10 价格计费**（Anthropic 5min cache）或者 **1/2 价格**（OpenAI）。
+两者对 cache 计费的影响取决于具体 API。不同 provider 对 prefix、message block、TTL 和缓存写入/读取的语义与价格都不同；实现前要查对应模型、区域和日期的官方文档。
 
-举例算账：如果你 system prompt 6000 token 全 static，user message 1000 token，第二次请求时 6000 token 命中缓存（价格 1/10），1000 token 全新（全价）。把时间放在 system prompt 第一行，第二次请求就 0 token 命中，全是新的，计费翻几倍。
+用符号算账更可靠：设静态前缀为 `S`、动态输入为 `D`、缓存读取单价为 `Pc`、普通输入单价为 `Pi`，命中时输入成本约为 `S×Pc + D×Pi`。实际命中与折扣从请求 telemetry 和账单读取。
 
 工程实操：
 
-1. **任何动态 token 都必须放在 prompt 后半段**。
-2. **boundary 字符串或者 message 分裂**用来明确告诉 API「以上是 static，以下是 dynamic」。
+1. 按目标 API 的缓存语义组织稳定与动态内容，不假定所有 provider 都以同一方式识别 prefix。
+2. boundary 字符串或 message 分裂只是实现手段；是否生效要看 API 文档和缓存指标。
 3. **项目文件改了 cache 自然失效**：这不是你能控的，但可以做到项目文件没改的时候连续 cache hit。
 
 **源码定位**：Anthropic Prompt Caching 官方文档、`claude-code/src/utils/systemPrompt.ts` 实战用法。
@@ -385,15 +370,11 @@ Dynamic context 是「每次推理都可能不同」的部分：当前时间、�
 <details>
 <summary>**Q6 · 实操**：你的项目要支持「上传一个 PDF，agent 帮我分析」。Context system 怎么设计？</summary>
 
-按 PDF 大小分三档：
+PDF 处理不应只由 token 数决定。可以把“全文内联、分块检索、向量加关键词混合检索”作为三种起始方案，再按目标模型窗口、文档结构、查询分布、延迟和答案召回率选择。原来的 5K / 50K 只适合作为实验分桶，不是路由规则。
 
-**< 5K token**（短报告）：解析后整段塞进 user message。不用进 vector store。前面 system prompt 加一句「下面附了一份 PDF，内容如下」。
-
-**5K-50K token**（中等长文档）：解析成 markdown，按 H2 或 H3 切片，每片打 metadata（章节、页码）。第一次推理时把全文塞进 prompt（如果 model 撑得住），后续推理时按 query 检索相关片段塞回去。这个阶段 vector store 不是必须的，可以纯关键词 TF-IDF。
-
-**> 50K token**（大手册）：解析加切片加向量化，进 vector store。检索时混合 dense 加 sparse retrieval。Context system 这一层要做两件事：
+采用检索路线时，Context system 至少要做两件事：
 1. 把检索结果放在 boundary 之后（dynamic 区），同时附「下面是从 PDF `xxx.pdf` 检索到的相关段落，可能不全」的元提示。
-2. 在第一次解析时生成一个 PDF 摘要 200 字放进 static 区，让模型知道整体在讲什么。
+2. 在第一次解析时生成一段可配置长度的 PDF 摘要，并验证摘要是否遗漏后续查询需要的章节。
 
 防注入：PDF 是外部文件，应该走 Hermes 风格的 `_scan_context_content`（Q4 提到的方案）。PDF 里如果有「Ignore previous instructions」或者带攻击意图的隐藏文字，扫描器要拦截。
 
@@ -424,7 +405,7 @@ OpenClaw 是最朴素：不做层级合并，谁调用谁负责拼 `ctx.projectI
 
 1. 起步阶段参考 Codex（从 cwd 回溯，找到第一个就停）。逻辑简单，bug 少。
 2. 上 monorepo 痛了，再加 hierarchical merge（父目录默认加子目录覆盖），用 markdown frontmatter 标记层级。
-3. 永远不要直接 follow Hermes 的全合并，会爆 prompt 长度。
+3. 不要在没有测量 prompt 增长时直接照搬 Hermes 的全合并；项目指令较大时，它可能不适合。
 
 **源码定位**：[`codex/codex-rs/core/src/agents_md.rs`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/core/src/agents_md.rs)、`claude-code/src/utils/claudemd.ts`。
 **追问**：「AGENTS.md 和 .cursorrules 怎么取舍？」四家里只有 Hermes 同时支持。如果你想做兼容，建议都加载，`.cursorrules` 优先级低于 `AGENTS.md`。
@@ -466,7 +447,7 @@ OpenClaw 走源码加 ctx 参数路线，本质和 Claude Code 一样。Hermes �
 <details>
 <summary>**Q9 · 概念**：什么叫 prompt 的「优先级排序」？Claude Code 5 级是哪 5 级？为什么这么排？</summary>
 
-Prompt 里不同段落对模型注意力的影响不均匀。经验：开头 200 token 和结尾 200 token 模型记得最牢，中间 lost in the middle。排序的核心是把**最重要的（identity 加当前任务）放两端**，次要的放中间。
+Prompt 位置会影响部分模型在长上下文任务中的表现，但不存在跨模型通用的“前后 200 token”规则。排序时应把必须遵守的约束和当前任务放在稳定、可测的位置，再用自己的评测检查中段信息是否被忽略。
 
 Claude Code 的 5 级优先级（来自 `splitSysPromptPrefix` 的拼装顺序，从高到低）：
 
@@ -485,40 +466,40 @@ Claude Code 的 5 级优先级（来自 `splitSysPromptPrefix` 的拼装顺序�
 如果你自己设计，建议至少分 3 层：CLI 覆盖、内置、运行时。5 层是 Claude Code 长期演化出来的，新项目不必一开始上。
 
 **源码定位**：`claude-code/src/utils/systemPrompt.ts`。
-**追问**：「lost in the middle 论文具体说什么？」Liu et al. 2023，发现 GPT-4 和 Claude 在长上下文里，问题的答案放在中间时准确率比放在头尾低 20%。这是排序设计的实证基础。
+**追问**：「Lost in the Middle 论文具体说什么？」Liu 等人在 2023 年的多文档问答与键值检索实验中观察到：相关信息放在长上下文中段时，部分模型表现会下降，幅度随模型、任务和位置变化。它支持“要测位置效应”，不支持一个通用的 20% 降幅。[论文](https://arxiv.org/abs/2307.03172)。
 </details>
 
 <details>
 <summary>**Q10 · 开放**：如果让你重新设计 context system，你会取哪几家的特性合在一起？</summary>
 
-我的选型组合（基于 18 个月真实项目经验）：
+基于本章四个源码快照，我会从下面的组合开始验证：
 
-**核心层（必选）**：
+**核心层（按需求验证）**：
 
-1. Claude Code 的 **boundary 字符串切分** 加双层 cache（static、dynamic）。这是 cache 效率的最低基线，少了就是浪费用户钱。
+1. Claude Code 的 **boundary 字符串切分** 加双层 cache（static、dynamic）。如果 provider 支持前缀缓存，它可以作为一个可测的起点；实际收益要看 usage 和账单。
 2. Codex 的 **fragment marker 机制**。压缩历史时要还原段落类型，没 marker 就只能整段丢。
 3. OpenClaw 的 **`PromptMode` 三档**（full、minimal、none）。给 subagent 用 minimal，给主 agent 用 full。
 
-**安全层（生产必选）**：
+**安全层（外部文件进入时优先考虑）**：
 
-4. Hermes 的 **`_scan_context_content`** 加不可见 Unicode 扫描。哪怕只是一个简单版本，比完全不扫强一万倍。生产 agent 一定会遇到恶意 AGENTS.md。
-5. **隔离边界**：外部文件永远不走 role=system 注入，走 role=user 包一层「以下是用户提供的文件内容」。
+4. Hermes 的 **`_scan_context_content`** 加不可见 Unicode 扫描。最简扫描也能拦住一部分明显异常，但不能代替来源信任、路径隔离和人工复核。
+5. **隔离边界**：默认把外部文件当作不可信输入，不要直接走 role=system；需要嵌入时，用 role=user 包一层「以下是用户提供的文件内容」。
 
-**可观测层（生产必选）**：
+**可观测层（需要调缓存或上下文成本时）**：
 
-6. **暴露每次请求的 cache hit ratio**。这个值低了，说明 boundary 设计有问题或者 dynamic 内容跑到 static 区了。
-7. **Fragment 级别的 token counting**。哪段 prompt 在吃 token 要可见，否则优化盲飞。
+6. **暴露每次请求的 cache hit ratio**。低值可能来自 boundary 变化或 dynamic 内容进入 static 区，应和 provider usage 字段一起核对。
+7. **Fragment 级别的 token counting**。记录各段 token 消耗，让调优依据运行数据进行。
 
 不沿用的：
 
 - Hermes 的 10 层硬编码（项目大了就乱）。
 - Claude Code 把所有 prompt 写源码里（非工程师改不了，影响 prompt iteration 速度）。
-- Codex 24 个 fragment（过度工程，前 3 个月不需要这么细）。
+- Codex 24 个 fragment（对尚未遇到压缩溯源问题的小型 harness 可能过细，应由实际维护成本和恢复需求决定）。
 
-落地节奏：第 1 个月用 OpenClaw 风格起步（buildXxxSection 加 PromptMode），第 2 个月接入 Hermes 风格的扫描，第 3 个月上 Claude Code 风格的 boundary，第 6 个月 prompt 段数突破 10 段时再上 Codex 风格的 fragment marker。
+落地顺序按问题触发：先做可测试的装配与模式切换；遇到外部文件再加扫描，出现缓存浪费再引入 boundary，需要在压缩后恢复来源类型时再上 fragment marker。
 
 **源码定位**：继续参考[工具系统](/patterns/04-tool-system/)、[Verifier](/patterns/05-verifier/)和[可观测性](/patterns/15-observability-cost/)的实现。
-**追问**：「全部照搬会不会太重？」会。所以分阶段。一开始 200 行能跑就行，每多一个真实痛点再加一层抽象。
+**追问**：「全部照搬会不会太重？」会。所以分阶段。先实现能记录来源和优先级的最小装配，再根据外部文件规模、cache miss、compaction 恢复需求和遥测结果逐层增加抽象。
 </details>
 
 </details>

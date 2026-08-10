@@ -1,34 +1,25 @@
 ---
-title: 10 · Subagents
+title: 10 · 什么时候值得拆 Subagent
 sidebar:
   order: 10
-description: SubAgentSource 类型化加服务继承、7 变种 TaskType、完整 subagent 平台、5 工具硬禁的 delegate：四家「派子代理」的工程深度差异
+description: 用交接成本、共享状态、重复工作和合并时间判断多 Agent 是否值得
+author: Rick
+last_verified: "2026-08-10"
+evidence: source-analysis
 ---
 
 import Verdict from '@components/Verdict.astro';
 import CompareTable from '@components/CompareTable.astro';
 import Diagram from '@components/Diagram.astro';
-import TradeOff from '@components/TradeOff.astro';
-import ScoreCard from '@components/ScoreCard.astro';
 import BuildRecipe from '@components/BuildRecipe.astro';
 import SourceTrail from '@components/SourceTrail.astro';
 import SourceBlock from '@components/SourceBlock.astro';
 
 ## 什么时候值得拆 Subagent
 
-<Verdict tldr="子 agent（subagent，由当前 agent 主动 spawn 出来跑另一段任务的进程级或 thread 级子 session）是 agent 工程里看似简单实则危险的功能：表面上「让一个 agent 派另一个 agent 干活」听起来很合理，但只要做过就知道几乎每一种灾难都会冒出来。子 agent 又调用自己变成无限递归把 token 烧光、子 agent 拿到父 agent 没有的工具权限造成提权、子 agent 走自己的 approval 流程让用户在多个弹窗里晕头转向、子 agent 把回复跨平台发出去造成消息重复、子 agent 写父 agent 的长期记忆造成状态污染。所以这一章真正要回答的是「面对这些危险，框架要做哪些硬性边界」。四家的做法差异极大。Codex 走的是「类型化每一种子 agent 用途」路线：它把所有 spawn 子 agent 的入口都强制带一个 SubAgentSource 枚举（Rust 的代数数据类型，调用时必须填一个具体的变体而不能省略），明确告诉系统这是什么用途的子 agent（用户主动触发的 Review、上下文压缩的 Compact、用户配置的 ThreadSpawn 模板、后台记忆固化的 MemoryConsolidation、插件实验性场景的 Other），不同 source 走不同的 prompt、权限、telemetry 路径。最关键的工程纪律是子 agent 必须继承父 session 的 7 类核心 service（exec_policy 权限策略、plugins 插件管理器、mcp_manager MCP 服务器管理器、skills_manager 技能管理器、environment_manager 环境变量管理器、agent_control agent 控制台等），永远不可能比父更宽松，没有「开子 agent 绕过 execpolicy」的逃生通道。approval 也强制路由回父 session，子 agent 永远不弹 UI。Claude Code 走的是「把子 agent 跟所有其他异步执行统一抽象」路线：它定义了一个叫 Task 的通用抽象（把所有「后台跑一段时间才出结果」的事情都归到这一个抽象下），TaskType 枚举有 7 种（local_bash 跑 shell 命令、local_agent 跑本地子 agent、remote_agent 跑远程 agent、in_process_teammate 跑同进程伙伴、local_workflow 跑工作流、monitor_mcp 监控 MCP、dream 后台预热），TaskStatus 是一个清晰的状态机（pending 排队、running 跑中、completed 正常完成、failed 失败、killed 被父杀掉），并且每个工具自报 isConcurrencySafe()（工具实例上的 boolean 方法，dispatch 层据此判断能否跟同一 turn 的其他工具并发跑）让 dispatch 层决定能不能跟同一 turn 的其他工具并发跑。OpenClaw 做了最完整的 subagent 平台：一个 subagent 子系统就有 6 个文件（spawn 负责创建、registry 负责注册、depth 负责追踪深度、announce 负责完成通知、attachments 负责附件传递、lifecycle-events 负责生命周期事件），SpawnSubagentParams 有 13 个配置字段（task、label、agentId、model、thinking、runTimeoutSeconds、mode、cleanup、sandbox、expectsCompletionMessage、attachments、attachMountPath、thread），最特别的是它把「不要 poll，等 push event」这条反模式硬写进了 spawn tool 的返回值文本里，让模型读到这段警告，工程上彻底解决子 agent 模式下模型疯狂 poll 浪费 token 的问题。Hermes 走的是「函数式加硬禁 5 工具」最克制路线：只有一个 delegate_task 函数（参数是 goal 任务目标、context 背景信息、toolset 子 agent 可用工具白名单、max_iterations 子 agent 最大迭代次数），但把核心安全约束全部写死：MAX_DEPTH=2 是硬编码常量（parent 0 走 child 1 走 grandchild 直接 reject）、5 个工具硬禁递归 spawn（delegate_task、clarify 反问用户、memory 写长期记忆、send_message 跨通道发消息、execute_code 跑代码这 5 个子 agent 永远拿不到），父进程用 ThreadPoolExecutor（Python 标准库的线程池执行器）同步阻塞等所有子完成，每 30 秒发一次 heartbeat（心跳事件，告诉外层观察者「我还活着」）让 UI 知道还在跑。要做编排框架参考 OpenClaw、要做 agent 类型已经清楚的产品参考 Codex、要把异步执行统一管参考 Claude Code、要做最简单可靠的派活机制参考 Hermes。" />
+<Verdict tldr="为什么开 8 个 Agent 可能更慢？并行度不会自动抵消交接、共享状态、重复读取和合并成本。本文先列出可测量的成本，再用 Codex、Claude Code、OpenClaw、Hermes 的源码说明它们怎样限制权限、深度和通知。本站没有 1/2/4/8 路实测，因此只给实验设计与来源边界，不把任何内部 benchmark 外推成结论。" />
 
-## 四种委派抽象
-
-<details>
-<summary>读前提示（按需展开）</summary>
-
-- **核心认知**：子 agent 看似简单实则危险：无限递归烧 token、工具提权、审批混乱、消息重复、状态污染，框架必须画硬性边界。
-- **分歧最大点**：Codex 用 SubAgentSource 枚举类型化 5 种用途、Claude Code 用 TaskType 7 种统一所有异步执行、OpenClaw 的 SpawnSubagentParams 有 13 个配置字段、Hermes 只有 delegate_task 一个函数加 MAX_DEPTH=2 硬编码。
-- **工程判断**：继承策略决定安全下限：子 agent 强制继承父 session 的 exec_policy 等 7 类 service，永远不能比父更宽松。
-- **动手要点**：第一优先是防递归：depth 限制加硬禁子 agent 拿 spawn 类工具（Hermes 硬禁 delegate_task、clarify、memory、send_message、execute_code 5 个）。
-
-</details>
+## 先算一笔交接账
 
 <Diagram
   src="/diagrams/10-subagents-base.svg"
@@ -50,15 +41,15 @@ import SourceBlock from '@components/SourceBlock.astro';
   dimensionLabel="维度"
 />
 
-## 四套系统怎样派出子 Agent
+## 源码证据：权限、深度与回传
 
 ### Codex · 把「开子 agent」拆成 5 种类型化来源，每种走不同的权限和 prompt 路径
 
-Codex 在子 agent 这件事上的出发点是：「开子 agent」不应该是一个无差别的函数调用，而应该是一组带语义的具体行为。同样是 spawn 一个子 agent，用户主动 /review 让模型审查代码、上下文超长触发摘要压缩、用户调用自己配的 ThreadSpawn 模板、系统周期性触发记忆固化，这四种场景的 prompt 不同、可用工具不同、用户期待的输出形态不同、是否要展示在 UI 上不同、telemetry 维度也不同。
+Codex 先问“这次为什么要派子 Agent”，再把用途写进 SubAgentSource。不同来源携带不同 prompt、权限和 telemetry；子 Agent 继承父 session 的服务，不另开一条提权通道。
 
-如果把它们都塞进一个通用 spawn 函数，调用方就得在每次调用前把这些差异手动配齐，调用点散落各处必然走样。
+如果把它们都塞进一个通用 spawn 函数，调用方就得在每次调用前手动配齐这些差异。调用点增加后，漏配权限或让配置逐渐分叉的风险也会上升。
 
-所以 Codex 强制每次 spawn 必须带一个 SubAgentSource 枚举值，明确告诉系统这是什么用途的子 agent：
+所以 Codex 强制每次 spawn 需要带一个 SubAgentSource 枚举值，明确告诉系统这是什么用途的子 agent：
 
 <SourceBlock path="REF/codex/codex-rs/protocol/src/protocol.rs" lines="2558-2576" system="codex" summary="SubAgentSource 5 种类型：每种走不同的 prompt / 权限路径">
 
@@ -146,7 +137,7 @@ approval 流程的处理也走同样的思路：子 agent 想跑危险命令时�
 
 ### Claude Code · 把子 agent 跟所有其他异步执行统一成一个 Task 抽象
 
-Claude Code 在子 agent 上的思路跟 Codex 完全不同。它发现一个事实：「派子 agent 干活」是「异步执行某件耗时事情」的一个特例，而 IDE 里需要异步执行的场景远不止子 agent：跑一个本地 bash 命令也是异步、调用远程 agent service 也是异步、跟同进程的另一个 teammate agent 协作也是异步、跑一个 workflow 也是异步。
+IDE 里的异步工作不止子 Agent。Claude Code 用 Task 统一本地命令、远程 Agent、workflow 和 teammate，再用状态机与 isConcurrencySafe 决定排队或并发。
 
 如果给每种异步执行单独写一套生命周期管理、状态机、并发控制、UI 展示，长期维护成本极高，并且行为会逐渐不一致（一个跑 bash 的取消机制和一个跑 agent 的取消机制差异巨大）。
 
@@ -189,7 +180,7 @@ export function isTerminalTaskStatus(status: TaskStatus): boolean {
 
 `local_workflow` 是「跑一个预定义的 workflow」（比如「上线流程」「review 流程」这种由多步组成的标准化操作）。`monitor_mcp` 是「跑一个常驻的 MCP 监控任务」（比如监控 GitHub PR 状态变化）。
 
-`dream` 是 Claude Code 2.1 引入的最特别的一种：「后台预热子任务」，用户主对话进行时 dream task 在后台准备可能用得到的资源（比如预先 grep 项目里可能相关的文件、预先加载相关文档），这是 7 类里唯一一个不是用户主动触发的 task，存在的理由是「让 agent 看起来更快」（用户问的时候资源已经准备好了）。
+`dream` 是 Claude Code 2.1 引入的最特别的一种：「后台预热子任务」，用户主对话进行时 dream task 在后台准备可能用得到的资源（比如预先 grep 项目里可能相关的文件、预先加载相关文档），这是 7 类里单一一个不是用户主动触发的 task，存在的理由是「让 agent 看起来更快」（用户问的时候资源已经准备好了）。
 
 TaskStatus 是一个清晰的状态机：pending（等待调度）、running（运行中）、completed（成功完成）、failed（失败）、killed（被取消）。`isTerminalTaskStatus(status)` 是个简单的函数判断「这个 task 是不是已经到终态了」：用来防止给已死的 teammate 注入消息、在终态时把 task 从 AppState 里 evict、清理 orphan 资源。
 
@@ -203,9 +194,9 @@ Claude Code 还提供了一组工具让模型主动管理任务列表：`TaskCre
 
 每个 task 的输出会写到 outputFile 持久化到磁盘，避免大量子 agent 输出把主进程内存撑爆，这是工程上很务实的细节。
 
-### OpenClaw · 把子 agent 做成一个完整的子系统：6 模块加 13 字段加反 polling 警告
+### OpenClaw · 把子 agent 做成一个较全的子系统：6 模块加 13 字段加反 polling 警告
 
-OpenClaw 在子 agent 上做得最完整，把 subagent 做成一个独立的子系统而不只是一个工具调用。打开它的源码会看到一整组文件协同工作：`subagent-spawn.ts` 负责创建子 agent 实例、`subagent-registry.ts` 负责注册和追踪当前活跃的子 agent、`subagent-depth.ts` 负责跨进程持久化深度信息、`subagent-announce.ts` 负责子完成时把通知 push 给父、`subagent-attachments.ts` 负责子 agent 接收文件附件、`subagent-lifecycle-events.ts` 负责生命周期事件（启动、完成、失败、取消）。
+OpenClaw 把委派当作可持久化的运行对象：spawn、registry、depth、announce、attachments 和 lifecycle events 各有边界，完成结果通过 push event 回父流程。
 
 这种「6 个文件协作完成一件事」的拆法说明 OpenClaw 不把子 agent 当成轻量工具，而是当成一个跟主 agent 平级的运行时实体。
 
@@ -301,9 +292,9 @@ function normalizeSpawnDepth(value: unknown): number | undefined {
 
 如果 depth 只在内存里，重启后大家都从 depth=0 开始，会破坏「最多 N 层递归」的限制（因为重启后理论上可以再 spawn N 层）。持久化到 session store 确保这种 corner case 也不会破窗。
 
-### Hermes · 最克制的子 agent 模型：一个函数加 5 工具硬禁加 MAX_DEPTH 写死
+### Hermes · 窄范围的子 agent 模型：一个函数、5 个禁用工具和固定 MAX_DEPTH
 
-Hermes 的子 agent 设计是这一章里最简洁的：只有一个 `delegate_task(goal, context, toolset, max_iterations)` 函数。看起来像「没做」的程度，但是「做了最重要的几件事，剩下的不做」的克制。
+Hermes 只暴露 delegate_task。MAX_DEPTH=2、工具白名单和 heartbeat 处理小型委派；父线程同步等待，长任务的 UI 代价需要单独测。
 
 理由是：Hermes 自己是一个聊天 agent（服务多平台 chat），不是 agent 编排框架，所以它对子 agent 的需求只有一个：「把一个明确的子任务派给一个临时 agent 干，干完拿结果」，不需要 OpenClaw 那种复杂的生命周期管理。
 
@@ -339,7 +330,7 @@ MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 
 </SourceBlock>
 
-5 条硬禁的工具每条都对应一个 Hermes 在生产中真实遇到过的灾难。`delegate_task` 自递归如果不禁，子 agent 可以再 spawn 同样的工具调用自己，立刻变成无限套娃，每层多花一倍 token，几层下来上下文窗口爆炸、账单失控。
+这 5 条限制对应源码作者描述的失败模式；本站没有 Hermes 的事故记录可独立核验。以 `delegate_task` 为例，允许自递归会让子 agent 继续 spawn，同一上下文和费用随层级增长，因此应当用深度和工具权限限制它。
 
 `clarify` 是 Hermes 让 agent 跟用户回话澄清意图的工具，子 agent 不应该有这个能力：因为用户当前在跟父 agent 对话，子 agent 凭空往用户那里发问题会让用户根本分不清是谁在问什么，UI 上一片混乱。`memory` 是 Hermes 写 MEMORY.md 长期记忆的工具，子 agent 写进去会污染父 agent 的长期偏好：子 agent 是临时的，它学到的东西不应该影响父的永久状态。
 
@@ -349,7 +340,7 @@ MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 
 MAX_DEPTH 写死成 2 的语义是：根 agent（用户在跟它对话）算 depth 0、它可以 spawn 子 agent 到 depth 1、depth 1 的子 agent 试图再 spawn 时会被直接拒绝（因为没有 delegate_task 工具）。为什么是 2 不是 3 不是 5？
 
-Hermes 团队的经验是：实际有用的子 agent 任务几乎都是「一层就够」（父 agent 想专注做一件事，把另一件辅助任务派出去），到第二层往往是模型陷入了无效的拆分循环（每个子任务都被进一步拆给孙子 agent 但本身并不必要）。允许超过 2 层在 99% 的场景下都是浪费 token 而不是需要更深的层级。
+Hermes 的源码选择是把深度限制在 2：一层委派覆盖它的目标任务，更深层级被视为拆分循环风险。这里没有跨产品样本支持「99%」这个比例；若要放宽深度，应记录每层带来的完成率、重复工作和 token，再决定上限。
 
 并发模型走 `ThreadPoolExecutor`：
 
@@ -388,62 +379,62 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 
 父进程同步阻塞在 `as_completed()` 上等所有 children 都完成。执行过程中每 30 秒发一次 heartbeat 让上层 UI 知道父 agent 还在等（而不是卡死了）。这是典型的同步并发模型，跟 OpenClaw 的 push-based 异步模型刚好相反：同步阻塞的优点是父 agent 的逻辑很清晰（spawn 完所有子，等齐，汇总），代价是父 agent 在等待期间不能做别的事，对长时间任务来说会影响 UI 响应。
 
-Hermes 选同步是因为它的子 agent 任务通常是短的（一两分钟内完成），同步等的 UX 损失很小，换来代码逻辑的极致简洁。
+Hermes 的源码选择同步等待并配 heartbeat。它是否适合某类任务，要看子任务时长分布、UI 是否需要继续响应，以及慢子任务的超时策略；本文没有一到两分钟的运行样本。
 
-## Subagent 已经形成的共识
+## 子 Agent 需要共享的约束
 
-虽然四家在 subagent 实现深度差异巨大，但有 4 件事是所有家都一致同意的：这些共识反映了子 agent 工程里不能绕过的硬约束。
+把四个源码快照放在一起，会反复遇到四个控制问题：递归深度、委派后的权限、完成回传，以及等待方式。它们是审查清单，不是“四家一致同意”的行业定律。
 
-**第一件是深度必须管，不允许无限递归**。Codex 通过 `ThreadSpawn.depth` 字段记录、OpenClaw 把 `spawnDepth` 持久化到 session store 跨进程重启不丢、Hermes 把 `MAX_DEPTH = 2` 写死在源码常量里。没有任何一家允许递归 spawn 不带限制。原因很简单：如果不限制深度，一个写错的子 agent prompt 就能让模型把自己 spawn 进无限套娃，每层 token 翻倍，几层之后整个 context 就爆了、账单也爆了。深度限制不是可选优化，是必须的硬性安全边界。
+**第一件是深度如何受控**。Codex 通过 `ThreadSpawn.depth` 字段记录，OpenClaw 把 `spawnDepth` 持久化到 session store，Hermes 把 `MAX_DEPTH = 2` 写成源码常量；本文引用的 Claude Code Task 路径没有展示同样的显式上限。无界递归会扩大调用、token 和调试链路，因此实现时要用深度、总调用预算或不可递归工具集至少提供一层硬约束。
 
-**第二件是递归 spawn 必禁，子 agent 不能再开同类子 agent**。Hermes 用最直接的方式：把 `delegate_task` 放进硬禁工具列表，子 agent 根本拿不到这个工具。Codex、Claude Code、OpenClaw 走 feature flag 或 toolset 限制路线：子 agent 的 toolset 默认不包含 spawn 工具。两种实现方式不同但目标一致：子 agent 是「干活的临时单元」不是「另一个调度者」，调度只能由根 agent 做。
+**第二件是子 agent 能否继续委派**。Hermes 直接把 `delegate_task` 放进硬禁工具列表；其他实现通过 source、feature flag、toolset 或 depth 控制不同委派路径。是否允许子级调度是产品选择，但允许时必须同时限制深度、总预算和权限继承，不能只依赖 prompt 自律。
 
-**第三件是子 agent 的工具能力是父的严格子集，不允许子拿到父没有的工具**。这条比上面两条更深刻：它防的不是「子 agent 自己作恶」而是「prompt 注入诱导子 agent 拿到父没有的权限」。如果子可以拿到父没有的工具，那么恶意 prompt 可以让父先 spawn 一个有更大权限的子，然后让子去做父被禁止做的事，本质上是一种权限提升攻击。四家都把「继承父的权限边界」作为默认行为，没有任何一家允许「子 agent 启用父没有的工具」。
+**第三件是子 agent 不应凭委派获得更宽的能力**。这条防的不是「子 agent 自己作恶」，而是 prompt 注入借 spawn 绕过父级限制。本文引用的实现分别通过继承 exec policy、限制工具集或禁止递归来收紧边界；具体机制不同，验证时要检查每条 spawn 路径，而不能只看一个配置默认值。
 
-**第四件是子 agent 完成的通知机制必须避免 polling，要么 push event 要么 await future**。Codex 通过 receiver/sender 推 `EventMsg::TurnComplete` 给父、OpenClaw 通过 subagent-announce 主动 push 通知给父并明确警告「不要 poll」、Hermes 用 `as_completed()` await future、Claude Code 通过 TaskStatus 状态机变迁触发回调。没有一家用「父循环查询子状态」的 polling 模型。理由很现实：polling 模式下模型会反复调用 sessions_list、sessions_history 浪费大量 token 在「问还没完吗」上，而 push 模式让模型只需要等待，token 效率高几个数量级。
+**第四件是完成结果怎样回到父级**。Codex 用 receiver/sender 推 `EventMsg::TurnComplete`，OpenClaw 的 subagent-announce 主动通知并提示不要 poll，Hermes 用 `as_completed()` await future，Claude Code 用 TaskStatus 状态变迁。频繁让模型调用 sessions_list、sessions_history 会增加 token 和延迟；节省多少要用同一批任务比较 push、await 与 polling trace。
 
-## 类型化、通用任务与完整平台怎么选
+## 按任务形状选择委派方式
 
 <Diagram
   src="/diagrams/10-tradeoff.svg"
   alt="四家 subagent 模型在抽象厚度加并发自由度上的相对位置"
-  caption="Hermes 函数式最轻，Codex 类型化适中，Claude Code Task 抽象给最大并发自由度，OpenClaw 完整平台抽象最重。"
+  caption="Hermes 函数式最轻，Codex 类型化适中，Claude Code Task 抽象给最大并发自由度，OpenClaw 较全平台抽象最重。"
 />
 
-虽然上面 4 条是不可绕过的共识，但四家在「子 agent 抽象应该做多重」这件事上的分歧才是真正决定他们各自适合什么产品的核心。从「你在做什么类型的 agent」这个角度看，四种取舍各自对应一个最适合的场景。
+这四个检查项并不导向同一种抽象。真正的选择是：你的任务需要多少状态、权限和调度能力，愿意承担多少维护面。
 
-**如果你在做一个 agent 编排框架，希望让用户写各种各样的子 agent 工作流，那 OpenClaw 的全套子 agent 平台是正确选择**。这种场景下「能不能优雅地管理几十个并发子 agent」「能不能跨进程持久化子状态」「能不能给子 agent 传附件」这些能力都是必需的，OpenClaw 的 6 模块拆分加 13 字段配置加 push-based 完成通知加 depth 持久化覆盖了这些诉求。代价是新手上手成本高（13 字段每个都要理解、6 个子模块都要维护），但对编排框架定位的产品这是不可避免的复杂度。
+**如果编排框架确实需要跨进程状态、附件和完成通知，可以先研究 OpenClaw 的子 agent 平台**。引用快照的 6 模块、13 字段、push 通知和 depth 持久化覆盖了这些能力；代价是配置、存储和生命周期都要长期维护。“几十个并发”仍要由任务样本和资源预算证明。
 
-**如果你在做一个 agent 产品，子 agent 的用途已经收敛到几种明确的场景（比如代码审查、上下文压缩、记忆固化），那 Codex 的 SubAgentSource 类型化模式是正确选择**。这种场景下每种子 agent 用途的 prompt 和约束都不一样，类型化让 dispatch、telemetry、权限路径都有明确依据，比给一个通用 spawn 函数让每个调用方手动配齐参数要可维护得多。代价是新增一种用途要改 protocol 定义（不能在外部插件里加），灵活性受限，但这种限制对成熟产品恰恰是好事。
+**如果用途已收敛到代码审查、上下文压缩、记忆固化等少数场景，可以先研究 Codex 的 SubAgentSource**。类型化让 dispatch、telemetry 和权限路径有明确依据；代价是新增用途要改 protocol 定义，外部扩展更慢。这个约束是否合算，要看用途变化频率和插件需求。
 
-**如果你在做一个 IDE 集成的 agent，需要把子 agent 跟其他异步执行（bash 命令、远程 agent 调用、workflow 跑 batch、teammate 协作）统一管理，那 Claude Code 的 Task 抽象是正确选择**。这种场景下让所有异步执行共用一套生命周期、状态机、UI、取消机制带来巨大的一致性收益，模型也可以用同一组工具（TaskCreate、List、Update、Get、Stop）管理所有这些异步行为。代价是 7 种 TaskType 的边界要长期维护、没有显式 depth 限制依赖用户自己管。
+**如果 IDE 需要统一管理子 agent、bash、远程调用和 workflow，可以先研究 Claude Code 的 Task 抽象**。共用生命周期、状态机、UI 和取消机制能减少入口差异；代价是 7 种 TaskType 的边界要维护，而且引用路径没有展示统一的显式 depth 上限。
 
-**如果你在做一个简单的对话 agent，只需要「派活给一个临时子 agent」这一个功能，那 Hermes 的 delegate_task 函数式加 5 工具硬禁是正确选择**。这种场景下整个子 agent 模块就一个函数加几个常量，新人 5 分钟就能看懂，每条限制都有清晰的失败案例对应。代价是缺乏 attachments、mode、cleanup 这种高级特性、同步阻塞模型在长任务上会卡 UI，但对简单聊天 agent 这些都不是问题。
+**如果对话 agent 只需要一次受限委派，可以先研究 Hermes 的 delegate_task 函数和 5 工具硬禁**。模块表面很小，每条限制也能对应到明确风险；理解和交付时间仍取决于周边工具、测试和失败恢复。代价是缺乏 attachments、mode、cleanup 等能力，同步阻塞还会影响长任务的 UI 响应。
 
-## 我的判断：先算交接成本
+## 选择：并发收益要超过交接成本
 
-<ScoreCard
-  rows={[
-    { system: 'Codex', value: '★★★★★', reason: '5 种 SubAgentSource 类型化每个用途。子 agent 继承父的 7 类 service（包括 exec_policy）。approval 路由回父。depth 在 ThreadSpawn 变体里记录。工程一致性极高', risk: '5 种类型扩展要改 protocol 协议。inherited_exec_policy 让子永远不可比父宽松，灵活性受限' },
-    { system: 'Claude Code', value: '★★★★', reason: 'Task 抽象统一 7 种异步执行。isConcurrencySafe 让 dispatch 自动判并发。TaskStatus 状态机清晰。outputFile 持久化避免 in-memory 撑爆', risk: '7 种 type 边界要长期维护。没显式 depth 限制依赖用户自管。dream task 这种「后台预热」复杂度高' },
-    { system: 'OpenClaw', value: '★★★★★', reason: '完整 subagent 平台：spawn、registry、depth、announce、attachments、lifecycle 全套。push-based 反 polling 加硬写在 tool 返回值里的警告。session store 持久化 depth', risk: '13 字段配置门槛高。6 个子模块要长期维护。新手容易在 mode、cleanup、sandbox 三个 enum 上踩坑' },
-    { system: 'Hermes', value: '★★★★', reason: '一个函数加 5 工具硬禁加 MAX_DEPTH=2。最小可用的 subagent 模型，每条限制都有清晰的失败案例对应', risk: '同步阻塞模型在长子任务下会卡父 UI。attachments 等高级特性缺失。7 种后端的兼容性自己管' },
-  ]}
-  caption="评分依据：抽象一致性 加 安全边界清晰度 加 并发模型适配度"
-  headers={['系统', '评分', '亮点', '风险']}
-/>
+这里不做星级评分。并行数应由任务的可分割程度和交接成本决定；本站尚未测出哪一个并发数更快。
+
+| 任务形状 | 可先读 | 先测什么 |
+| --- | --- | --- |
+| 用途固定，子 Agent 需要继承父权限 | Codex 的 SubAgentSource 与 service inheritance | 子任务交接字段、权限收窄和失败回传 |
+| shell、远程调用和 Agent 都要统一管理 | Claude Code 的 TaskType、状态机和并发安全标记 | 排队、取消、共享资源冲突 |
+| 要编排多模型、附件和跨进程通知 | OpenClaw 的 spawn/registry/depth/announce | push 通知、重复工作、存储和合并时长 |
+| 只有一次性的受限委派 | Hermes 的 delegate_task、深度和工具禁用 | 单任务 wall time、父流程阻塞、预算耗尽 |
+
+建议用同一任务跑 1、2、4、8 个 Agent，记录 wall time、输入/输出 token、重复读取、冲突和人工合并时间；没有数据时不要写速度结论。
 
 ## 从一次受限委派开始
 
-下面是从四家提炼的「自己写 sub-agent」配方。先用函数式起步，再加生产级特性，最后避开五个常见死路。
+下面是从引用实现整理出的起步清单。先用函数式委派验证任务形状，再按 trace 添加权限、通知和持久化。
 
 <BuildRecipe
   title="复刻方案"
   minimal={[
     '从函数式起步（参考 Hermes 的 delegate_task）：参数 task（任务描述）、context（必要上下文，不是父 agent 全部历史）、toolset（受限工具集）、max_iterations（独立预算）。简单清晰，参数明确',
     '硬禁 5 个工具防递归、跨平台副作用：blocked_tools = [delegate, clarify, memory, send_message, execute_code]。delegate 防递归、clarify 防子 agent 反过来问父 agent、memory 防共享 memory 污染、send_message 防越界发消息、execute_code 限制可用工具',
-    'MAX_DEPTH 写死（参考 Hermes 的 2 层）：parent(0) 走 child(1) 走 grandchild reject。2 层足够覆盖 95% 的 sub-agent 场景，更深的需要专门审计',
-    '默认 3 并发可配，父用 ThreadPoolExecutor 阻塞等所有 children。3 并发是大多数场景的最佳折中（再高就容易撞 API rate limit），同时允许用户根据自己的 quota 调',
+    '先设置 MAX_DEPTH（参考 Hermes 的 2 层）：parent(0) 走 child(1) 走 grandchild reject。2 层是该源码的产品选择，不代表覆盖 95% 场景；需要更深时用任务样本和审计记录证明',
+    '并发上限可配（Hermes 源码默认 3），父用 ThreadPoolExecutor 等待 children。3 是该快照的实现参数，不是通用最佳值；按 provider quota、任务耗时、内存和限流记录调整',
   ]}
   advanced={[
     '把子 agent 来源类型化（参考 Codex 的 SubAgentSource）：Review、Compact、ThreadSpawn、MemoryConsolidation、Other。不同来源的子 agent 需要不同 trace、监控策略，类型化让事件流可分类查询',
@@ -456,24 +447,24 @@ Hermes 选同步是因为它的子 agent 任务通常是短的（一两分钟内
   ]}
   avoid={[
     '别让子 agent 共享父的对话历史：上下文继承会让子被「已经在做的方向」污染（认知锚定 bias），失去独立判断。只传 task 描述加必要 context',
-    '别允许子 agent 自己 spawn 同类子 agent：递归套娃 token 爆炸（一层 100K，三层就 1M），且 depth>2 后调试链路爆炸。MAX_DEPTH 是必须的硬限制',
+    '别让子 agent 无界 spawn 同类子 agent：递归会扩大调用数、token 和调试链路。设置 MAX_DEPTH 与总预算，并用任务 trace 决定上限',
     '别在子 agent 完成前 polling：父 agent 不停调 wait_for_subagent 工具白白烧 token。用 push-based 完成事件加硬警告（参考 OpenClaw）',
     '别让子 agent 跑 send_message、写共享 memory：跨平台副作用（子 agent 突然给用户发消息，用户懵）、共享状态污染（多个子 agent 同时写 memory 数据冲突）',
-    '别忽视 attachments 大小：base64 编码的图片塞进 prompt 容易撑爆（一张 1MB 图片约 1.4M token）。attachments 必须有 size limit 加自动压缩',
+    '别忽视 attachments 大小：base64 会放大传输体积，进入模型后的 token 成本还取决于 provider 的多模态编码。按字节和 provider token 预算双重限额，超限时压缩或拒绝',
   ]}
 />
 
-## 四条 Subagent 流程并列
+## 把并发差异放回任务
 
 <Diagram
   src="/diagrams/10-subagent-flows.svg"
   alt="四种 subagent 模型流程并列对照"
-  caption="Hermes 函数式同步阻塞，Codex 类型化加服务全继承，Claude Code Task 抽象统一异步执行，OpenClaw 完整平台加 push 通知加跨进程持久化 depth。"
+  caption="Hermes 函数式同步阻塞，Codex 类型化加服务全继承，Claude Code Task 抽象统一异步执行，OpenClaw 较全平台加 push 通知加跨进程持久化 depth。"
 />
 
-把 4 种放一起，抽象厚度的 spectrum 一眼可见：函数式（Hermes）走 类型化（Codex）走 任务抽象（Claude Code）走 完整平台（OpenClaw）。
+把 4 种放一起，抽象厚度的 spectrum 一眼可见：函数式（Hermes）走 类型化（Codex）走 任务抽象（Claude Code）走 较全平台（OpenClaw）。
 
-## 沿着 spawn 入口读源码
+## 委派权限与完成回传的证据
 
 <SourceTrail
   title="延伸阅读 / 源码入口"
@@ -534,7 +525,7 @@ Rust 里 trait 也能做。但 enum 序列化更直接（已经 `Serialize + Des
 
 **源码**：[`codex/codex-rs/protocol/src/protocol.rs:2558-2576`](https://github.com/openai/codex/blob/f27cf9db0974d344d78e7e0b47e7c812776b1395/codex-rs/protocol/src/protocol.rs#L2558-L2576)（`SubAgentSource` 定义）+ `codex_delegate.rs` 里大量按 source 分支的代码。
 
-**追问**：「为什么 `Other(String)` 存在？」给插件 / 实验性场景兜底。生产环境的 5 种类型已经覆盖 95% 用例；新类型在没正式加进 enum 之前先走 `Other("plugin-name")`，等沉淀稳定再升级成正式 variant。这是 enum 设计的常见 escape hatch。
+**追问**：「为什么 `Other(String)` 存在？」给插件 / 实验性场景兜底。这 5 种类型是当前源码快照的已知分类，不代表覆盖 95% 的生产用例；新类型可以先走 `Other("plugin-name")`，等调用量和约束稳定后再升级成正式 variant。
 </details>
 
 <details>
@@ -543,7 +534,7 @@ Rust 里 trait 也能做。但 enum 序列化更直接（已经 `Serialize + Des
 继承默认正确的有三个理由：
 
 1. **子永远 ≤ 父的能力集**：没有"派一个子 agent 绕过限制"的逃生通道。安全。
-2. **避免冷启动**：plugins / mcp_manager 启动很贵（要 spawn 子进程、建立 connection）。继承一份省 100-500ms。
+2. **避免重复初始化**：plugins / mcp_manager 可能需要 spawn 子进程、建立连接。共享可以少做一次初始化，但本文没有 100-500ms 的测量；需要分别记录冷启动与复用路径。
 3. **状态一致**：父刚 disable 了某个 plugin，子也应该 disable。共享一份就不会漂移。
 
 但有 3 个具体场景会反咬：
@@ -582,11 +573,11 @@ Codex 设计：skills 加载到共享 manager，父子都能看到。**理由**�
 
 **`delegate_task` · 自递归套娃**
 
-子 agent 也是个 LLM 调用。如果子拿到 `delegate_task`，它会想「这个任务太大，我也开个子的子」。结果：父 → 子 → 孙 → 重孙……每层都消耗 token，最后 OOM 或 timeout。Hermes 早期没禁，遇到一次 4 层递归 spawn，烧光 60K context。从此加 `MAX_DEPTH = 2` 兜底（防漏） + 工具级硬禁（防发生）。
+子 agent 也是个 LLM 调用。如果子拿到 `delegate_task`，它可以继续生成子任务，调用数和 token 随分支增长，最终可能触发预算或 timeout。源码能证明的是 Hermes 同时设置 `MAX_DEPTH = 2` 和工具级硬禁；本站没有事故记录可证明「4 层、60K context」这类具体叙述。
 
 **`clarify` · 子 agent 不能跟用户对话**
 
-用户是跟父 agent 对话的。子 agent 弹出 clarify("你想用哪种算法？")，用户在哪儿看到？要么 UI 错乱（多个 clarify 框叠加），要么沉默丢失。Hermes 早期，一个分析子 agent 弹了 clarify，TUI 不知道路由到哪儿，整个 session 卡死。从此子 agent 永远不能问问题（不知道答案就在 result 里说明，让父决定）。
+用户是跟父 agent 对话的。子 agent 弹出 clarify("你想用哪种算法？") 时，系统必须定义问题由谁展示、如何关联 child_id、父是否暂停。Hermes 的 blocked-tools 列表选择让子返回不确定性、由父决定；本站没有它「早期 TUI 卡死」的事故证据。
 
 **`memory` · 共享 MEMORY.md 被污染**
 
@@ -605,7 +596,7 @@ MEMORY.md 是 Hermes 的长期记忆文件，用户级共享。如果子 agent �
 - 子 agent 完成后心想「我要不顺便发个通知吧」（LLM 自动决策）
 - 父 agent 拿到 result 后也发通知
 
-用户被 ping 两次。Hermes 早期出过这事，用户在 Slack 收到「Build broken」两条一模一样。从此外部副作用永远父独占。
+如果父和子都能发送同一结果，用户可能收到重复通知。外部副作用由父级统一提交是一种简单边界；若允许子级发送，就需要幂等键、归属和审计记录。本站没有 Hermes 重复发送的事故记录。
 
 **`execute_code` · 子应该用工具，不应该再 spawn Python**
 
@@ -659,7 +650,7 @@ final answer, reply ONLY with NO_REPLY.
 
 - **subagent-announce push event**：子完成时主动发 user message 到父对话。父被「唤醒」，不需要主动查。
 - **超时降级**：push 超过 N 秒没到，自动降级为 polling 1 次（兜底）。
-- **session key 追踪**：父 spawn 时拿到 child session key，最终答必须等所有 key 都 announce 完。
+- **session key 追踪**：父 spawn 时拿到 child session key，最终答需要等所有 key 都 announce 完。
 
 **这是「prompt engineering as architecture」**
 
@@ -671,7 +662,7 @@ Codex 子 agent 完成也是 push（`EventMsg::TurnComplete`），但父代码�
 
 **对比哪种更好？**
 
-Codex 模式更稳（代码 enforce），但限制了灵活性（父必须用 Rust 写）。OpenClaw 模式更灵活（模型可以做更复杂决策），但需要 prompt 引导。两种都对，看你的 orchestrator 是代码还是模型。
+Codex 模式更稳（代码 enforce），但限制了灵活性（父需要用 Rust 写）。OpenClaw 模式更灵活（模型可以做更复杂决策），但需要 prompt 引导。两种都对，看你的 orchestrator 是代码还是模型。
 
 **源码**：[`openclaw/src/agents/subagent-spawn.ts:81-84`](https://github.com/openclaw/openclaw/blob/f6d0712f508b1f926ad6fc42f7d07b1a60e62730/src/agents/subagent-spawn.ts#L81-L84)（`SUBAGENT_SPAWN_ACCEPTED_NOTE`）+ `subagent-announce.ts`。
 
@@ -734,9 +725,9 @@ Task 抽象适合「**异步执行多样化但调度模式相似**」的产品�
 <details>
 <summary>**Q6 · 实战**：你要给自己的 agent 加 subagent 能力，从 0 起步。最小可用 → 生产就绪要走多远？</summary>
 
-四个阶段：**函数式 MVP → 安全边界 → 类型化 → 平台化**。
+按 **函数式 MVP → 安全边界 → 并发 → 类型化 → 平台化** 五个 scope 推进；每个 scope 都要通过资源、权限和结果契约的 fixture。
 
-**阶段 1（Day 1）· 函数式 MVP**
+**阶段 1 · 函数式 MVP**
 
 参考 Hermes：
 
@@ -749,7 +740,7 @@ def delegate_task(goal: str, context: str, toolset: list[str], max_iter: int = 5
     return run_subagent_sync(goal, context, toolset, max_iter)
 ```
 
-第一天就能跑。父 agent 用法：
+先用它验证父子结果契约。父 agent 用法：
 
 ```
 父 agent: 我要分析这 3 个日志文件
@@ -759,7 +750,7 @@ def delegate_task(goal: str, context: str, toolset: list[str], max_iter: int = 5
 等结果
 ```
 
-**阶段 2（Day 2-3）· 安全边界（最关键）**
+**阶段 2 · 安全边界（最关键）**
 
 加 4 件事，不能省：
 
@@ -770,7 +761,11 @@ def delegate_task(goal: str, context: str, toolset: list[str], max_iter: int = 5
 
 这一步是「最小可用 → 不会爆炸」的关键。先有这些，再加复杂功能。
 
-**阶段 3（Week 2）· 并发并行**
+**验收门槛**：递归、禁用工具、并发上限和 timeout fixture 都能拒绝或终止子任务，并回收资源。
+
+**阶段 3 · 并发并行**
+
+**前置**：阶段 2 的深度、工具和 timeout 边界已经稳定。
 
 让父能同时开多个子：
 
@@ -787,11 +782,15 @@ async def parent_turn():
     # 父用 results 综合
 ```
 
-每个子独立 LLM 调用，不互相依赖。3 倍速度。
+三个调用没有数据依赖时可以并发，wall time 通常受最慢子任务和调度开销支配；实际加速比要与串行基线一起测量。
 
 UI 要解决：3 个子同时跑，progress bar 怎么显示？建议给每个子一个 `child_id`，主 UI 显示 progress per child。
 
-**阶段 4（Week 3-4）· 类型化（中长期）**
+**验收门槛**：无数据依赖的固定任务集与串行基线对比，重复调用、冲突和 child cleanup 都有记录。
+
+**阶段 4 · 类型化**
+
+**前置**：子 agent source 已出现可重复的行为差异，字符串配置开始难以维护。
 
 当子 agent 类型超过 3 种（比如 review / summarize / search / analyze），切到 enum：
 
@@ -814,7 +813,11 @@ def delegate_task(source: SubAgentSource, ...):
 - metrics 按 source 聚合
 - feature 收紧由 source 决定（Review 自动 disable web_search）
 
-**阶段 5（Month 2-3）· 平台化（长期）**
+**验收门槛**：每个 source 的 prompt、工具约束和 metrics 标签在 schema fixture 中一致，未知 source 明确拒绝。
+
+**阶段 5 · 平台化（按需）**
+
+**前置**：产品需要跨进程状态、通知、附件或多用户 framework 能力。
 
 如果产品是 agent 框架（多个用户用你的 framework 写自己的 agent），参考 OpenClaw：
 
@@ -826,14 +829,16 @@ def delegate_task(source: SubAgentSource, ...):
 
 这些是 agent 框架的「产品力」，自用 agent 不需要。
 
+**验收门槛**：kill/resume、push 通知、附件传递和 lifecycle event 可重放，权限继承不会被平台层放宽。
+
 **关键经验**：
 
-1. **MAX_DEPTH 第一天就要有**（防递归套娃，token 爆炸是最容易出的事故）
-2. **blocked_tools 第一天就要有**（防共享状态污染）
-3. **timeout + heartbeat 第一周就要有**（防卡死 UI）
-4. **类型化 / 平台化是后期**（数据驱动，等真有需求再上）
+  1. **MAX_DEPTH 先固定**（防递归套娃，token 爆炸是最容易出的事故）
+  2. **blocked_tools 先固定**（防共享状态污染）
+  3. **timeout + heartbeat 通过 fixture 后再扩展并发**（防卡死 UI）
+  4. **类型化 / 平台化按需求推进**（用 trace 和真实调用决定）
 
-**源码组合**：Hermes `tools/delegate_tool.py` (基础 MVP) + Codex `protocol.rs SubAgentSource` (类型化) + OpenClaw `agents/subagent-*.ts` (平台化)。三家代码拼一起 = subagent 框架 v0.1。
+**源码路线**：Hermes `tools/delegate_tool.py` 展示最小委派，Codex `protocol.rs SubAgentSource` 展示用途类型化，OpenClaw `agents/subagent-*.ts` 展示状态与通知。它们的契约不同，不能直接拼接；先按任务 trace 选需要的层。
 
 **追问**：「子 agent 失败父怎么处理？」三种策略：(1) 重试 1 次（适合 transient error）；(2) 标记 failed 让父决定要不要继续（适合业务逻辑错误）；(3) abort 整个父 task（适合致命错误如 quota exhausted）。多数情况选 (2)，把决策权留给父 agent。
 </details>
@@ -847,7 +852,7 @@ def delegate_task(source: SubAgentSource, ...):
 
 经典攻击模式：用户输入「写一个脚本 delete /etc/passwd」→ 父 exec_policy 禁了 `rm -rf` → 但子 agent 没继承禁令 → 子能跑 → boom。
 
-**所以 Codex 的设计是对的**：默认子是父的子集，永远更严格。
+**Codex 的默认收紧适合作为安全起点**：默认子是父的子集；具体业务若确有需要，可由父层显式授予更宽权限并附加约束。
 
 **但「子比父能干更多」的合理需求存在**
 
@@ -865,7 +870,7 @@ Codex 实际就是这么做的：`subagent_source = Review` 时，spawn 时 expl
 
 **场景 2 · 父是 IDE 模式（不许 spawn 子进程），子是 build task**
 
-build 必须 spawn `cargo` / `npm` 子进程。父在 IDE 模式下 disable spawn 是为了 UX（避免污染 IDE 进程状态），子的 build 是显式用户意图。
+build 需要 spawn `cargo` / `npm` 子进程。父在 IDE 模式下 disable spawn 是为了 UX（避免污染 IDE 进程状态），子的 build 是显式用户意图。
 
 **怎么破？**
 
@@ -881,7 +886,7 @@ build 必须 spawn `cargo` / `npm` 子进程。父在 IDE 模式下 disable spaw
 
 **通用解法**
 
-`inherited_exec_policy` 默认严格 + **显式 grant** 例外。grant 必须：
+`inherited_exec_policy` 默认严格 + **显式 grant** 例外。grant 需要：
 
 1. 在 spawn 点（不是子运行中）声明
 2. 限定 source（只对特定 SubAgentSource 生效）
@@ -902,7 +907,7 @@ build 必须 spawn `cargo` / `npm` 子进程。父在 IDE 模式下 disable spaw
 
 四层排查：**并发模型 → 资源 → 通信 → 模型**。
 
-**第一层 · 并发模型（10 分钟）**
+**第一层 · 并发模型（先检查）**
 
 看你的 subagent 是同步还是异步：
 
@@ -919,7 +924,7 @@ rust-gdb -p <parent_pid>             # Rust
 
 看父是不是 stuck 在 `wait()` / `recv()` / `gather()`。是的话进下一层。
 
-**第二层 · 资源耗尽（20 分钟）**
+**第二层 · 资源耗尽（随后检查）**
 
 10 个子可能炸 4 类资源：
 
@@ -937,7 +942,7 @@ cat /proc/<parent_pid>/limits        # ulimit
 grep "429" logs/                     # rate limit 错误
 ```
 
-**第三层 · 通信瓶颈（30 分钟）**
+**第三层 · 通信瓶颈**
 
 如果是 push-based：
 
@@ -956,7 +961,7 @@ grep "input_tokens" logs/parent.log
 chrome devtools performance tab
 ```
 
-**第四层 · 模型行为（1 小时）**
+**第四层 · 模型行为（最后检查）**
 
 如果以上都没问题，但父 UI 还卡：
 
@@ -968,13 +973,13 @@ chrome devtools performance tab
 
 **常见根因 + 修复**
 
-按出现频率排：
+下面按排查顺序列出候选原因。原文的 30/25/20/15/10 没有事故样本支撑，因此不保留为发生率；上线后应按 trace 和 incident 数据重新排序。
 
-1. **rate limit 触发**（30% 的案例）：限并发到 3-5，加 exponential backoff。
-2. **同步阻塞被慢子拖死**（25%）：切异步 / push-based + 单子 timeout。
-3. **资源耗尽**（20%）：监控 + 限并发 + cleanup。
-4. **父模型疯狂 polling**（15%）：参考 OpenClaw 的反 polling warning。
-5. **UI render 慢**（10%）：debounce + batch event。
+1. **rate limit 触发**：限并发，加 exponential backoff。
+2. **同步阻塞被慢子拖死**：切异步 / push-based + 单子 timeout。
+3. **资源耗尽**：监控 + 限并发 + cleanup。
+4. **父模型疯狂 polling**：参考 OpenClaw 的反 polling warning。
+5. **UI render 慢**：debounce + batch event。
 
 **预防**
 
@@ -1001,7 +1006,7 @@ chrome devtools performance tab
 
 场景：用户 spawn 一个 bash task 跑 `find /` 几分钟，输出几十万行。in-memory buffer 不能装这么多。outputFile 写盘后，父只持有一个引用（文件路径），需要时按需读片段。
 
-进阶价值：**会话恢复**。用户 kill Claude Code，重新启动恢复会话。outputFile 还在磁盘，task 历史完整。
+进阶价值：**会话恢复**。用户 kill Claude Code，重新启动恢复会话。outputFile 还在磁盘，task 历史较全。
 
 **spawnDepth（OpenClaw）**
 
@@ -1020,9 +1025,9 @@ chrome devtools performance tab
 
 Claude Code 是前者（CLI / IDE），OpenClaw 是后者（长期 agent 平台），所以重点不同。
 
-**最佳实践：两个都做**
+**长跑系统的组合建议**
 
-任何严肃的 subagent 系统都该：
+对于跨进程、长期运行，或需要跨重启恢复的 subagent 系统，建议同时持久化：
 
 1. **大输出落盘**（outputFile / stdout 重定向 / chunked storage）
 2. **安全约束持久化**（depth / quota / rate limit state）
@@ -1061,11 +1066,11 @@ spawnDepth：
 </details>
 
 <details>
-<summary>**Q10 · 开放**：综合四家长处，设计一个「通用 subagent 框架」。给出最小完整 API + 实现 outline。</summary>
+<summary>**Q10 · 开放**：按任务约束设计一个可组合的 subagent 框架，给出最小 API 与验证路径。</summary>
 
 分层设计，按需启用：
 
-**Layer 1 · 函数式接口（必需）**
+**Layer 1 · 函数式接口（需要）**
 
 ```typescript
 interface SpawnArgs {
@@ -1081,7 +1086,7 @@ async function spawnSubagent(args: SpawnArgs): Promise<SubAgentResult> {
 }
 ```
 
-最小可用，30 行实现。
+这是最小接口示意；生产实现还需要超时、取消、预算、trace 和错误传播，不能用这段示例的行数估算交付量。
 
 **Layer 2 · 类型化（推荐）**
 
@@ -1106,7 +1111,7 @@ const SOURCE_CONFIG: Record<SubAgentSource, SourceConfig> = {
 
 参考 Codex SubAgentSource。每种来源走不同配置。
 
-**Layer 3 · 安全约束（必需，不能省）**
+**Layer 3 · 安全约束（需要，不能省）**
 
 ```typescript
 const HARD_LIMITS = {
@@ -1131,7 +1136,7 @@ function validateSpawn(parent: Session, args: SpawnArgs) {
 }
 ```
 
-参考 Hermes 5 工具硬禁 + MAX_DEPTH。绝对不能省。
+参考 Hermes 5 工具硬禁 + MAX_DEPTH。跨进程或长期运行场景应保留这些约束；短会话、单进程工具可按风险取舍。
 
 **Layer 4 · 服务继承（推荐）**
 
@@ -1172,7 +1177,7 @@ async function spawnAsync(args: SpawnArgs, callback: (r: SubAgentResult) => void
 
 业务选一种。复杂场景两种都暴露。
 
-**Layer 6 · 持久化（生产必需）**
+**Layer 6 · 持久化（生产需要）**
 
 ```typescript
 interface SubAgentStore {
@@ -1266,17 +1271,17 @@ console.log(result.summary);
 - OpenClaw 参考 anti-polling warning + spawnDepth 持久化
 - Hermes 参考 5 工具硬禁 + ThreadPoolExecutor
 
-**实现工作量**：
+**按 scope 评估**：
 
-- Layer 1-3：1 周（含测试）
-- Layer 4-6：2-3 周
-- Layer 7-9：1-2 月（含 UI 集成）
+- **Layer 1-3 · 核心委派**：包含 spawn contract、深度/工具边界和超时语义。**验收**：单元测试覆盖拒绝路径，集成 fixture 能收到 child result 或明确 failure。
+- **Layer 4-6 · 并发与类型化**：只有在子任务确实无数据依赖、或 source 类型已经出现可维护性问题时增加。**前置**：先有串行基线和 child_id；**验收**：固定任务集对比并发收益、重复调用、资源清理和 source 约束。
+- **Layer 7-9 · 平台能力**：仅在需要跨进程、持久通知、附件或 UI 观察时增加。**前置**：先定义生命周期和权限边界；**验收**：kill/resume、push 通知、附件传递和状态查询 fixture 均可重放。
 
 **关键决策**：
 
 1. **核心 API JSON 互通**（schema 跨语言共享）
 2. **配置 file-based**（YAML / JSON 配置 source 行为）
-3. **拒绝 polling**：第一天就把 anti-polling warning 加上
+  3. **拒绝 polling**：在核心契约中固定 anti-polling warning
 
 **追问**：「这个框架怎么测试？」三层测试：(1) 单元测试 spawn / depth / blocked_tools；(2) 集成测试 push event flow；(3) chaos 测试 spawn 100 个子 / kill 一半 / 看资源回收。前两层 CI 跑，第三层每周跑一次。
 </details>
